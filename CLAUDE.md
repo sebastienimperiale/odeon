@@ -292,7 +292,16 @@ published to crates.io; the apps never are.
    `trunk build --release --public-url /<repo>/` for a project page; an
    HTTPS page can only call an HTTPS server (a tunnel with TLS in front
    of the Mac), and the server has no authentication yet — add a token
-   and run limits before pointing a public page at it. The
+   and run limits before pointing a public page at it.
+   **Git and GitHub** (same day): the workspace became a git repository
+   (fresh history, no import of the old `mortensen` repository; first
+   commit `cb85bd5`) pushed to `github.com/sebastienimperiale/odeon`
+   (public, HTTPS remote authenticated through `gh`).
+   `.github/workflows/pages.yml` builds the page with trunk
+   (`--public-url /odeon/`) on every push to `main` and deploys it to
+   GitHub Pages (`https://sebastienimperiale.github.io/odeon/`, to be
+   opened with `?server=https://…`); Pages must be set to "GitHub
+   Actions" as source once. The
    `.wasm` is ≈ 8 MB because the workspace release profile keeps debug
    symbols and `wasm-opt` is not installed (trunk skips it): install
    `binaryen` for a smaller page. 103 native tests, no warnings.
