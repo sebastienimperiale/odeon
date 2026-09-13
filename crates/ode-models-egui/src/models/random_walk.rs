@@ -1,0 +1,235 @@
+//! Random-walk scene: the lamppost at the origin, the man as a disc at (x, y)
+//! with the trace of his (optional) walk, and the observed quantity — the
+//! circle of radius √(x² + y²) — in the accent. The filter's density is a
+//! ring on that circle; the tracker collapses onto one of its points.
+
+use super::{EstimatorHints, SceneMap, VarHint, VizModel, draw_trace};
+use crate::noise::NoiseModel;
+use crate::palette;
+use crate::playback::{Job, Trajectory};
+use ode_models::spec::ModelSpec;
+use ode_models::models::random_walk::{DEFAULT_STATE, DIM, RandomWalkSystem};
+
+/// Half-width of the scene window (world units, centered on the lamppost).
+const WINDOW: f64 = 2.0;
+
+#[derive(Clone, PartialEq)]
+struct Params {
+    x0: [f64; 2],
+    /// Standard deviation of the reference's random walk (0 = static man).
+    walk_std: f64,
+    obs_noise: NoiseModel,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Params {
+            x0: DEFAULT_STATE,
+            walk_std: 0.0,
+            obs_noise: NoiseModel::None,
+        }
+    }
+}
+
+impl Params {
+    fn system(&self, dt: f64, seed: u64) -> RandomWalkSystem {
+        let sys = RandomWalkSystem::new(self.x0, dt);
+        if self.walk_std > 0.0 {
+            sys.with_walk(self.walk_std, seed)
+        } else {
+            sys
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct RandomWalkViz {
+    params: Params,
+    /// Snapshot taken by `make_job`; the scene is drawn with these.
+    drawn: Params,
+}
+
+impl VizModel for RandomWalkViz {
+    fn name(&self) -> &'static str {
+        "Random walk"
+    }
+
+    fn description(&self) -> String {
+        "Toy model for multimodality (\"the drunk man\"). A man stands in the plane next to a lamppost at the \
+         origin and does not move (d/dt (x, y) = 0); all that is observed is his squared \
+         distance to the lamppost, x² + y². With the reference at (0, 1) the observation is \
+         constantly 1, and every point of the unit circle explains the data equally well: the \
+         value function is flat on the ring x² + y² = 1 and the density is a ring — a \
+         continuum of maxima.\n\n\
+         The grid filter represents the ring as is (from a flat prior it appears within a few \
+         steps). The tracker, a single Gaussian, cannot: it converges to one point at distance 1, \
+         the one its prior points to, with a confident covariance — the smallest illustration of \
+         what the Gaussian closure loses. The drunkness is in the filter's eyes: with model noise \
+         q > 0 the filter believes the man random-walks, and the diffusion keeps the ring from \
+         collapsing to a curve; with q = 0 it sharpens forever.\n\n\
+         Parameters: initial position (x₀, y₀); walk σ — if > 0 the reference itself \
+         random-walks (Brownian increments of standard deviation σ√dt per step), so the ring must \
+         follow a moving radius.\n\n\
+         State (filter order): x, y. Scene: fixed window [−2, 2]², the lamppost at the origin, \
+         the man and the trace of his walk, and the observed circle of radius √(x² + y²) in the \
+         accent.\n\n\
+         Observation: x² + y², the squared distance to the lamppost."
+            .to_string()
+    }
+
+    fn params_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let before = self.params.clone();
+        let p = &mut self.params;
+        ui.horizontal(|ui| {
+            ui.label("Initial position").on_hover_text("The toy's reference is (0, 1): on the unit circle.");
+            if ui.small_button("default").clicked() {
+                p.x0 = DEFAULT_STATE;
+            }
+        });
+        for (i, label) in ["x₀", "y₀"].iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut p.x0[i]).speed(0.02).range(-WINDOW..=WINDOW));
+                ui.label(*label);
+            });
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut p.walk_std).speed(0.01).range(0.0..=2.0));
+            ui.label("walk σ").on_hover_text(
+                "Standard deviation of the reference's random walk per unit time (0: the man \
+                 stands still — the drunkness is then only the filter's model noise q).",
+            );
+        });
+        before != self.params
+    }
+
+    fn obs_options(&self) -> Vec<String> {
+        vec!["x² + y²  (squared distance to the lamppost)".into()]
+    }
+
+    fn obs_exclusive(&self) -> bool {
+        true
+    }
+
+    fn obs_selected(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn toggle_obs(&mut self, _idx: usize) {}
+
+    fn noise_ui(&mut self, ui: &mut egui::Ui, _idx: usize) -> bool {
+        crate::noise::noise_ui(&mut self.params.obs_noise, ui, "random_walk_noise")
+    }
+
+    fn state_labels(&self) -> Vec<String> {
+        vec!["x".into(), "y".into()]
+    }
+
+    fn periodic(&self) -> Vec<bool> {
+        vec![false; DIM]
+    }
+
+    fn default_pairs(&self) -> Vec<(usize, usize)> {
+        vec![(0, 1)]
+    }
+
+    /// The reference is a point, so the range-based domain default would
+    /// be a small box around it: use the scene window, at the resolution
+    /// of the one-spring example, so that the whole ring is on the grid.
+    fn estimator_hints(&self) -> EstimatorHints {
+        let var = VarHint { domain: Some((-WINDOW, WINDOW)), n_el: Some(16), p_ord: Some(4), ..VarHint::default() };
+        EstimatorHints { vars: vec![var; DIM], eps: Some(0.05) }
+    }
+
+    fn model_spec(&self) -> ModelSpec {
+        let p = &self.drawn;
+        ModelSpec::RandomWalk {
+            x0: p.x0,
+            walk_std: p.walk_std,
+            walk_seed: 7000,
+            noise: p.obs_noise,
+            noise_seed: 7100,
+        }
+    }
+
+    fn make_job(&mut self, dt: f64, steps: usize) -> Job {
+        self.drawn = self.params.clone();
+        let p = self.params.clone();
+        Box::new(move |progress| {
+            let mut sys = p.system(dt, 7000);
+            for _ in 0..steps {
+                sys.forward();
+                progress.step();
+            }
+            let states: Vec<Vec<f64>> = sys.states.iter().map(|s| s.iter().copied().collect()).collect();
+            let mut observations: Vec<Vec<f64>> = states.iter().map(|s| vec![sys.h(s)]).collect();
+            let eta = p.obs_noise.realize(observations.len(), dt, 7100);
+            for (o, e) in observations.iter_mut().zip(eta) {
+                o[0] += e;
+            }
+            let obs_labels = vec![if p.obs_noise.is_none() {
+                "x² + y²".to_string()
+            } else {
+                "x² + y² (noisy)".to_string()
+            }];
+            Trajectory {
+                dt,
+                states,
+                observations,
+                obs_labels,
+            }
+        })
+    }
+
+    fn draw(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        traj: &Trajectory,
+        frame: usize,
+        visuals: &egui::Visuals,
+    ) {
+        let map = SceneMap::fit(rect, (-WINDOW, WINDOW), (-WINDOW, WINDOW));
+        let painter = painter.with_clip_rect(rect);
+        let painter = &painter;
+        let neutral = visuals.widgets.noninteractive.fg_stroke.color;
+        let accent = palette::series(0, visuals.dark_mode);
+        let trace_color = palette::series(2, visuals.dark_mode);
+
+        // The lamppost.
+        let origin = map.pt(0.0, 0.0);
+        painter.circle_filled(origin, 5.0, neutral);
+        painter.line_segment([origin, origin + egui::vec2(0.0, -map.len(0.25))], egui::Stroke::new(2.0, neutral));
+
+        // The walk so far.
+        let trace: Vec<egui::Pos2> = traj.states[..=frame].iter().map(|s| map.pt(s[0], s[1])).collect();
+        draw_trace(painter, &trace, trace_color);
+
+        // The observed circle and the man, in the accent.
+        let [x, y] = [traj.states[frame][0], traj.states[frame][1]];
+        let man = map.pt(x, y);
+        painter.circle_stroke(origin, map.len(x.hypot(y)), egui::Stroke::new(1.5, accent.gamma_multiply(0.7)));
+        painter.line_segment([origin, man], egui::Stroke::new(1.0, accent.gamma_multiply(0.5)));
+        painter.circle_filled(man, 6.0, accent);
+        painter.circle_stroke(man, 6.0, egui::Stroke::new(1.0, visuals.window_fill()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hints put the whole ring on the grid: the (−2, 2)² box at 16×4
+    /// in both directions, ε = 0.05. (The ring itself, through the whole
+    /// pipeline, is tested in the viewer app.)
+    #[test]
+    fn hints_cover_the_ring() {
+        let viz = RandomWalkViz::default();
+        let hints = viz.estimator_hints();
+        assert_eq!(hints.vars.len(), DIM);
+        assert!(hints.vars.iter().all(|v| v.domain == Some((-WINDOW, WINDOW))));
+        assert!(hints.vars.iter().all(|v| v.n_el == Some(16) && v.p_ord == Some(4)));
+        assert_eq!(hints.eps, Some(0.05));
+        assert_eq!(viz.model_spec().dim(), DIM);
+    }
+}

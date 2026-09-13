@@ -1,0 +1,30 @@
+[package]
+name = "ode-observers"
+description = "Observers for ode-models: the Mortensen filter on Gauss–Lobatto grids, its Gaussian closure (tracker), the translating window and a particle approximation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ode-models       = { path = "../ode-models" }
+lobatto-grid     = "0.1.0"
+lobatto-spectral = "0.2.0"
+nalgebra         = "0.34.1"
+rayon            = "1"
+serde            = { version = "1", features = ["derive"] }
+
+# The FFT-across-elements solver, kept for `benches/diffusion.rs` only.
+[dev-dependencies]
+lobatto-fft = "0.5.0"
+num-complex = "0.4"
+serde_json  = { version = "1", features = ["float_roundtrip"] }
+
+[[bench]]
+name = "transport"
+harness = false
+test = false
+
+[[bench]]
+name = "diffusion"
+harness = false
+test = false

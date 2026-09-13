@@ -1,0 +1,13 @@
+[package]
+name = "ode-observers-remote"
+description = "Wire protocol of the Odeon observers server and its client: a job description posted, progress polled, the output fetched — a remote run handle for any front-end"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ode-observers = { path = "../ode-observers" }
+ehttp         = "0.5"
+serde         = { version = "1", features = ["derive"] }
+serde_json    = { version = "1", features = ["float_roundtrip"] }
+web-time      = "1"

@@ -1,0 +1,24 @@
+[package]
+name = "odeon-observers-server"
+description = "HTTP job server for the Odeon observers: runs job descriptions (model + estimator + configuration) and serves their progress and outputs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "observers-server"
+path = "src/main.rs"
+
+[dependencies]
+ode-observers        = { path = "../../crates/ode-observers" }
+ode-observers-remote = { path = "../../crates/ode-observers-remote" }
+axum                 = "0.8"
+tokio                = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tower-http           = { version = "0.6", features = ["cors", "fs"] }
+serde                = { version = "1", features = ["derive", "rc"] }
+serde_json           = { version = "1", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+ode-models = { path = "../../crates/ode-models" }
+ehttp      = "0.5"

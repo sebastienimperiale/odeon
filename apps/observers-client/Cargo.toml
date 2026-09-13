@@ -1,0 +1,23 @@
+[package]
+name = "odeon-observers-client"
+description = "The observers viewer as a client of observers-server: the same interface, every estimator job posted to the server and its output fetched back"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "observers-client"
+path = "src/main.rs"
+
+[dependencies]
+ode-observers        = { path = "../../crates/ode-observers" }
+ode-observers-egui   = { path = "../../crates/ode-observers-egui" }
+ode-observers-remote = { path = "../../crates/ode-observers-remote" }
+eframe               = "0.35"
+
+# The web page (`trunk build` / `trunk serve` in this directory).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+log                  = "0.4"
+wasm-bindgen-futures = "0.4"
+web-sys              = { version = "0.3", features = ["Document", "Window", "Element", "HtmlCanvasElement", "Location", "Storage", "UrlSearchParams"] }

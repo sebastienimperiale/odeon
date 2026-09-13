@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ode-models",
+    "crates/ode-observers",
+    "crates/ode-models-egui",
+    "crates/ode-observers-egui",
+    "crates/ode-observers-remote",
+    "apps/models-viewer",
+    "apps/observers-viewer",
+    "apps/observers-server",
+    "apps/observers-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-only"
+
+# Symbol names in release binaries, for profiling (sample/samply/Instruments).
+[profile.release]
+debug = true

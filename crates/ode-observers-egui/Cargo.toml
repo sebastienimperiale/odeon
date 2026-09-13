@@ -1,0 +1,13 @@
+[package]
+name = "ode-observers-egui"
+description = "egui front-end of ode-observers: the estimator configuration panels and the four result views (filter density, tracking density, particles, tracker)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ode-models      = { path = "../ode-models" }
+ode-observers   = { path = "../ode-observers" }
+ode-models-egui = { path = "../ode-models-egui" }
+egui            = "0.35"
+egui_plot       = "0.36"

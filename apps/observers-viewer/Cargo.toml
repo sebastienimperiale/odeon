@@ -1,0 +1,15 @@
+[package]
+name = "odeon-observers-viewer"
+description = "The observers viewer: forward models, their trajectories and the Mortensen estimators (filter, box tracker, particles, tracker), computed locally"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "observers-viewer"
+path = "src/main.rs"
+
+[dependencies]
+ode-observers-egui = { path = "../../crates/ode-observers-egui" }
+eframe             = "0.35"

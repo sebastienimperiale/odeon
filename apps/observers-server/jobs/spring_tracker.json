@@ -1,0 +1,24 @@
+{
+  "model": {
+    "kind": "spring",
+    "n": 1, "rho": 1.0, "a": 1.0,
+    "y0": [0.15], "v0": [0.0],
+    "obs": 0,
+    "noise": {"gaussian": {"std": 0.01}},
+    "noise_seed": 1000
+  },
+  "estimator": "tracker",
+  "config": {
+    "eps": 0.01, "gamma": 1.0, "diffusion": "split_euler", "n_snapshots": 3,
+    "vars": [
+      {"label": "y_1", "periodic": false, "dirichlet": false, "domain": [-0.5, 0.5], "n_el": 20, "p_ord": 4,
+       "half_width": 0.2, "win_n_el": 5, "q": 1.0, "x0": 0.15, "sigma": 5.0},
+      {"label": "v_1", "periodic": false, "dirichlet": false, "domain": [-0.5, 0.5], "n_el": 20, "p_ord": 4,
+       "half_width": 0.2, "win_n_el": 5, "q": 1.0, "x0": 0.0, "sigma": 5.0}
+    ],
+    "pairs": [[[0, 1], true]],
+    "particles": {"n_particles": 500}
+  },
+  "dt": 0.02,
+  "steps": 200
+}

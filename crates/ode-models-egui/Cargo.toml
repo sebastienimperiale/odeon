@@ -1,0 +1,13 @@
+[package]
+name = "ode-models-egui"
+description = "egui front-end of ode-models: the dimension-erased VizModel contract, parameter forms, animated scenes, palette and playback clock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ode-models = { path = "../ode-models" }
+egui       = "0.35"
+egui_plot  = "0.36"
+nalgebra   = "0.34.1"
+web-time   = "1"
