@@ -296,12 +296,20 @@ published to crates.io; the apps never are.
    **Git and GitHub** (same day): the workspace became a git repository
    (fresh history, no import of the old `mortensen` repository; first
    commit `cb85bd5`) pushed to `github.com/sebastienimperiale/odeon`
-   (public, HTTPS remote authenticated through `gh`).
-   `.github/workflows/pages.yml` builds the page with trunk
-   (`--public-url /odeon/`) on every push to `main` and deploys it to
-   GitHub Pages (`https://sebastienimperiale.github.io/odeon/`, to be
-   opened with `?server=https://…`); Pages must be set to "GitHub
-   Actions" as source once. The
+   (public, HTTPS remote authenticated through `gh`; the `workflow`
+   scope is missing from that login, and the user does not want a
+   GitHub Actions workflow). **The page is published from a second
+   repository, `odeon-client`, whose content is exactly `dist/`**: its
+   working tree is `apps/observers-client/dist` and its git directory
+   `apps/observers-client/odeon-client.git` (both git-ignored by Odeon)
+   — trunk empties `dist/` at every build (verified: hidden files and
+   directories included), so the history cannot live inside it.
+   `apps/observers-client/publish.sh [public-url]` = `trunk build
+   --public-url /odeon-client/` + add/commit/push through
+   `git --git-dir=odeon-client.git` (the one-time setup is in its
+   header); `.nojekyll` is copied into the build by a `copy-file` link
+   in `index.html`. Page: `https://sebastienimperiale.github.io/odeon-client/`
+   (Pages source: branch `main`, root), opened with `?server=https://…`. The
    `.wasm` is ≈ 8 MB because the workspace release profile keeps debug
    symbols and `wasm-opt` is not installed (trunk skips it): install
    `binaryen` for a smaller page. 103 native tests, no warnings.

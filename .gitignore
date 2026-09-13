@@ -1,4 +1,5 @@
 /target
 /examples/output
 /apps/observers-client/dist
+/apps/observers-client/odeon-client.git
 .DS_Store
