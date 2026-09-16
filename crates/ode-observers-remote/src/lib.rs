@@ -18,9 +18,12 @@
 //!   `ehttp`, which issues the requests from a thread on native and through
 //!   `fetch` on wasm; nothing here is UI-specific.
 //!
-//! Floats travel as JSON; with `serde_json`'s `float_roundtrip` feature (on
+//! Jobs travel as JSON; with `serde_json`'s `float_roundtrip` feature (on
 //! here and on the server) a run fetched from the server equals the local
-//! run bit for bit. Time is `web_time::Instant` (std's on native, the
+//! run bit for bit. The output comes back in the binary encoding
+//! [`protocol::BINARY`] (`postcard`, exact floats, a third of the JSON's
+//! size and a copy rather than a text scan to decode) and the server
+//! gzips it in transit. Time is `web_time::Instant` (std's on native, the
 //! browser clock on wasm), so the client builds for the web.
 
 pub mod protocol;
@@ -184,6 +187,7 @@ impl<T: TryFrom<JobOutput, Error = String>> RemoteRun<T> {
         let mut request = ehttp::Request::get(protocol::run_url(&base, id));
         self.authorize(&mut request);
         let mut output_request = ehttp::Request::get(protocol::output_url(&base, id));
+        output_request.headers.insert("Accept", protocol::BINARY);
         self.authorize(&mut output_request);
         ehttp::fetch(request, move |response| {
             let status = match decode::<RunStatus>(response) {
@@ -211,7 +215,7 @@ impl<T: TryFrom<JobOutput, Error = String>> RemoteRun<T> {
             let state = state.clone();
             ehttp::fetch(output_request, move |response| {
                 let mut st = state.lock().unwrap();
-                match decode::<JobOutput>(response) {
+                match decode_output(response) {
                     Ok(out) => st.output = Some(out),
                     Err(e) => st.error = Some(e),
                 }
@@ -246,10 +250,28 @@ impl<T> Drop for RemoteRun<T> {
 /// Decode a JSON response, turning transport failures and non-2xx statuses
 /// into one error string.
 fn decode<D: serde::de::DeserializeOwned>(response: ehttp::Result<ehttp::Response>) -> Result<D, String> {
+    let response = check(response)?;
+    serde_json::from_slice(&response.bytes).map_err(|e| format!("cannot decode the server's answer: {e}"))
+}
+
+/// Decode the output, in the binary encoding when the server used it
+/// (its content type says so) and as JSON otherwise.
+fn decode_output(response: ehttp::Result<ehttp::Response>) -> Result<JobOutput, String> {
+    let response = check(response)?;
+    let binary = response.headers.get("content-type").is_some_and(|t| t.starts_with(protocol::BINARY));
+    if binary {
+        protocol::decode_output(&response.bytes).map_err(|e| format!("cannot decode the server's binary output: {e}"))
+    } else {
+        serde_json::from_slice(&response.bytes).map_err(|e| format!("cannot decode the server's output: {e}"))
+    }
+}
+
+/// Transport failures and non-2xx statuses as one error string.
+fn check(response: ehttp::Result<ehttp::Response>) -> Result<ehttp::Response, String> {
     let response = response.map_err(|e| format!("no answer from the server: {e}"))?;
     if !response.ok {
         let text = response.text().unwrap_or("").trim();
         return Err(format!("server answered {} {}{}{}", response.status, response.status_text, if text.is_empty() { "" } else { ": " }, text));
     }
-    serde_json::from_slice(&response.bytes).map_err(|e| format!("cannot decode the server's answer: {e}"))
+    Ok(response)
 }

@@ -16,7 +16,7 @@ ode-observers        = { path = "../../crates/ode-observers" }
 ode-observers-remote = { path = "../../crates/ode-observers-remote" }
 axum                 = "0.8"
 tokio                = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-tower-http           = { version = "0.6", features = ["cors", "fs"] }
+tower-http           = { version = "0.6", features = ["cors", "fs", "compression-gzip"] }
 serde                = { version = "1", features = ["derive", "rc"] }
 serde_json           = { version = "1", features = ["float_roundtrip"] }
 

@@ -468,7 +468,34 @@ pure-algorithms crate.
    443 as the TLS reverse proxy (`<host> { reverse_proxy 127.0.0.1:8787 }`),
    the page opened as `…/odeon-client/?server=https://<host>&token=…`.
    A 4 vCPU / 8 GB VPS covers the viewer's default runs; the target grid
-   sizes (26M–43M DOFs) do not fit a VPS.
+   sizes (26M–43M DOFs) do not fit a VPS. **Deployed the same day** on
+   `148.113.239.218:8787` (Ubuntu, user `ubuntu`, `~/odeon`, systemd unit
+   `odeon.service`; the page is built there with trunk and served by the
+   server itself over plain HTTP — the GitHub Pages copy is abandoned, no
+   Caddy/TLS; update = `git pull`, rebuild the server and the page,
+   `systemctl restart odeon`).
+   **Output transfer** (same day, after a slow first remote run: a default
+   spring filter run of 500 steps is 70 MB of JSON — one 81×81 snapshot
+   per step by default — downloaded then parsed single-threaded in wasm):
+   (a) `CompressionLayer` (gzip, tower-http) on the server, for clients
+   announcing it (browsers, ureq); (b) the **binary output**:
+   `GET /runs/{id}/output` answers `application/octet-stream` when the
+   request accepts it — `protocol::encode_output` / `decode_output`, one
+   tag byte (0 filter, 1 window, 2 particles, 3 tracker) then the output
+   in `postcard` (exact 8-byte floats; the tag byte replaces `JobOutput`'s
+   adjacently tagged form, which postcard cannot read — `ode-observers`
+   untouched) — JSON otherwise (curl, scripts); `RemoteRun` asks for it and
+   decodes by content type; encoding runs on `spawn_blocking`. Measured
+   (500-step spring, M4 Pro): filter 70.5 MB JSON → 26.3 MB binary (gzip:
+   30.8 → 25.0 MB); particles 19.6 → 8.0 MB (gzip 6.9 → 5.8 MB); encode
+   and decode of the binary are milliseconds. Test `output_formats_agree`
+   (both formats decode to the same output, binary < half the JSON).
+   The remaining lever is the number of snapshots (the Outputs slider);
+   the default of one per step is the old viewer's.
+
+**Golden rule (2026-09-16): nothing touches the algorithms of `ode-observers`
+(nor the models' physics) without the user's explicit consent.** Plumbing —
+derives, formats, jobs, server, UI — is fine; numerics never.
 
 Conventions carried over: all linear solves through nalgebra; English,
 Unicode-math doc comments citing the papers by name; tests pin every

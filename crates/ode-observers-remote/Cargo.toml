@@ -11,4 +11,5 @@ ode-observers = { path = "../ode-observers" }
 ehttp         = "0.5"
 serde         = { version = "1", features = ["derive"] }
 serde_json    = { version = "1", features = ["float_roundtrip"] }
+postcard      = { version = "1", features = ["alloc"] }
 web-time      = "1"

@@ -50,19 +50,20 @@
 //! status rather than killing the server.
 
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
-use axum::http::header::AUTHORIZATION;
-use axum::http::StatusCode;
+use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ode_models_spec::progress::Progress;
 use ode_observers::jobs::{Estimator, FilterConfig, JobOutput, JobSpec};
-use ode_observers_remote::protocol::{NewRun, RunStatus, TwinJob};
+use ode_observers_remote::protocol::{self, NewRun, RunStatus, TwinJob};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
@@ -208,8 +209,12 @@ pub fn router(web_dir: Option<&str>, settings: Settings) -> Router {
     // A job carries its reference (states and observations of every
     // step): a long run is tens of megabytes of JSON, far beyond axum's
     // default 2 MB body limit. The CORS layer is outermost so that
-    // preflight requests are answered before the token check.
-    router.layer(CorsLayer::permissive()).layer(DefaultBodyLimit::max(1 << 30))
+    // preflight requests are answered before the token check; answers
+    // are gzipped for clients accepting it (an output is megabytes).
+    router
+        .layer(CompressionLayer::new())
+        .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(1 << 30))
 }
 
 /// With a token configured, refuse (401) any API request not carrying it
@@ -392,16 +397,30 @@ async fn status(State(runs): State<Runs>, Path(id): Path<u64>) -> Result<Json<Ru
     }))
 }
 
-/// `GET /runs/{id}/output`: the output of a finished run.
-async fn output(State(runs): State<Runs>, Path(id): Path<u64>) -> Result<Json<Arc<JobOutput>>, (StatusCode, String)> {
+/// `GET /runs/{id}/output`: the output of a finished run — the binary
+/// encoding (`postcard`, [`protocol::BINARY`]) when the request accepts
+/// it, JSON otherwise (curl, scripts).
+async fn output(State(runs): State<Runs>, Path(id): Path<u64>, headers: HeaderMap) -> Result<Response, (StatusCode, String)> {
     let run = runs.get(id).ok_or((StatusCode::NOT_FOUND, format!("no run {id}")))?;
     run.touch();
-    let result = run.result.lock().unwrap();
-    match &*result {
-        None => Err((StatusCode::CONFLICT, format!("run {id} is not finished"))),
-        Some(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.clone())),
-        Some(Ok(out)) => Ok(Json(out.clone())),
+    let out = {
+        let result = run.result.lock().unwrap();
+        match &*result {
+            None => return Err((StatusCode::CONFLICT, format!("run {id} is not finished"))),
+            Some(Err(e)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.clone())),
+            Some(Ok(out)) => out.clone(),
+        }
+    };
+    let binary = headers.get(ACCEPT).and_then(|v| v.to_str().ok()).is_some_and(|a| a.contains(protocol::BINARY));
+    if !binary {
+        return Ok(Json(out).into_response());
     }
+    // Encoding tens of megabytes: off the request threads.
+    let bytes = tokio::task::spawn_blocking(move || protocol::encode_output(&out))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encoding panicked: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot encode the output: {e}")))?;
+    Ok(([(CONTENT_TYPE, protocol::BINARY)], bytes).into_response())
 }
 
 /// `DELETE /runs/{id}`: ask the job to stop at its next iteration and
@@ -756,5 +775,43 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(600)).await;
         let r = fetch(ehttp::Request::get(format!("{base}/runs/{id}"))).await;
         assert_eq!(r.status, 404, "the idle run was not dropped");
+    }
+
+    /// The output route serves JSON by default (curl, scripts) and the
+    /// binary encoding on request; both decode to the same output, and the
+    /// client handle gets the binary one.
+    #[tokio::test]
+    async fn output_formats_agree() {
+        let base = serve().await;
+        let job = spring_job(Estimator::Filter, 10);
+        let run = RemoteRun::<FilterOutput>::spawn(&base, &job);
+        let out = take(run).await.unwrap();
+        // The handle deleted the run on drop; post it again and fetch the
+        // output by hand in both formats.
+        let mut request = ehttp::Request::post(format!("{base}/runs"), serde_json::to_vec(&job).unwrap());
+        request.headers = ehttp::Headers::new(&[("Content-Type", "application/json")]);
+        let id = serde_json::from_slice::<NewRun>(&fetch(request).await.bytes).unwrap().id;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let json = loop {
+            let r = fetch(ehttp::Request::get(format!("{base}/runs/{id}/output"))).await;
+            if r.status == 200 {
+                break r;
+            }
+            assert!(Instant::now() < deadline && r.status == 409, "{}", r.status);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(json.headers.get("content-type").unwrap().starts_with("application/json"));
+        let mut request = ehttp::Request::get(format!("{base}/runs/{id}/output"));
+        request.headers = ehttp::Headers::new(&[("Accept", protocol::BINARY)]);
+        let binary = fetch(request).await;
+        assert_eq!(binary.headers.get("content-type"), Some(protocol::BINARY));
+        assert!(binary.bytes.len() * 2 < json.bytes.len(), "binary {} vs json {}", binary.bytes.len(), json.bytes.len());
+        let from_json: JobOutput = serde_json::from_slice(&json.bytes).unwrap();
+        let from_binary = protocol::decode_output(&binary.bytes).unwrap();
+        let (JobOutput::Filter(a), JobOutput::Filter(b)) = (from_json, from_binary) else { panic!("not filter outputs") };
+        assert_eq!(a.estimates, b.estimates);
+        assert_eq!(a.marginals, b.marginals);
+        assert_eq!(a.estimates, out.estimates);
+        assert_eq!(a.marginals, out.marginals);
     }
 }
