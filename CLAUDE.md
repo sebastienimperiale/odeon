@@ -468,12 +468,9 @@ pure-algorithms crate.
    443 as the TLS reverse proxy (`<host> { reverse_proxy 127.0.0.1:8787 }`),
    the page opened as `…/odeon-client/?server=https://<host>&token=…`.
    A 4 vCPU / 8 GB VPS covers the viewer's default runs; the target grid
-   sizes (26M–43M DOFs) do not fit a VPS. **Deployed the same day** on
-   `148.113.239.218:8787` (Ubuntu, user `ubuntu`, `~/odeon`, systemd unit
-   `odeon.service`; the page is built there with trunk and served by the
-   server itself over plain HTTP — the GitHub Pages copy is abandoned, no
-   Caddy/TLS; update = `git pull`, rebuild the server and the page,
-   `systemctl restart odeon`).
+   sizes (26M–43M DOFs) do not fit a VPS. **Deployed the same day** —
+   see "VPS deployment" below (the page is built and served on the VPS
+   itself; the GitHub Pages copy is abandoned).
    **Output transfer** (same day, after a slow first remote run: a default
    spring filter run of 500 steps is 70 MB of JSON — one 81×81 snapshot
    per step by default — downloaded then parsed single-threaded in wasm):
@@ -515,6 +512,59 @@ cargo run -p odeon-observers-client --release             # the same viewer send
 cargo run -p odeon-observers-server --release             # …then serves it at http://127.0.0.1:8787/ (or ODEON_WEB_DIR=<dist>)
 python scripts/visualize_filter.py one_spring             # figures from a CLI run
 ```
+
+## VPS deployment (operations, 2026-09-16)
+
+The observers server and its web page run on an OVH VPS; the GitHub
+Pages copy of the page (`odeon-client` repository, `publish.sh`) is
+abandoned. Everything below was set up by hand over SSH; there is no
+deployment script yet.
+
+| What | Value |
+|------|-------|
+| Machine | OVH VPS, Ubuntu, IPv4 `148.113.239.218`, hostname `vps-d837c56a.vps.ovh.ca` |
+| Login | `ssh ubuntu@148.113.239.218` (the Mac's `~/.ssh/id_rsa` key, registered in the OVH panel) |
+| Sources | `~/odeon`, a clone of `github.com/sebastienimperiale/odeon` (public, `main`) |
+| Toolchain | rustup stable, `wasm32-unknown-unknown` target, `trunk` (installed with `cargo install --locked trunk`, or the prebuilt binary if that fails) |
+| Server | `~/odeon/target/release/observers-server`, systemd unit `/etc/systemd/system/odeon.service` (user `ubuntu`, `Restart=on-failure`), env `ODEON_SERVER_ADDR=127.0.0.1:8787`, `ODEON_TOKEN=ananke`, no `ODEON_WEB_DIR` (default = `~/odeon/apps/observers-client/dist`) |
+| Page | built on the VPS: `cd ~/odeon/apps/observers-client && trunk build --public-url /` → `dist/`, served by the server at `/` |
+| TLS | Caddy (`apt install caddy`), `/etc/caddy/Caddyfile` = `vps-d837c56a.vps.ovh.ca { reverse_proxy 127.0.0.1:8787 }`, Let's Encrypt certificate obtained and renewed by Caddy; firewall `ufw`: OpenSSH, 80, 443 open, 8787 closed |
+| URL | `https://vps-d837c56a.vps.ovh.ca/?token=ananke` (the token once per browser; the page remembers it and the server URL defaults to the page's origin) |
+
+The token is deliberately a plain word (user's choice); an intruder knowing
+it can only submit jobs within the limits. Change it in the unit file and
+`systemctl restart odeon`; browsers then need `?token=` once more.
+
+Everyday commands, on the VPS:
+
+```sh
+# update to the pushed main branch (server + page), restart
+cd ~/odeon && git pull
+cargo build --release -p odeon-observers-server
+(cd apps/observers-client && trunk build --public-url /)
+sudo systemctl restart odeon
+# state and logs
+systemctl status odeon --no-pager
+sudo journalctl -u odeon -f            # live log (startup prints the limits and the access mode)
+sudo journalctl -u caddy -n 20 --no-pager
+pgrep -a observers-server              # exactly one instance expected
+sudo ss -ltnp | grep 8787              # one listener, 127.0.0.1 only
+# change the served name (after the DNS A record exists)
+sudo sed -i 's|OLD|NEW|' /etc/caddy/Caddyfile && sudo systemctl reload caddy
+```
+
+Sizing: the viewer's default runs (2D springs, lamppost, 3D Lorenz, 4D at
+21⁴) fit a 4 vCPU / 8 GB VPS; the limits in `ODEON_MAX_*` keep one
+request from claiming more (see step 8). Browsers refuse to let an HTTPS
+page call an `http://` server, which is why Caddy exists; a bare IP
+cannot get a browser-trusted certificate, hence the OVH hostname (a bought
+domain would replace it by editing the Caddyfile only). After a page
+rebuild, hard-refresh the browser (Shift + reload) to drop the old wasm.
+
+Known first-time pitfalls met: `apt` waiting on the unattended-upgrades
+lock right after install (wait, do not kill it); `cargo install trunk`
+without `--locked` failing to compile `lightningcss`; a manual test
+instance of the server still holding port 8787 when the service starts.
 
 # Inherited design notes (from the `mortensen` repository, 2026-09-13)
 
