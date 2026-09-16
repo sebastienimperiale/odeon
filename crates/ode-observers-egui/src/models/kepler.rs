@@ -24,10 +24,10 @@
 use super::{EstimatorHints, SceneMap, VarHint, VizModel, draw_trace};
 use crate::noise::NoiseModel;
 use crate::palette;
-use crate::playback::{Job, Progress, Trajectory};
-use ode_models::models::kepler::{KeplerObservation, KeplerParams, KeplerSystem, perihelion_state};
-use ode_models::models::kepler_mu::{KeplerMuParams, KeplerMuSystem, augmented_state};
-use ode_models::spec::ModelSpec;
+use crate::playback::Trajectory;
+use ode_models::models::kepler::{KeplerObservation, KeplerParams, perihelion_state};
+use ode_models::models::kepler_mu::{KeplerMuParams, augmented_state};
+use ode_models_spec::spec::{ModelSpec, TwinSpec};
 
 /// Eccentricity of the default orbit.
 const DEFAULT_E: f64 = 0.5;
@@ -86,8 +86,7 @@ impl Params {
         4 + usize::from(self.unknown_mu)
     }
 
-    /// Seed of the observation noise (shared by the plotted series and the
-    /// estimators' model-internal observations).
+    /// Seed of the observation noise of the twin experiment.
     fn noise_seed(&self) -> u64 {
         4000 + self.obs_idx as u64
     }
@@ -112,29 +111,6 @@ impl KeplerViz {
     /// does). Takes effect at the next `make_job`.
     pub fn set_unknown_mu(&mut self, on: bool) {
         self.params.unknown_mu = on;
-    }
-}
-
-/// Run the forward model of `p` for `steps` steps (bumping `progress` once
-/// per step), returning the trajectory as flat states: (q, p) of the plain
-/// orbit, or (q, p, θ) of the augmented one.
-fn run_forward(p: &Params, dt: f64, steps: usize, progress: &Progress) -> Vec<Vec<f64>> {
-    let obs = p.observation();
-    if p.unknown_mu {
-        let x0 = augmented_state(p.x0, p.theta);
-        let mut sys = KeplerMuSystem::with_params(p.mu_params(), x0, dt, obs);
-        for _ in 0..steps {
-            sys.forward();
-            progress.step();
-        }
-        sys.states.iter().map(|s| s.iter().copied().collect()).collect()
-    } else {
-        let mut sys = KeplerSystem::with_params(p.phys, p.x0, dt, obs);
-        for _ in 0..steps {
-            sys.forward();
-            progress.step();
-        }
-        sys.states.iter().map(|s| s.iter().copied().collect()).collect()
     }
 }
 
@@ -312,8 +288,8 @@ impl VizModel for KeplerViz {
         labels
     }
 
-    fn periodic(&self) -> Vec<bool> {
-        vec![false; self.params.dim()]
+    fn periodic(&self) -> Vec<Option<(f64, f64)>> {
+        vec![None; self.params.dim()]
     }
 
     /// The position and momentum planes; with the unknown μ the (q₁, θ)
@@ -343,53 +319,38 @@ impl VizModel for KeplerViz {
         hints
     }
 
+    fn snapshot(&mut self) {
+        self.drawn = self.params.clone();
+    }
+
     fn model_spec(&self) -> ModelSpec {
         let p = &self.drawn;
         if p.unknown_mu {
-            ModelSpec::KeplerMu {
-                params: p.mu_params(),
-                x0: p.x0,
-                theta: p.theta,
-                observation: p.observation(),
-                noise: p.obs_noise[p.obs_idx],
-                noise_seed: p.noise_seed(),
-            }
+            ModelSpec::KeplerMu { params: p.mu_params(), observation: p.observation() }
         } else {
-            ModelSpec::Kepler {
-                params: p.phys,
-                x0: p.x0,
-                observation: p.observation(),
-                noise: p.obs_noise[p.obs_idx],
-                noise_seed: p.noise_seed(),
-            }
+            ModelSpec::Kepler { params: p.phys, observation: p.observation() }
         }
     }
 
-    fn make_job(&mut self, dt: f64, steps: usize) -> Job {
-        self.drawn = self.params.clone();
-        let p = self.params.clone();
-        Box::new(move |progress| {
-            let obs = p.observation();
-            let states = run_forward(&p, dt, steps, progress);
-            let mut observations: Vec<Vec<f64>> =
-                states.iter().map(|s| vec![obs.h(s)]).collect();
-            let noise = p.obs_noise[p.obs_idx];
-            let eta = noise.realize(observations.len(), dt, p.noise_seed());
-            for (o, e) in observations.iter_mut().zip(eta) {
-                o[0] += e;
-            }
-            let obs_labels = vec![if noise.is_none() {
-                obs.label().to_string()
-            } else {
-                format!("{} (noisy)", obs.label())
-            }];
-            Trajectory {
-                dt,
-                states,
-                observations,
-                obs_labels,
-            }
-        })
+    /// The orbit from (q, p), augmented with θ_true when μ is unknown.
+    fn twin_spec(&self, dt: f64, steps: usize) -> TwinSpec {
+        let p = &self.drawn;
+        TwinSpec {
+            model: self.model_spec(),
+            x0: if p.unknown_mu { augmented_state(p.x0, p.theta).to_vec() } else { p.x0.to_vec() },
+            dt,
+            steps,
+            noise: p.obs_noise[p.obs_idx],
+            seed: p.noise_seed(),
+            walk: None,
+        }
+    }
+
+    fn obs_labels(&self) -> Vec<String> {
+        let p = &self.drawn;
+        let obs = p.observation();
+        let noise = p.obs_noise[p.obs_idx];
+        vec![if noise.is_none() { obs.label().to_string() } else { format!("{} (noisy)", obs.label()) }]
     }
 
     fn draw(
@@ -497,6 +458,7 @@ fn draw_scene(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playback::Progress;
 
     /// The option augments the run: dimension 5, θ label, the (q₁, θ)
     /// plane first, the twin-experiment hints on θ; off, everything is the

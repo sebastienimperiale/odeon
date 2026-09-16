@@ -1,13 +1,15 @@
 [package]
 name = "ode-observers-egui"
-description = "egui front-end of ode-observers: the estimator configuration panels and the four result views (filter density, tracking density, particles, tracker)"
+description = "egui front-end of ode-models and ode-observers: the VizModel contract with the model entries and their scenes, the estimator panels, the four result views and the observers application"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 ode-models      = { path = "../ode-models" }
+ode-models-spec = { path = "../ode-models-spec" }
 ode-observers   = { path = "../ode-observers" }
-ode-models-egui = { path = "../ode-models-egui" }
 egui            = "0.35"
 egui_plot       = "0.36"
+nalgebra        = "0.34.1"
+web-time        = "1"

@@ -6,9 +6,10 @@
 use super::{EstimatorHints, SceneMap, VarHint, VizModel, draw_trace};
 use crate::noise::NoiseModel;
 use crate::palette;
-use crate::playback::{Job, Trajectory};
-use ode_models::spec::ModelSpec;
-use ode_models::models::random_walk::{DEFAULT_STATE, DIM, RandomWalkSystem};
+use crate::playback::Trajectory;
+use ode_models::models::lamppost::{DEFAULT_STATE, DIM};
+use ode_models_spec::reference::Walk;
+use ode_models_spec::spec::{ModelSpec, TwinSpec};
 
 /// Half-width of the scene window (world units, centered on the lamppost).
 const WINDOW: f64 = 2.0;
@@ -31,27 +32,16 @@ impl Default for Params {
     }
 }
 
-impl Params {
-    fn system(&self, dt: f64, seed: u64) -> RandomWalkSystem {
-        let sys = RandomWalkSystem::new(self.x0, dt);
-        if self.walk_std > 0.0 {
-            sys.with_walk(self.walk_std, seed)
-        } else {
-            sys
-        }
-    }
-}
-
 #[derive(Default)]
-pub struct RandomWalkViz {
+pub struct LamppostViz {
     params: Params,
     /// Snapshot taken by `make_job`; the scene is drawn with these.
     drawn: Params,
 }
 
-impl VizModel for RandomWalkViz {
+impl VizModel for LamppostViz {
     fn name(&self) -> &'static str {
-        "Random walk"
+        "Lamppost"
     }
 
     fn description(&self) -> String {
@@ -118,15 +108,15 @@ impl VizModel for RandomWalkViz {
     fn toggle_obs(&mut self, _idx: usize) {}
 
     fn noise_ui(&mut self, ui: &mut egui::Ui, _idx: usize) -> bool {
-        crate::noise::noise_ui(&mut self.params.obs_noise, ui, "random_walk_noise")
+        crate::noise::noise_ui(&mut self.params.obs_noise, ui, "lamppost_noise")
     }
 
     fn state_labels(&self) -> Vec<String> {
         vec!["x".into(), "y".into()]
     }
 
-    fn periodic(&self) -> Vec<bool> {
-        vec![false; DIM]
+    fn periodic(&self) -> Vec<Option<(f64, f64)>> {
+        vec![None; DIM]
     }
 
     fn default_pairs(&self) -> Vec<(usize, usize)> {
@@ -141,44 +131,31 @@ impl VizModel for RandomWalkViz {
         EstimatorHints { vars: vec![var; DIM], eps: Some(0.05) }
     }
 
+    fn snapshot(&mut self) {
+        self.drawn = self.params.clone();
+    }
+
     fn model_spec(&self) -> ModelSpec {
+        ModelSpec::Lamppost
+    }
+
+    /// The man at x₀, walking when the form asks for it (seed 7000), the
+    /// squared distance observed with the form's noise (seed 7100).
+    fn twin_spec(&self, dt: f64, steps: usize) -> TwinSpec {
         let p = &self.drawn;
-        ModelSpec::RandomWalk {
-            x0: p.x0,
-            walk_std: p.walk_std,
-            walk_seed: 7000,
+        TwinSpec {
+            model: ModelSpec::Lamppost,
+            x0: p.x0.to_vec(),
+            dt,
+            steps,
             noise: p.obs_noise,
-            noise_seed: 7100,
+            seed: 7100,
+            walk: (p.walk_std > 0.0).then_some(Walk { std: p.walk_std, seed: 7000 }),
         }
     }
 
-    fn make_job(&mut self, dt: f64, steps: usize) -> Job {
-        self.drawn = self.params.clone();
-        let p = self.params.clone();
-        Box::new(move |progress| {
-            let mut sys = p.system(dt, 7000);
-            for _ in 0..steps {
-                sys.forward();
-                progress.step();
-            }
-            let states: Vec<Vec<f64>> = sys.states.iter().map(|s| s.iter().copied().collect()).collect();
-            let mut observations: Vec<Vec<f64>> = states.iter().map(|s| vec![sys.h(s)]).collect();
-            let eta = p.obs_noise.realize(observations.len(), dt, 7100);
-            for (o, e) in observations.iter_mut().zip(eta) {
-                o[0] += e;
-            }
-            let obs_labels = vec![if p.obs_noise.is_none() {
-                "x² + y²".to_string()
-            } else {
-                "x² + y² (noisy)".to_string()
-            }];
-            Trajectory {
-                dt,
-                states,
-                observations,
-                obs_labels,
-            }
-        })
+    fn obs_labels(&self) -> Vec<String> {
+        vec![if self.drawn.obs_noise.is_none() { "x² + y²".to_string() } else { "x² + y² (noisy)".to_string() }]
     }
 
     fn draw(
@@ -224,7 +201,7 @@ mod tests {
     /// pipeline, is tested in the viewer app.)
     #[test]
     fn hints_cover_the_ring() {
-        let viz = RandomWalkViz::default();
+        let viz = LamppostViz::default();
         let hints = viz.estimator_hints();
         assert_eq!(hints.vars.len(), DIM);
         assert!(hints.vars.iter().all(|v| v.domain == Some((-WINDOW, WINDOW))));

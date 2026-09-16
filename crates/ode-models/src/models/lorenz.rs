@@ -15,23 +15,24 @@
 //! C± = (±√(β(ρ−1)), ±√(β(ρ−1)), ρ−1) (the centers of the two wings).
 //!
 //! Time stepping: the same Gauss–Legendre 4 scheme as the other nonlinear
-//! models ([`super::gl4`]; no energy to conserve here, but it is A-stable
+//! models ([`crate::gl4`]; no energy to conserve here, but it is A-stable
 //! and symmetric, so flow_inv = one step with −dt is exact). Note the inverse flow of a dissipative system is expanding: grid
 //! points near the filter-domain boundary are mapped far outside and folded
 //! back by the extension, so leave a generous margin around the attractor.
 //!
 //! The observation is one coordinate ([`LorenzObservation`]: X, Y or Z).
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use crate::model::Model;
-use crate::noise::{NoiseModel, NoiseSampler};
 use nalgebra::{DMatrix, DVector};
 
 /// State dimension: (x, y, z).
 pub const DIM: usize = 3;
 
 /// Parameters of the Lorenz-63 system. [`Default`]: σ = 10, ρ = 28, β = 8/3.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LorenzParams {
     /// Prandtl number σ.
     pub sigma: f64,
@@ -52,8 +53,9 @@ impl Default for LorenzParams {
 }
 
 /// The observed coordinate h(x) of the Lorenz system.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum LorenzObservation {
     #[default]
     X,
@@ -92,9 +94,8 @@ impl LorenzObservation {
 /// ```
 /// use ode_models::models::lorenz::{DIM, LorenzObservation, LorenzSystem};
 ///
-/// let mut sys = LorenzSystem::new([1.0, 1.0, 1.0], 0.01, LorenzObservation::X);
-/// sys.forward();                    // one step: t^0 → t^1
-/// // sys.states[n] = (x, y, z) at t^n
+/// let sys = LorenzSystem::new(0.01, LorenzObservation::X);
+/// let x1 = sys.flow(&[1.0, 1.0, 1.0]); // one step: t^0 → t^1
 /// ```
 pub struct LorenzSystem {
     // ── Public ───────────────────────────────────────────────────────────────
@@ -103,57 +104,24 @@ pub struct LorenzSystem {
     pub params: LorenzParams,
     /// Which coordinate the system reports as observation.
     pub observation: LorenzObservation,
-    /// Trajectory so far: `states[n]` = (x, y, z) at t^n. Holds the initial
-    /// condition after [`new`]; each [`forward`] call appends one state.
-    /// The last entry is the current state.
-    pub states: Vec<DVector<f64>>,
 
-    // ── Private (observation) ────────────────────────────────────────────────
-    /// Cached observation of the current state, y_n = h(x_n) + η_n (η ≡ 0
-    /// without [`with_obs_noise`](Self::with_obs_noise)); refreshed by
-    /// [`forward`].
-    y_obs: f64,
-    /// Observation-noise draws, one per step.
-    noise: NoiseSampler,
 }
 
 impl LorenzSystem {
     /// Build the system with the classic parameters ([`LorenzParams::default`]).
     ///
-    /// * `x0`          — initial state (x, y, z)
+    /// The state is (x, y, z).
+    ///
     /// * `dt`          — time step
     /// * `observation` — the observed coordinate
-    pub fn new(x0: [f64; DIM], dt: f64, observation: LorenzObservation) -> Self {
-        Self::with_params(LorenzParams::default(), x0, dt, observation)
+    pub fn new(dt: f64, observation: LorenzObservation) -> Self {
+        Self::with_params(LorenzParams::default(), dt, observation)
     }
 
     /// Build the system from explicit parameters (see [`new`](Self::new) for
     /// the other arguments).
-    pub fn with_params(
-        params: LorenzParams,
-        x0: [f64; DIM],
-        dt: f64,
-        observation: LorenzObservation,
-    ) -> Self {
-        LorenzSystem {
-            dt,
-            params,
-            observation,
-            states: vec![DVector::from_row_slice(&x0)],
-            y_obs: observation.h(&x0),
-            noise: NoiseModel::None.sampler(dt, 0),
-        }
-    }
-
-    /// Add observation noise: from now on the cached observation is
-    /// y_n = h(x_n) + η_n with η drawn from `noise` (deterministic in
-    /// `seed`). Re-caches the current observation with the first draw, so
-    /// call this right after construction.
-    pub fn with_obs_noise(mut self, noise: NoiseModel, seed: u64) -> Self {
-        self.noise = noise.sampler(self.dt, seed);
-        let x = self.states.last().expect("states holds the initial condition");
-        self.y_obs = self.observation.h(x.as_slice()) + self.noise.next_sample();
-        self
+    pub fn with_params(params: LorenzParams, dt: f64, observation: LorenzObservation) -> Self {
+        LorenzSystem { dt, params, observation }
     }
 
     /// The non-trivial fixed points C± for the current parameters (ρ > 1):
@@ -166,27 +134,10 @@ impl LorenzSystem {
         })
     }
 
-    /// Forward operator: advance the current state one Gauss–Legendre step,
-    /// t^n → t^{n+1}.
-    ///
-    /// The current state is the last entry of [`states`]; the new state is
-    /// appended and becomes the current one.
-    pub fn forward(&mut self) {
-        let x = self
-            .states
-            .last()
-            .expect("states holds the initial condition");
-        let x = std::array::from_fn(|i| x[i]);
-        let x_next = self.step(&x, self.dt);
-        self.y_obs = self.observation.h(&x_next) + self.noise.next_sample();
-        self.states.push(DVector::from_row_slice(&x_next));
-    }
-
-    /// Squared discrepancy |y_n − h(xi)|² between the current observation
-    /// y_n = h(x_n) (the last entry of [`states`]) and the observation of an
-    /// arbitrary input state.
-    pub fn discrepancy(&self, xi: &[f64]) -> f64 {
-        let d = self.y_obs - self.observation.h(xi);
+    /// Squared discrepancy |y − h(xi)|² between an observation `y` (one
+    /// component) and the observation of an arbitrary input state.
+    pub fn discrepancy(&self, y: &[f64], xi: &[f64]) -> f64 {
+        let d = y[0] - self.observation.h(xi);
         d * d
     }
 
@@ -209,9 +160,9 @@ impl LorenzSystem {
     }
 
     /// One step of the fourth-order Gauss–Legendre method (shared solver,
-    /// see [`super::gl4`]).
+    /// see [`crate::gl4`]).
     fn step(&self, x: &[f64; DIM], h: f64) -> [f64; DIM] {
-        super::gl4::gl4_step(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, h)
+        crate::gl4::gl4_step(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, h)
     }
 
     /// Discrete flow map φ: one Gauss–Legendre step of size `dt`.
@@ -220,9 +171,9 @@ impl LorenzSystem {
     }
 
     /// φ(x) together with its exact Jacobian ∂φ/∂x (see
-    /// [`super::gl4::gl4_step_with_jacobian`]).
+    /// [`crate::gl4::gl4_step_with_jacobian`]).
     pub fn flow_with_jacobian(&self, x: &[f64; DIM]) -> ([f64; DIM], [[f64; DIM]; DIM]) {
-        super::gl4::gl4_step_with_jacobian(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, self.dt)
+        crate::gl4::gl4_step_with_jacobian(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, self.dt)
     }
 
     /// Inverse discrete flow map φ⁻¹: one Gauss–Legendre step of size `−dt`.
@@ -239,12 +190,8 @@ impl Model<DIM> for LorenzSystem {
         self.dt
     }
 
-    fn forward(&mut self) {
-        LorenzSystem::forward(self);
-    }
-
-    fn discrepancy(&self, xi: &[f64]) -> f64 {
-        LorenzSystem::discrepancy(self, xi)
+    fn discrepancy(&self, y: &[f64], xi: &[f64]) -> f64 {
+        LorenzSystem::discrepancy(self, y, xi)
     }
 
     fn flow_inv(&self, xi: [f64; DIM]) -> [f64; DIM] {
@@ -259,16 +206,12 @@ impl Model<DIM> for LorenzSystem {
         self.flow_with_jacobian(&xi).1
     }
 
-    fn n_obs(&self) -> usize {
+    fn obs_dim(&self) -> usize {
         1
     }
 
-    fn h(&self, xi: &[f64]) -> DVector<f64> {
+    fn obs(&self, xi: &[f64]) -> DVector<f64> {
         DVector::from_element(1, self.observation.h(xi))
-    }
-
-    fn y_obs(&self) -> DVector<f64> {
-        DVector::from_element(1, self.y_obs)
     }
 
     fn obs_jacobian(&self, _xi: &[f64]) -> DMatrix<f64> {
@@ -280,10 +223,6 @@ impl Model<DIM> for LorenzSystem {
     /// The vector field is time-independent: autonomous.
     fn is_autonomous(&self) -> bool {
         true
-    }
-
-    fn states(&self) -> &[DVector<f64>] {
-        &self.states
     }
 
     fn state_labels(&self) -> Vec<String> {
@@ -306,7 +245,7 @@ mod tests {
 
     #[test]
     fn jacobian_matches_finite_differences() {
-        let sys = LorenzSystem::with_params(ODD_PARAMS, X0, 0.01, LorenzObservation::X);
+        let sys = LorenzSystem::with_params(ODD_PARAMS, 0.01, LorenzObservation::X);
         let x = [-3.2, 4.1, 17.5];
         let jac = sys.rhs_jacobian(&x);
         let eps = 1e-6;
@@ -330,7 +269,7 @@ mod tests {
 
     #[test]
     fn flow_inv_inverts_flow() {
-        let sys = LorenzSystem::new([-8.0, 7.0, 27.0], 0.01, LorenzObservation::Y);
+        let sys = LorenzSystem::new(0.01, LorenzObservation::Y);
         let x0 = [-8.0, 7.0, 27.0];
         let y = sys.flow(&x0);
         let z = sys.flow_inv(&y);
@@ -346,7 +285,7 @@ mod tests {
     /// The fixed points C± are stationary for the discrete flow too.
     #[test]
     fn fixed_points_are_stationary() {
-        let sys = LorenzSystem::with_params(ODD_PARAMS, X0, 0.02, LorenzObservation::Z);
+        let sys = LorenzSystem::with_params(ODD_PARAMS, 0.02, LorenzObservation::Z);
         for c in sys.fixed_points().expect("ρ > 1") {
             let y = sys.flow(&c);
             for i in 0..DIM {
@@ -362,13 +301,14 @@ mod tests {
     /// |x| ≲ 20, |y| ≲ 28, 0 < z ≲ 50).
     #[test]
     fn trajectory_is_bounded() {
-        let mut sys = LorenzSystem::new(X0, 0.01, LorenzObservation::X);
-        for _ in 0..5000 {
-            sys.forward();
-        }
-        for s in &sys.states[500..] {
-            assert!(s[0].abs() < 25.0 && s[1].abs() < 35.0 && s[2] > 0.0 && s[2] < 60.0,
-                "left the attractor: {s}");
+        let sys = LorenzSystem::new(0.01, LorenzObservation::X);
+        let mut s = X0;
+        for n in 0..5000 {
+            s = sys.flow(&s);
+            if n >= 500 {
+                assert!(s[0].abs() < 25.0 && s[1].abs() < 35.0 && s[2] > 0.0 && s[2] < 60.0,
+                    "left the attractor: {s:?}");
+            }
         }
     }
 
@@ -378,12 +318,12 @@ mod tests {
     fn scheme_is_fourth_order() {
         let t = 0.5;
         let solve = |dt: f64| {
-            let mut sys = LorenzSystem::new(X0, dt, LorenzObservation::X);
+            let sys = LorenzSystem::new(dt, LorenzObservation::X);
+            let mut s = X0;
             for _ in 0..(t / dt).round() as usize {
-                sys.forward();
+                s = sys.flow(&s);
             }
-            let s = sys.states.last().unwrap();
-            [s[0], s[1], s[2]]
+            s
         };
         let reference = solve(2.5e-4);
         let err = |dt: f64| {

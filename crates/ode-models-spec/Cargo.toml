@@ -1,0 +1,14 @@
+[package]
+name = "ode-models-spec"
+description = "The driving layer of ode-models: models as plain data (ModelSpec, the dimension-erasing visitor), twin experiments and their references (trajectory + observations, noise models), the progress handle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ode-models = { path = "../ode-models", features = ["serde"] }
+nalgebra   = "0.34.1"
+serde      = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["float_roundtrip"] }

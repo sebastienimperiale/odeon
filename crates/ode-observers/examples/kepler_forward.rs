@@ -8,6 +8,9 @@
 
 use ode_models::models::kepler::{DIM, KeplerObservation, KeplerSystem, perihelion_state};
 use ode_observers::output::save_forward;
+use ode_models_spec::noise::NoiseModel;
+use ode_models_spec::progress::Progress;
+use ode_models_spec::reference::Reference;
 
 fn main() {
     let dt = 0.01;
@@ -16,12 +19,10 @@ fn main() {
     // Initial data: perihelion of the e = 0.5 orbit of semi-major axis 1.
     let x0 = perihelion_state(0.5);
 
-    let mut sys = KeplerSystem::new(x0, dt, KeplerObservation::Q1);
+    let sys = KeplerSystem::new(dt, KeplerObservation::Q1);
 
     let n_steps = (t_end / dt).ceil() as usize;
-    for _ in 0..n_steps {
-        sys.forward();
-    }
+    let reference = Reference::twin(&sys, x0, n_steps, NoiseModel::None, 0, None, &Progress::default());
 
-    save_forward::<DIM, _>(&sys, "examples/output/kepler_forward");
+    save_forward::<DIM, _>(&sys, &reference, "examples/output/kepler_forward");
 }

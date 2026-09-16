@@ -2,14 +2,19 @@
 //! and its client.
 //!
 //! * [`protocol`] — the JSON messages and the routes: a
-//!   [`JobSpec`](ode_observers::jobs::JobSpec) is POSTed to `/runs` and
+//!   [`JobSpec`] is POSTed to `/runs` and
 //!   answered by a [`protocol::NewRun`]; `GET /runs/{id}` returns a
-//!   [`protocol::RunStatus`]; `GET /runs/{id}/output` the
-//!   [`JobOutput`](ode_observers::jobs::JobOutput) once finished;
+//!   [`protocol::RunStatus`]; `GET /runs/{id}/output` the [`JobOutput`]
+//!   once finished;
 //!   `DELETE /runs/{id}` cancels (and forgets) the run.
 //! * [`RemoteRun`] — the client: a handle on a run executing on the server,
 //!   with the same surface as a local run handle (`progress`, `elapsed`,
-//!   `try_take`) plus `error`, so a front-end can hold either. Built on
+//!   `try_take`) plus `error`, so a front-end can hold either. A run is
+//!   posted either as a twin experiment ([`RemoteRun::spawn_twin`], a few
+//!   kilobytes: the server generates the reference — what the viewers
+//!   use) or with its reference ([`RemoteRun::spawn`], for observations
+//!   that are not a twin experiment's); the `_with_token` variants carry
+//!   the bearer token of a server started with `ODEON_TOKEN`. Built on
 //!   `ehttp`, which issues the requests from a thread on native and through
 //!   `fetch` on wasm; nothing here is UI-specific.
 //!
@@ -21,7 +26,7 @@
 pub mod protocol;
 
 use ode_observers::jobs::{JobOutput, JobSpec};
-use protocol::{NewRun, RunStatus};
+use protocol::{NewRun, RunStatus, TwinJob};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -51,12 +56,14 @@ struct State {
 
 /// A run executing on the observers server: created by [`spawn`](Self::spawn),
 /// polled by [`try_take`](Self::try_take) (call it every frame — it issues
-/// at most one request per [`POLL_INTERVAL`]), cancelled on drop. `T` is
+/// at most one request per `POLL_INTERVAL`, 150 ms), cancelled on drop. `T` is
 /// the output type expected by the caller, extracted from the
 /// [`JobOutput`] the server returns (`FilterOutput`, `TrackerOutput`, …,
 /// which implement `TryFrom<JobOutput>`).
 pub struct RemoteRun<T> {
     base: String,
+    /// Bearer token sent with every request, when the server requires one.
+    token: Option<String>,
     total: usize,
     started: Instant,
     state: Arc<Mutex<State>>,
@@ -64,27 +71,53 @@ pub struct RemoteRun<T> {
 }
 
 impl<T: TryFrom<JobOutput, Error = String>> RemoteRun<T> {
-    /// POST the job description to the server at `base` (e.g.
-    /// `http://127.0.0.1:8787`) and return the handle at once; the id
-    /// arrives asynchronously, and any failure surfaces through
-    /// [`error`](Self::error).
+    /// POST the job description — reference included — to `/runs` of the
+    /// server at `base` (e.g. `http://127.0.0.1:8787`) and return the
+    /// handle at once; the id arrives asynchronously, and any failure
+    /// surfaces through [`error`](Self::error).
     pub fn spawn(base: &str, job: &JobSpec) -> Self {
+        Self::spawn_with_token(base, None, job)
+    }
+
+    /// [`spawn`](Self::spawn) with the server's bearer token (`ODEON_TOKEN`
+    /// on the server); `None` for an open server.
+    pub fn spawn_with_token(base: &str, token: Option<&str>, job: &JobSpec) -> Self {
+        Self::post(base, token, protocol::runs_url(base), serde_json::to_vec(job), job.steps())
+    }
+
+    /// POST a twin experiment to `/twin-runs`: the server generates the
+    /// reference (deterministic in the twin's seeds, so it is the run the
+    /// client computed for its own display) and runs the estimator on it.
+    /// A few kilobytes whatever the run length.
+    pub fn spawn_twin(base: &str, job: &TwinJob) -> Self {
+        Self::spawn_twin_with_token(base, None, job)
+    }
+
+    /// [`spawn_twin`](Self::spawn_twin) with the server's bearer token;
+    /// `None` for an open server.
+    pub fn spawn_twin_with_token(base: &str, token: Option<&str>, job: &TwinJob) -> Self {
+        Self::post(base, token, protocol::twin_runs_url(base), serde_json::to_vec(job), job.twin.steps)
+    }
+
+    fn post(base: &str, token: Option<&str>, url: String, body: serde_json::Result<Vec<u8>>, steps: usize) -> Self {
         let base = base.trim_end_matches('/').to_string();
         let state = Arc::new(Mutex::new(State::default()));
         let run = RemoteRun {
-            base: base.clone(),
-            total: job.steps.max(1),
+            base,
+            token: token.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string),
+            total: steps.max(1),
             started: Instant::now(),
             state: state.clone(),
             _out: PhantomData,
         };
-        match serde_json::to_vec(job) {
+        match body {
             Ok(body) => {
-                let mut request = ehttp::Request::post(protocol::runs_url(&base), body);
+                let mut request = ehttp::Request::post(url, body);
                 request.headers = ehttp::Headers::new(&[
                     ("Accept", "application/json"),
                     ("Content-Type", "application/json"),
                 ]);
+                run.authorize(&mut request);
                 ehttp::fetch(request, move |response| {
                     let mut st = state.lock().unwrap();
                     match decode::<NewRun>(response) {
@@ -148,7 +181,11 @@ impl<T: TryFrom<JobOutput, Error = String>> RemoteRun<T> {
 
         let state = self.state.clone();
         let base = self.base.clone();
-        ehttp::fetch(ehttp::Request::get(protocol::run_url(&base, id)), move |response| {
+        let mut request = ehttp::Request::get(protocol::run_url(&base, id));
+        self.authorize(&mut request);
+        let mut output_request = ehttp::Request::get(protocol::output_url(&base, id));
+        self.authorize(&mut output_request);
+        ehttp::fetch(request, move |response| {
             let status = match decode::<RunStatus>(response) {
                 Ok(s) => s,
                 Err(e) => {
@@ -172,7 +209,7 @@ impl<T: TryFrom<JobOutput, Error = String>> RemoteRun<T> {
             st.finished = true;
             drop(st);
             let state = state.clone();
-            ehttp::fetch(ehttp::Request::get(protocol::output_url(&base, id)), move |response| {
+            ehttp::fetch(output_request, move |response| {
                 let mut st = state.lock().unwrap();
                 match decode::<JobOutput>(response) {
                     Ok(out) => st.output = Some(out),
@@ -184,6 +221,15 @@ impl<T: TryFrom<JobOutput, Error = String>> RemoteRun<T> {
     }
 }
 
+impl<T> RemoteRun<T> {
+    /// Add the bearer token to `request`, if the server needs one.
+    fn authorize(&self, request: &mut ehttp::Request) {
+        if let Some(token) = &self.token {
+            request.headers.insert("Authorization", format!("Bearer {token}"));
+        }
+    }
+}
+
 impl<T> Drop for RemoteRun<T> {
     /// Cancel and forget the run on the server (a no-op for a run that
     /// already finished, apart from freeing its output there).
@@ -191,6 +237,7 @@ impl<T> Drop for RemoteRun<T> {
         if let Some(id) = self.state.lock().unwrap().id {
             let mut request = ehttp::Request::get(protocol::run_url(&self.base, id));
             request.method = "DELETE".to_owned();
+            self.authorize(&mut request);
             ehttp::fetch(request, |_| {});
         }
     }

@@ -36,20 +36,21 @@
 //! invariant at fixed θ, which the Gauss–Legendre scheme conserves
 //! *exactly* (to the Newton tolerance).
 //!
-//! Time stepping: the shared Gauss–Legendre 4 scheme ([`super::gl4`]) at
+//! Time stepping: the shared Gauss–Legendre 4 scheme ([`crate::gl4`]) at
 //! M = 2N + 1, by the library's convention for every nonlinear model (the θ
 //! dependence is nonlinear); Newton converges in one iteration since the
 //! stage equations are linear in (y, v) at the frozen θ. The `Model<M>`
 //! implementations are instantiated for N = 1, 2, 3 (M = 3, 5, 7).
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use crate::model::Model;
-use crate::noise::{NoiseModel, NoiseSampler};
 use nalgebra::{DMatrix, DVector};
 use std::f64::consts::LN_2;
 
 /// Physical parameters. [`Default`]: m = 1, m₀ = 1, k = 1.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SpringMassParams {
     /// Known mass of the bodies 1..N−1 (unused for N = 1).
     pub m: f64,
@@ -85,8 +86,8 @@ impl SpringMassParams {
 ///
 /// // Two bodies, free end displaced, true mass m₂ = 2^0.3·m₀, observing y₁:
 /// let x0 = SpringMassSystem::<2>::state([0.0, 0.3], [0.0, 0.0], 0.3);
-/// let mut sys = SpringMassSystem::<2>::new(&x0, 0.01, 0);
-/// sys.forward(); // one step: t^0 → t^1 (θ stays 0.3 exactly)
+/// let sys = SpringMassSystem::<2>::new(0.01, 0);
+/// let x1 = sys.flow(&x0); // one step: t^0 → t^1 (θ stays 0.3 exactly)
 /// ```
 pub struct SpringMassSystem<const N: usize> {
     // ── Public ───────────────────────────────────────────────────────────────
@@ -95,16 +96,6 @@ pub struct SpringMassSystem<const N: usize> {
     pub params: SpringMassParams,
     /// Index (0-based) of the observed position y_{obs+1}.
     pub obs: usize,
-    /// Trajectory so far: `states[n]` = (y, v, θ) at t^n; the θ component
-    /// is constant (the reference runs at the true mass).
-    pub states: Vec<DVector<f64>>,
-
-    // ── Private (observation) ────────────────────────────────────────────────
-    /// Cached observation of the current state, y_n = h(x_n) + η_n (η ≡ 0
-    /// without [`with_obs_noise`](Self::with_obs_noise)).
-    y_obs: f64,
-    /// Observation-noise draws, one per step.
-    noise: NoiseSampler,
 }
 
 impl<const N: usize> SpringMassSystem<N> {
@@ -114,50 +105,32 @@ impl<const N: usize> SpringMassSystem<N> {
     /// Build the system with the default physical parameters
     /// ([`SpringMassParams::default`]).
     ///
-    /// * `x0`  — initial state (y₁..y_N, v₁..v_N, θ), 2N + 1 entries; the θ
-    ///   component is the *true* log-parameter of the reference trajectory
+    /// The state is (y₁..y_N, v₁..v_N, θ), 2N + 1 entries; the θ component
+    /// of a reference trajectory is the *true* log-parameter.
+    ///
     /// * `dt`  — time step
     /// * `obs` — index (0-based) of the observed position
-    pub fn new(x0: &[f64], dt: f64, obs: usize) -> Self {
-        Self::with_params(SpringMassParams::default(), x0, dt, obs)
+    pub fn new(dt: f64, obs: usize) -> Self {
+        Self::with_params(SpringMassParams::default(), dt, obs)
     }
 
     /// Build the system from explicit physical parameters (see
     /// [`new`](Self::new) for the other arguments).
-    pub fn with_params(params: SpringMassParams, x0: &[f64], dt: f64, obs: usize) -> Self {
+    pub fn with_params(params: SpringMassParams, dt: f64, obs: usize) -> Self {
         assert!(N >= 1, "the chain needs at least one body");
-        assert_eq!(x0.len(), Self::DIM, "x0 must have 2N + 1 = {} entries", Self::DIM);
         assert!(obs < N, "observed position index {obs} out of range (N = {N})");
         assert!(params.m > 0.0 && params.m0 > 0.0 && params.k > 0.0, "masses and stiffness must be positive");
-        SpringMassSystem {
-            dt,
-            params,
-            obs,
-            states: vec![DVector::from_row_slice(x0)],
-            y_obs: x0[obs],
-            noise: NoiseModel::None.sampler(dt, 0),
-        }
-    }
-
-    /// Add observation noise: from now on the cached observation is
-    /// y_n = h(x_n) + η_n with η drawn from `noise` (deterministic in
-    /// `seed`). Re-caches the current observation with the first draw, so
-    /// call this right after construction.
-    pub fn with_obs_noise(mut self, noise: NoiseModel, seed: u64) -> Self {
-        self.noise = noise.sampler(self.dt, seed);
-        let x = self.states.last().expect("states holds the initial condition");
-        self.y_obs = x[self.obs] + self.noise.next_sample();
-        self
+        SpringMassSystem { dt, params, obs }
     }
 
     /// Observation h(x) = y_{obs+1}.
-    pub fn h(&self, x: &[f64]) -> f64 {
+    pub fn obs(&self, x: &[f64]) -> f64 {
         x[self.obs]
     }
 
-    /// Squared discrepancy |y_n − h(xi)|².
-    pub fn discrepancy(&self, xi: &[f64]) -> f64 {
-        let d = self.y_obs - self.h(xi);
+    /// Squared discrepancy |y − h(xi)|².
+    pub fn discrepancy(&self, y: &[f64], xi: &[f64]) -> f64 {
+        let d = y[0] - self.obs(xi);
         d * d
     }
 
@@ -247,19 +220,9 @@ macro_rules! impl_spring_mass {
             }
 
             /// One step of the fourth-order Gauss–Legendre method (shared
-            /// solver, see [`super::gl4`]).
+            /// solver, see [`crate::gl4`]).
             fn gl4_step(&self, x: &[f64; $m], h: f64) -> [f64; $m] {
-                super::gl4::gl4_step(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, h)
-            }
-
-            /// Forward operator: advance the current state one
-            /// Gauss–Legendre step, t^n → t^{n+1} (θ is exactly conserved).
-            pub fn forward(&mut self) {
-                let x = self.states.last().expect("states holds the initial condition");
-                let x: [f64; $m] = std::array::from_fn(|i| x[i]);
-                let x_next = self.gl4_step(&x, self.dt);
-                self.y_obs = x_next[self.obs] + self.noise.next_sample();
-                self.states.push(DVector::from_row_slice(&x_next));
+                crate::gl4::gl4_step(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, h)
             }
 
             /// Discrete flow map φ: one Gauss–Legendre step of size `dt`.
@@ -270,7 +233,7 @@ macro_rules! impl_spring_mass {
             /// φ(x) together with its exact Jacobian ∂φ/∂x, including the
             /// ∂φ/∂θ sensitivity column the tracker needs.
             pub fn flow_with_jacobian(&self, x: &[f64; $m]) -> ([f64; $m], [[f64; $m]; $m]) {
-                super::gl4::gl4_step_with_jacobian(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, self.dt)
+                crate::gl4::gl4_step_with_jacobian(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, self.dt)
             }
 
             /// Inverse discrete flow map φ⁻¹: one Gauss–Legendre step of
@@ -298,12 +261,8 @@ macro_rules! impl_spring_mass {
                 self.dt
             }
 
-            fn forward(&mut self) {
-                SpringMassSystem::<$n>::forward(self);
-            }
-
-            fn discrepancy(&self, xi: &[f64]) -> f64 {
-                SpringMassSystem::<$n>::discrepancy(self, xi)
+            fn discrepancy(&self, y: &[f64], xi: &[f64]) -> f64 {
+                SpringMassSystem::<$n>::discrepancy(self, y, xi)
             }
 
             fn flow_inv(&self, xi: [f64; $m]) -> [f64; $m] {
@@ -318,16 +277,12 @@ macro_rules! impl_spring_mass {
                 self.flow_with_jacobian(&xi).1
             }
 
-            fn n_obs(&self) -> usize {
+            fn obs_dim(&self) -> usize {
                 1
             }
 
-            fn h(&self, xi: &[f64]) -> DVector<f64> {
-                DVector::from_element(1, SpringMassSystem::<$n>::h(self, xi))
-            }
-
-            fn y_obs(&self) -> DVector<f64> {
-                DVector::from_element(1, self.y_obs)
+            fn obs(&self, xi: &[f64]) -> DVector<f64> {
+                DVector::from_element(1, SpringMassSystem::<$n>::obs(self, xi))
             }
 
             /// ∇h is the unit vector of the observed position (zero
@@ -341,10 +296,6 @@ macro_rules! impl_spring_mass {
             /// Time-independent flow: autonomous (so the transport plan applies).
             fn is_autonomous(&self) -> bool {
                 true
-            }
-
-            fn states(&self) -> &[DVector<f64>] {
-                &self.states
             }
 
             fn state_labels(&self) -> Vec<String> {
@@ -381,21 +332,21 @@ mod tests {
     #[test]
     fn energy_is_conserved_exactly_and_theta_is_constant() {
         let x0 = SpringMassSystem::<2>::state([0.2, -0.4], [0.1, 0.3], ODD_THETA);
-        let mut sys = SpringMassSystem::<2>::with_params(ODD_PARAMS, &x0, 0.05, 0);
+        let sys = SpringMassSystem::<2>::with_params(ODD_PARAMS, 0.05, 0);
         let e0 = sys.energy(&x0);
+        let mut x = x0;
         for _ in 0..400 {
-            sys.forward();
-            let x = sys.states.last().unwrap();
-            assert!((sys.energy(x.as_slice()) - e0).abs() < 1e-10 * e0, "N=2 energy drift");
+            x = sys.flow(&x);
+            assert!((sys.energy(&x) - e0).abs() < 1e-10 * e0, "N=2 energy drift");
             assert_eq!(x[4], ODD_THETA, "θ moved along the flow");
         }
         let x0 = SpringMassSystem::<1>::state([0.3], [-0.2], ODD_THETA);
-        let mut sys = SpringMassSystem::<1>::with_params(ODD_PARAMS, &x0, 0.05, 0);
+        let sys = SpringMassSystem::<1>::with_params(ODD_PARAMS, 0.05, 0);
         let e0 = sys.energy(&x0);
+        let mut x = x0;
         for _ in 0..400 {
-            sys.forward();
-            let x = sys.states.last().unwrap();
-            assert!((sys.energy(x.as_slice()) - e0).abs() < 1e-10 * e0, "N=1 energy drift");
+            x = sys.flow(&x);
+            assert!((sys.energy(&x) - e0).abs() < 1e-10 * e0, "N=1 energy drift");
             assert_eq!(x[2], ODD_THETA);
         }
     }
@@ -425,11 +376,11 @@ mod tests {
             }
         }
         check(
-            &SpringMassSystem::<2>::with_params(ODD_PARAMS, &[0.0; 5], 0.01, 1),
+            &SpringMassSystem::<2>::with_params(ODD_PARAMS, 0.01, 1),
             [0.6, -0.35, 0.8, -1.9, 0.45],
         );
         check(
-            &SpringMassSystem::<3>::with_params(ODD_PARAMS, &[0.0; 7], 0.01, 2),
+            &SpringMassSystem::<3>::with_params(ODD_PARAMS, 0.01, 2),
             [0.6, -0.35, 0.2, 0.8, -1.9, 0.4, 0.45],
         );
     }
@@ -437,7 +388,7 @@ mod tests {
     #[test]
     fn flow_inv_inverts_flow() {
         let x0 = SpringMassSystem::<2>::state([0.3, -0.2], [0.0, 0.5], 0.3);
-        let sys = SpringMassSystem::<2>::new(&x0, 0.02, 0);
+        let sys = SpringMassSystem::<2>::new(0.02, 0);
         let z = sys.flow_inv(&sys.flow(&x0));
         for i in 0..5 {
             assert!((z[i] - x0[i]).abs() < 1e-11, "round-trip error at {i}: {}", z[i] - x0[i]);
@@ -450,7 +401,7 @@ mod tests {
     #[test]
     fn flow_is_conditionally_linear() {
         let theta = 0.35;
-        let sys = SpringMassSystem::<2>::with_params(ODD_PARAMS, &[0.0; 5], 0.03, 0);
+        let sys = SpringMassSystem::<2>::with_params(ODD_PARAMS, 0.03, 0);
         let x = SpringMassSystem::<2>::state([0.4, -0.1], [0.2, 0.7], theta);
         let xp = SpringMassSystem::<2>::state([-0.3, 0.5], [-0.6, 0.1], theta);
         let (a, b) = (1.7, -0.4);

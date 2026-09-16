@@ -34,10 +34,9 @@
 use super::{EstimatorHints, SceneMap, VarHint, VizModel};
 use crate::noise::NoiseModel;
 use crate::palette;
-use crate::playback::{Job, Progress, Trajectory};
-use nalgebra::DVector;
-use ode_models::models::{SpringMassParams, SpringMassSystem, SpringSystem};
-use ode_models::spec::ModelSpec;
+use crate::playback::Trajectory;
+use ode_models::models::SpringMassParams;
+use ode_models_spec::spec::{ModelSpec, TwinSpec};
 
 /// Default true log-mass of the reference when the free-end mass is
 /// unknown: m_N = 2^0.3·m₀ ≈ 1.23·m₀. The normal-mode frequencies then
@@ -112,8 +111,7 @@ impl Params {
         2 * self.n + usize::from(self.unknown_mass)
     }
 
-    /// Seed of the observation noise (shared by the plotted series and the
-    /// estimators' model-internal observations).
+    /// Seed of the observation noise of the twin experiment.
     fn noise_seed(&self) -> u64 {
         1000 + self.obs_index() as u64
     }
@@ -169,48 +167,6 @@ impl SpringViz {
                 *sel = k == p.n - 1;
             }
         }
-    }
-}
-
-/// Run the forward model of `p` for `steps` steps (bumping `progress` once
-/// per step), returning the trajectory as flat states: [Y; V] of the
-/// plain chain, or (y, v, θ) of the augmented one.
-fn run_forward(p: &Params, dt: f64, steps: usize, progress: &Progress) -> Vec<Vec<f64>> {
-    if p.unknown_mass {
-        let obs = p.obs_index();
-        macro_rules! run {
-            ($n:literal) => {{
-                let mut sys = SpringMassSystem::<$n>::with_params(p.mass_params(), &p.augmented_x0(), dt, obs);
-                for _ in 0..steps {
-                    sys.forward();
-                    progress.step();
-                }
-                sys.states.iter().map(|s| s.iter().copied().collect()).collect()
-            }};
-        }
-        match p.n {
-            1 => run!(1),
-            2 => run!(2),
-            3 => run!(3),
-            _ => unreachable!("viewer spring chains have 1-3 masses"),
-        }
-    } else {
-        // The model wants one scalar observation h; the viewer records
-        // its own selected component, so any component serves.
-        let mut sys = SpringSystem::new(
-            p.n,
-            p.rho,
-            p.a,
-            dt,
-            DVector::from_vec(p.y0.clone()),
-            DVector::from_vec(p.v0.clone()),
-            move |x: &[f64]| x[0],
-        );
-        for _ in 0..steps {
-            sys.forward();
-            progress.step();
-        }
-        sys.states.iter().map(|s| s.iter().copied().collect()).collect()
     }
 }
 
@@ -369,8 +325,8 @@ impl VizModel for SpringViz {
             .collect()
     }
 
-    fn periodic(&self) -> Vec<bool> {
-        vec![false; self.params.dim()]
+    fn periodic(&self) -> Vec<Option<(f64, f64)>> {
+        vec![None; self.params.dim()]
     }
 
     /// The (yᵢ, vᵢ) phase planes; with the unknown mass the (y₁, θ) plane
@@ -399,58 +355,44 @@ impl VizModel for SpringViz {
         hints
     }
 
+    fn snapshot(&mut self) {
+        self.drawn = self.params.clone();
+    }
+
     fn model_spec(&self) -> ModelSpec {
         let p = &self.drawn;
-        let obs = p.obs_index();
         if p.unknown_mass {
-            ModelSpec::SpringMass {
-                n: p.n,
-                params: p.mass_params(),
-                y0: p.y0.clone(),
-                v0: p.v0.clone(),
-                theta: p.theta,
-                obs,
-                noise: p.obs_noise[obs],
-                noise_seed: p.noise_seed(),
-            }
+            ModelSpec::SpringMass { n: p.n, params: p.mass_params(), obs: p.obs_index() }
         } else {
-            ModelSpec::Spring {
-                n: p.n,
-                rho: p.rho,
-                a: p.a,
-                y0: p.y0.clone(),
-                v0: p.v0.clone(),
-                obs,
-                noise: p.obs_noise[obs],
-                noise_seed: p.noise_seed(),
-            }
+            ModelSpec::Spring { n: p.n, rho: p.rho, a: p.a, obs: p.obs_index() }
         }
     }
 
-    fn make_job(&mut self, dt: f64, steps: usize) -> Job {
-        self.drawn = self.params.clone();
-        let p = self.params.clone();
-        Box::new(move |progress| {
-            let n = p.n;
-            let states = run_forward(&p, dt, steps, progress);
-            // The selected component (the model's own h), plus the noise
-            // the estimators' model draws with the same seed.
-            let k = p.obs_index();
-            let mut observations: Vec<Vec<f64>> = states.iter().map(|s| vec![s[k]]).collect();
-            let noise = p.obs_noise[k];
-            let eta = noise.realize(observations.len(), dt, p.noise_seed());
-            for (o, e) in observations.iter_mut().zip(eta) {
-                o[0] += e;
-            }
-            let name = if k < n { format!("y_{}", k + 1) } else { format!("v_{}", k - n + 1) };
-            let obs_labels = vec![if noise.is_none() { name } else { format!("{name} (noisy)") }];
-            Trajectory {
-                dt,
-                states,
-                observations,
-                obs_labels,
-            }
-        })
+    /// The plain chain from (y, v), or the augmented one from (y, v, θ_true)
+    /// — the same (y, v) either way — with the selected component's noise.
+    fn twin_spec(&self, dt: f64, steps: usize) -> TwinSpec {
+        let p = &self.drawn;
+        let x0 = if p.unknown_mass {
+            p.augmented_x0()
+        } else {
+            p.y0.iter().chain(p.v0.iter()).copied().collect()
+        };
+        TwinSpec {
+            model: self.model_spec(),
+            x0,
+            dt,
+            steps,
+            noise: p.obs_noise[p.obs_index()],
+            seed: p.noise_seed(),
+            walk: None,
+        }
+    }
+
+    fn obs_labels(&self) -> Vec<String> {
+        let p = &self.drawn;
+        let k = p.obs_index();
+        let name = if k < p.n { format!("y_{}", k + 1) } else { format!("v_{}", k - p.n + 1) };
+        vec![if p.obs_noise[k].is_none() { name } else { format!("{name} (noisy)") }]
     }
 
     fn draw(
@@ -594,6 +536,7 @@ fn zigzag(a: egui::Pos2, b: egui::Pos2, coils: usize, amp: f32) -> Vec<egui::Pos
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playback::Progress;
 
     /// The option augments the run: dimension 2N + 1, θ label, positions
     /// only as observations (a selected velocity falls back to the free

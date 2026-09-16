@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 nalgebra = "0.34.1"
-serde    = { version = "1", features = ["derive"] }
+serde    = { version = "1", features = ["derive"], optional = true }
 
-[dev-dependencies]
-serde_json = { version = "1", features = ["float_roundtrip"] }
+[features]
+# Serialize/Deserialize on the parameter structs and observation enums
+# (what `ode-models-spec` needs to make a model plain data).
+serde = ["dep:serde"]

@@ -9,8 +9,11 @@
 //!
 //! Outputs go to examples/output/lorenz/.
 
-use ode_observers::filter::{DiffusionScheme, FilterParams, MortensenFilter};
+use ode_observers::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
 use ode_models::models::lorenz::{DIM, LorenzObservation, LorenzSystem};
+use ode_models_spec::noise::NoiseModel;
+use ode_models_spec::progress::Progress;
+use ode_models_spec::reference::Reference;
 
 fn main() {
     const M: usize = DIM;
@@ -29,7 +32,7 @@ fn main() {
 
     println!("Lorenz-63: x0 = {x0:?}, dt = {dt}, t_end = {t_end}\ndomain = {domain:?}");
 
-    let sys = LorenzSystem::new(x0, dt, LorenzObservation::X);
+    let sys = LorenzSystem::new(dt, LorenzObservation::X);
 
     // ── Mortensen filter ─────────────────────────────────────────────────────
     let params = FilterParams {
@@ -51,5 +54,6 @@ fn main() {
     filter.init_filter_quadratic_at(sigma, x0);
 
     let n_steps = (t_end / dt).ceil() as usize;
-    filter.run(n_steps, 25, PLOT_PAIRS, "examples/output/lorenz");
+    let reference = Reference::twin(&filter.model, x0, n_steps, NoiseModel::None, 0, None, &Progress::default());
+    filter.run_and_save(&reference, 25, PLOT_PAIRS, "examples/output/lorenz");
 }

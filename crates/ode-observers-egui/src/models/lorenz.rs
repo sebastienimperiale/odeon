@@ -8,9 +8,9 @@
 use super::{VizModel, draw_trace};
 use crate::noise::NoiseModel;
 use crate::palette;
-use crate::playback::{Job, Trajectory};
-use ode_models::spec::ModelSpec;
-use ode_models::models::lorenz::{LorenzObservation, LorenzParams, LorenzSystem};
+use crate::playback::Trajectory;
+use ode_models::models::lorenz::{LorenzObservation, LorenzParams};
+use ode_models_spec::spec::{ModelSpec, TwinSpec};
 
 /// Default initial condition: on the attractor — the state reached from the
 /// usual (1, 1, 1) start after t = 1.4, then a further t = 10 (dt = 0.01).
@@ -189,56 +189,41 @@ impl VizModel for LorenzViz {
         ["x", "y", "z"].map(String::from).to_vec()
     }
 
-    fn periodic(&self) -> Vec<bool> {
-        vec![false; 3]
+    fn periodic(&self) -> Vec<Option<(f64, f64)>> {
+        vec![None; 3]
     }
 
     fn default_pairs(&self) -> Vec<(usize, usize)> {
         vec![(0, 2), (0, 1)]
     }
 
+    fn snapshot(&mut self) {
+        self.drawn = self.params.clone();
+    }
+
     fn model_spec(&self) -> ModelSpec {
         let p = &self.drawn;
-        ModelSpec::Lorenz {
-            params: p.phys,
-            x0: p.x0,
-            observation: p.observation(),
+        ModelSpec::Lorenz { params: p.phys, observation: p.observation() }
+    }
+
+    fn twin_spec(&self, dt: f64, steps: usize) -> TwinSpec {
+        let p = &self.drawn;
+        TwinSpec {
+            model: self.model_spec(),
+            x0: p.x0.to_vec(),
+            dt,
+            steps,
             noise: p.obs_noise[p.obs_idx],
-            noise_seed: 5000 + p.obs_idx as u64,
+            seed: 5000 + p.obs_idx as u64,
+            walk: None,
         }
     }
 
-    fn make_job(&mut self, dt: f64, steps: usize) -> Job {
-        self.drawn = self.params.clone();
-        let p = self.params.clone();
-        Box::new(move |progress| {
-            let obs = p.observation();
-            let mut sys = LorenzSystem::with_params(p.phys, p.x0, dt, obs);
-            for _ in 0..steps {
-                sys.forward();
-                progress.step();
-            }
-            let states: Vec<Vec<f64>> =
-                sys.states.iter().map(|s| s.iter().copied().collect()).collect();
-            let mut observations: Vec<Vec<f64>> =
-                states.iter().map(|s| vec![obs.h(s)]).collect();
-            let noise = p.obs_noise[p.obs_idx];
-            let eta = noise.realize(observations.len(), dt, 5000 + p.obs_idx as u64);
-            for (o, e) in observations.iter_mut().zip(eta) {
-                o[0] += e;
-            }
-            let obs_labels = vec![if noise.is_none() {
-                obs.label().to_string()
-            } else {
-                format!("{} (noisy)", obs.label())
-            }];
-            Trajectory {
-                dt,
-                states,
-                observations,
-                obs_labels,
-            }
-        })
+    fn obs_labels(&self) -> Vec<String> {
+        let p = &self.drawn;
+        let obs = p.observation();
+        let noise = p.obs_noise[p.obs_idx];
+        vec![if noise.is_none() { obs.label().to_string() } else { format!("{} (noisy)", obs.label()) }]
     }
 
     fn draw(

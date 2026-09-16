@@ -15,16 +15,17 @@ description of the algorithms; their file paths are mapped at their top.
 ```
 Odeon/
   Cargo.toml                  workspace (resolver 3), shared version/edition, release profile with symbols
-  crates/ode-models/          forward models: Model trait, models/*, gl4 stepper, noise      [DONE]
-  crates/ode-observers/       observers: filter, tracker, box_tracker, particles, output,
-                              jobs (dimension-erased runners + plain outputs), progress     [DONE]
-  crates/ode-models-egui/     VizModel trait, scenes, parameter forms, palette, playback,
-                              and app::App — the whole models-only application            [DONE]
-  crates/ode-observers-egui/  the four views (filter, box, particles, tracker), panels,
-                              and app::App<C: Compute> — the whole observers application  [DONE]
+  crates/ode-models/          forward models: Model trait, models/*, gl4 stepper — physics
+                              only, nalgebra its sole dependency (serde optional)          [DONE]
+  crates/ode-models-spec/     the driving layer: ModelSpec + visitor, TwinSpec, Reference +
+                              twin generator, noise models, Progress                        [DONE]
+  crates/ode-observers/       methods/ (mortensen, mortensen_window, kalman, fleming_viot),
+                              output, jobs (dimension-erased runners + outputs)             [DONE]
+  crates/ode-observers-egui/  VizModel trait, scenes, parameter forms, palette, playback,
+                              model_panels; the four views (filter, box, particles,
+                              tracker), estimator panels, and app::App<C: Compute> — the
+                              whole observers application                                 [DONE]
   crates/ode-observers-remote/ wire protocol of the job server + RemoteRun client (ehttp)   [DONE]
-  apps/models-viewer/         the models-only viewer: scenes, no estimator
-                              (package odeon-models-viewer, bin models-viewer)              [DONE]
   apps/observers-viewer/      the observers viewer, computing locally
                               (package odeon-observers-viewer, bin observers-viewer)        [DONE]
   apps/observers-client/      the same viewer as a client of observers-server: a desktop
@@ -37,13 +38,27 @@ Odeon/
   scripts/                    Python plotting scripts for the CLI examples
 ```
 
-Dependency graph (a diamond): `ode-models` at the bottom; `ode-observers`
-depends on it through the `Model` trait only; `ode-models-egui` depends on
-`ode-models` (+ egui); `ode-observers-egui` depends on `ode-observers` (+
-egui) and, for the palette of the tracker view, on `ode-models-egui`;
-`ode-observers-remote` depends on `ode-observers` (+ ehttp) only; the apps
-depend on what they show. The five library crates are the ones that may be
-published to crates.io; the apps never are.
+Dependency graph: `ode-models` at the bottom (nalgebra only);
+`ode-models-spec` on it (the models as data, twin experiments,
+references, noise, progress — serde); `ode-observers` on both, through
+the `Model` trait and the `Reference`; `ode-observers-egui` on
+`ode-models` + `ode-models-spec` + `ode-observers` (+ egui);
+`ode-observers-remote` on `ode-observers` + `ode-models-spec` (+ ehttp);
+the apps depend on what they show. The five library crates are the ones
+that may be published to crates.io; the apps never are.
+
+2026-09-15: `apps/models-viewer` (the models-only viewer) was removed and
+`crates/ode-models-egui` folded into `ode-observers-egui` (its `panels`
+became `model_panels`; `models/`, `noise`, `palette`, `playback`, `slot`
+kept their names; `ode_models_egui::` paths below read
+`ode_observers_egui::`). One egui crate, two apps (local / server).
+`ode-models-spec` was re-evaluated the same day and **kept** (decision
+A): it cannot move into the egui crate, since `ode-observers` (jobs,
+particles), `ode-observers-remote` (the `/twin-runs` protocol) and
+`observers-server` all need `Reference`, `Progress`, `ModelSpec`/`TwinSpec`
+and `rng` without any GUI dependency, and folding it into `ode-observers`
+would put the serde model catalogue and the twin generator into the
+pure-algorithms crate.
 
 ## Migration plan and status
 
@@ -113,13 +128,14 @@ published to crates.io; the apps never are.
    with the slots, the runs, the tabs, the scene and observation panels).
    `viz/` is gone. Two contract changes were needed to keep
    `ode-models-egui` free of `ode-observers`: `Progress` moved down to
-   `ode_models::progress` (`ode_observers::progress` re-exports it, all
-   paths unchanged), and `VizModel::tune_filter_defaults(&mut
+   `ode_models::progress` (`ode_observers::progress` re-exported it until
+   2026-09-15, when the re-export was dropped: `Progress` is
+   `ode_models_spec::progress::Progress` everywhere), and `VizModel::tune_filter_defaults(&mut
    FilterConfig)` became `estimator_hints() -> EstimatorHints` — a
    `VarHint { domain, n_el, p_ord, q, x0 }` (all `Option`) per state
    component plus an optional ε — applied onto the computed defaults by
    the app's `apply_hints`; Kepler-μ, the unknown-mass chains and the
-   random walk return the same overrides as before. The three
+   lamppost return the same overrides as before. The three
    "tuned defaults + filter run" tests split accordingly: the hints are
    tested in `ode-models-egui`, the runs through the whole pipeline
    (`model_spec` → `JobSpec` → `run_filter_spec`) in `apps/viewer`. The
@@ -179,7 +195,7 @@ published to crates.io; the apps never are.
    `augmented_run_is_the_same_orbit`); the θ hints, the (q₁, θ) plane
    first, θ not drawn. `kepler_mu.rs` of the viewer is gone; the menu
    has 8 entries (springs 0–2, pendulum 3, rod 4, Kepler 5, Lorenz 6,
-   random walk 7). `apps/viewer` is renamed `apps/observers-viewer`
+   lamppost 7). `apps/viewer` is renamed `apps/observers-viewer`
    (package `odeon-observers-viewer`, bin `observers-viewer`, window
    "Odeon — observers"). 97 tests, no warnings.
 6. **Serde, server, web.**
@@ -228,7 +244,9 @@ published to crates.io; the apps never are.
    `#[tokio::test]` on an ephemeral port, driven by `RemoteRun`):
    `remote_filter_run_equals_the_local_run` (bit for bit),
    `wrong_output_kind_is_an_error`, `bad_jobs_are_refused` (400 with the
-   message, 404), `dropping_the_handle_cancels_the_run`. The observers
+   message, 404), `dropping_the_handle_cancels_the_run` (its long job is
+   a 20M-step *tracker*: a long grid-filter job saturated the rayon pool
+   and made the test flaky under the parallel suite). The observers
    viewer has an "on server" checkbox + URL next to the estimator header
    (`Compute`; `ODEON_SERVER=http://host:port` pre-selects it), every run
    slot is an `EstimatorRun<T> { Local(RunHandle<T>), Remote(RemoteRun<T>) }`
@@ -281,8 +299,9 @@ published to crates.io; the apps never are.
    `apps/observers-client` with a relative `ODEON_WEB_DIR`). Checked: `/` → 200 text/html, the `.wasm` → 200
    application/wasm, `/runs/1` → 404, CORS preflight → 200 with
    `access-control-allow-origin: *`. Trajectories (`VizModel::make_job`)
-   are still computed in the page; a forward-run visitor through the
-   spec, computing the reference on the server too, remains open.
+   are computed in the page (since step 7 by the generic reference
+   generator; `POST /twin-runs` lets a client without a model
+   implementation have the server generate the reference).
    **Publishing the page elsewhere** (GitHub Pages, …; same day): the
    web client takes the server URL from `?server=https://…` in the
    page's address (remembered in the browser's local storage under
@@ -314,6 +333,143 @@ published to crates.io; the apps never are.
    symbols and `wasm-opt` is not installed (trunk skips it): install
    `binaryen` for a smaller page. 103 native tests, no warnings.
 
+7. **Stateless models** — done 2026-09-14 (on request: "the model
+   should store its parameters, not the state"; fixed dt kept; the job
+   carries the observations). `Model<M>` is now parameters plus pure maps
+   of a state: `dt`, `dim()` (default `M`; the spring's 2N), `flow`,
+   `flow_inv`, `flow_jacobian`, `periodic() -> [Option<(f64, f64)>; M]`
+   (default all `None`; the pendulums declare their angles on [−π, π) —
+   the generator wraps every stored state, x₀ included, into the
+   interval, as the old constructors and `forward()` did; briefly a
+   `normalize` hook, replaced the same day on request so that the fact
+   and its interval are declared, not procedural, and no map ever wraps:
+   `flow`/`flow_inv` stay smooth on the covering space, which the
+   translating window and the Neumann boxes rely on), `is_autonomous`, `obs_dim`, `obs`, `obs_jacobian`, `discrepancy(y, x)`
+   and `innovation(y, x)` with the observation as an argument (defaults
+   = squared Euclidean distance / plain difference; the models keep
+   allocation-free overrides, Kepler's angular for the bearing),
+   `state_labels`. Gone: `forward()`, `states()`, `y_obs()`, the
+   `with_obs_noise` builders, the lamppost's `with_walk`, every `states`
+   field, and the initial state from the constructors (`KeplerSystem::new(dt,
+   observation)`, `PendulumSystem::new(dt)`, `SpringSystem::new(n, ρ, a,
+   dt, obs)`, `SpringMassSystem::<N>::with_params(params, dt, obs)`,
+   `LamppostSystem::new(dt)`, …). The **reference** of a twin experiment
+   is `ode_models_spec::reference::Reference { dt, states, observations }`
+   (serde), produced by `Reference::twin(model, x0, steps, noise, seed,
+   walk, progress)`: x_{n+1} = normalize(φ(x_n)) (+ the optional
+   `Walk { std, seed }`: Gaussian increments std·√dt per component,
+   streams `seed + d`), y_n = h(x_n) + η_n with component j drawn from
+   the stream `seed + j` — exactly the old per-model conventions, so the
+   sequences are unchanged; or a `Reference` built from real data. A
+   twin experiment as data is `spec::TwinSpec { model: ModelSpec, x0,
+   dt, steps, noise, seed, walk }` with `reference(progress)`;
+   `ModelSpec` lost `x0`, the noise, the seeds and the walk (`Spring { n,
+   rho, a, obs }`, `Kepler { params, observation }`, `Lamppost`, …).
+   Observers: `MortensenFilter::forward(&y_n)`, `MortensenTracker::forward(&y_n)`,
+   `BoxTracker::forward(&y_n)`, `ParticleSystem::forward(&y_n)` — the
+   cycle is observation → transport → diffusion, the reference's own
+   step being the generator's business; `filter.run(&reference, …)`,
+   `tracker.run(&reference)`; `output::save_forward(model, &reference,
+   dir)`, `save_trajectory(&reference, dir)`. Jobs: `run_filter(model,
+   &reference, &cfg, &progress)` (same for the three others), `JobSpec {
+   model, reference, estimator, config }` with `steps()` = the
+   reference's, `JobSpec::from_twin(&twin, estimator, config,
+   progress)`; `run_*_spec(model, &reference, &cfg, &progress)`;
+   `ParticleConfig` gained `seed: Option<u64>` (None = the clock, the
+   viewer's default); `FilterConfig::defaults` takes the periodic
+   intervals (`Vec<Option<(f64, f64)>>`, the interval becoming the
+   domain) and the display wrap of x̂ uses the variable's domain instead
+   of a hard-coded (−π, π); `VizModel::periodic()` returns the same. Viewer: `VizModel` has `snapshot()`,
+   `twin_spec(dt, steps) -> TwinSpec`, `obs_labels()` (empty = the
+   observation is switched off in the form) and a *provided* `make_job`
+   (the generator + the labels); `model_spec()` is the twin's model; the
+   app's `JobSpec` carries `Trajectory::reference()` — the run on
+   screen *is* the estimator's reference, no second simulation. Server:
+   `POST /runs` also checks the reference's dimension, `POST
+   /twin-runs` takes `protocol::TwinJob { twin, estimator, config }`
+   and generates the reference on the server (the sample
+   `apps/observers-server/jobs/spring_tracker.json` is one), and the
+   body limit is 1 GB (a long run's reference is tens of MB of JSON —
+   axum's default 2 MB refused it, which the test `dropping_the_handle…`
+   caught). **Numerics pinned by golden tests**
+   (`crates/ode-observers/tests/golden.rs` + `golden/stateful.json`,
+   283 KB, recorded from the old code by a throw-away program): the
+   filter, tracker, window and particles on the spring; the Kepler
+   bearing tracker with AR(1) noise; the pendulum filter with periodic
+   angles and two-component tip noise; the lamppost filter with a
+   walking reference; Kepler-μ, Lorenz and rod trackers; the
+   unknown-mass 5D filter — every Gauss–Legendre model and the lamppost
+   agree **bit for bit**, the spring cases to 1e-9 (its reference is now
+   generated by T·x, the flow the observers use, instead of the old
+   `forward()`'s LU solve of the same midpoint step: round-off only).
+   The model tests iterate `flow` instead of `forward`; `model.rs` lost
+   the commented-out `ModelEstimator` notes (implemented by this step).
+   111 tests, no warnings; the three desktop binaries launch; the page
+   rebuilt (republish with `publish.sh`). **`ode-models-spec`** (same
+   day, on request: "the purity of ode-models matters"): the driving
+   layer moved out of `ode-models` into its own crate — `spec`
+   (`ModelSpec`, `ModelVisitor`, `TwinSpec`), `reference` (`Reference`,
+   `Walk`, the twin generator), `noise` (the noise models), `rng`
+   (`SplitMix64`, split out of `noise` on 2026-09-15 since the particles
+   use it too) and `progress` (`Progress`) are now
+   `ode_models_spec::…`; `ode-models` is the `Model` trait, the eight
+   models and `gl4`, with nalgebra as its only dependency and serde an
+   optional feature (`cfg_attr` derives on the parameter structs and
+   observation enums, enabled by `ode-models-spec`). Every other crate
+   repointed; the lamppost's walk test moved next to the generator.
+   **Renamed** (same day, on request): the trait's observation methods
+   are `obs_dim` (was `n_obs`) and `obs` (was `h`); `discrepancy` keeps
+   its name (briefly `obs_discrepancy`), on the trait, the models' inherent versions and
+   `Shifted`; `Reference::obs_dim()` likewise. The observation *choice*
+   enums keep `KeplerObservation::h` / `LorenzObservation::h`. **The client uses `/twin-runs` only**
+   (same day, on request — it was never meant to send anything else):
+   `RemoteRun::spawn_twin(base, &TwinJob)` posts the twin description (a
+   few kilobytes whatever the run length) and the server regenerates the
+   reference from the same seeds; `Compute::spawn(job, twin, local)`
+   receives both the `JobSpec` (its reference = the run on screen, what
+   `LocalCompute` runs) and the `TwinSpec` it came from (what
+   `RemoteCompute` sends); `RemoteRun::spawn(base, &JobSpec)` and `POST
+   /runs` remain for observations that are not a twin experiment's (real
+   data). Test `twin_runs_generate_the_reference_on_the_server` pins the
+   remote run to the local one.
+8. **Server hardening for a public deployment** — done 2026-09-16 (on
+   request, before renting a VPS). `observers-server` reads a `Settings`
+   from the environment (`Settings::from_env`, printed at startup):
+   `ODEON_TOKEN` (bearer token checked by a `route_layer` middleware on
+   the API routes only — 401 otherwise, the body drained first so a
+   client still uploading sees the answer and not a reset; the CORS layer
+   stays outermost so the page's preflight passes without it; the static
+   page never needs it), `ODEON_MAX_RUNS` (runs in progress at once,
+   default 2 — one more is 429), `ODEON_MAX_STEPS` (200k),
+   `ODEON_MAX_DOFS` (2M grid points of a filter or window: the nodes per
+   direction as the filter counts them — Neumann n_el·p_ord + 1, periodic
+   n_el·p_ord, Dirichlet n_el·p_ord − 1, the window all Dirichlet),
+   `ODEON_MAX_PARTICLES` (200k), `ODEON_MAX_OUTPUT` (50M floats of one
+   output: estimates + snapshots × selected planes, or population × steps,
+   or covariances × steps) — a job beyond a limit is refused with 400 and
+   a message naming the limit — and `ODEON_RUN_TTL` (600 s: every status
+   or output request touches the run; a sweeper on the tokio runtime,
+   period ttl/4 clamped to [50 ms, 30 s], cancels and forgets runs idle
+   for longer, i.e. closed tabs). `ODEON_WEB_DIR=none` serves no page.
+   Client side: `RemoteRun::spawn_with_token` / `spawn_twin_with_token`
+   (the token as `Authorization: Bearer …` on every request, DELETE
+   included; the old constructors = no token); `observers-client` has a
+   password field "token" under the server URL, pre-filled from
+   `ODEON_TOKEN` on the desktop and, on the web, from `?token=` /
+   local storage `odeon.token` like the server URL. Tests:
+   `the_token_guards_the_api` (401 without / with a wrong token, the run
+   with it, the preflight without), `oversized_jobs_are_refused` (the
+   four limits by message), `a_busy_server_answers_429`,
+   `idle_runs_expire` (ttl 200 ms, a run posted and never polled is 404
+   after 600 ms). 116 tests, no warnings; the page rebuilt.
+   **Deployment plan** (OVH VPS, Ubuntu, page on GitHub Pages): build on
+   the VPS with rustup, run the binary under systemd bound to
+   `127.0.0.1:8787` with `ODEON_TOKEN` and `ODEON_WEB_DIR=none`, Caddy on
+   443 as the TLS reverse proxy (`<host> { reverse_proxy 127.0.0.1:8787 }`),
+   the page opened as `…/odeon-client/?server=https://<host>&token=…`.
+   A 4 vCPU / 8 GB VPS covers the viewer's default runs; the target grid
+   sizes (26M–43M DOFs) do not fit a VPS.
+
 Conventions carried over: all linear solves through nalgebra; English,
 Unicode-math doc comments citing the papers by name; tests pin every
 numerical claim; no `Default` on parameter structs of the solvers.
@@ -325,10 +481,9 @@ cargo test --release --workspace                          # everything
 cargo run -p ode-observers --release --example one_spring # CLI examples (write examples/output/<name>/ under the cwd)
 cargo bench -p ode-observers --bench transport            # transport paths (fixed box and window)
 cargo bench -p ode-observers --bench diffusion            # lobatto-spectral vs lobatto-fft
-cargo run -p odeon-models-viewer --release                # the models-only viewer (apps/models-viewer)
 cargo run -p odeon-observers-viewer --release             # the observers viewer (apps/observers-viewer)
-cargo run -p odeon-observers-server --release             # the job server on 127.0.0.1:8787 (ODEON_SERVER_ADDR)
-cargo run -p odeon-observers-client --release             # the same viewer sending its jobs to the server (ODEON_SERVER, default http://127.0.0.1:8787)
+cargo run -p odeon-observers-server --release             # the job server on 127.0.0.1:8787 (ODEON_SERVER_ADDR; ODEON_TOKEN, ODEON_MAX_*, ODEON_RUN_TTL — see its crate doc)
+cargo run -p odeon-observers-client --release             # the same viewer sending its jobs to the server (ODEON_SERVER, default http://127.0.0.1:8787; ODEON_TOKEN)
 (cd apps/observers-client && trunk build)                # the web page → apps/observers-client/dist (release by Trunk.toml)
 cargo run -p odeon-observers-server --release             # …then serves it at http://127.0.0.1:8787/ (or ODEON_WEB_DIR=<dist>)
 python scripts/visualize_filter.py one_spring             # figures from a CLI run
@@ -336,11 +491,34 @@ python scripts/visualize_filter.py one_spring             # figures from a CLI r
 
 # Inherited design notes (from the `mortensen` repository, 2026-09-13)
 
-**Paths in these notes are the old ones**: read `src/model.rs`, `src/models/`,
-`src/noise.rs` as `crates/ode-models/src/...`; `src/filter.rs`, `tracker.rs`,
-`box_tracker.rs`, `particles.rs`, `output.rs` as `crates/ode-observers/src/...`;
+**Paths in these notes are the old ones**: read `src/model.rs`, `src/models/`
+as `crates/ode-models/src/...` and `src/noise.rs` as
+`crates/ode-models-spec/src/noise.rs`; `src/filter.rs`, `box_tracker.rs`, `tracker.rs`, `particles.rs` as
+`crates/ode-observers/src/methods/{mortensen, mortensen_window, kalman,
+fleming_viot}.rs` (module `ode_observers::methods`, the files named after
+the methods since 2026-09-15; the types keep their names —
+`MortensenFilter`, `BoxTracker`, `MortensenTracker`, `ParticleSystem`) and
+`output.rs` as `crates/ode-observers/src/output.rs`; the four share the
+**`ode_observers::methods::Observer<M>` trait** (2026-09-15, on
+request): `dt`, `init_gaussian(center, sigma)`, `forward(&y_n)`,
+`estimate()` and a provided `run(&reference, &progress) -> Vec<[f64; M]>`
+— implemented by delegation (the filter's estimate is `argmax_p`, the
+window's `x̂ + argmax ρ`, the tracker's `x̂`, the particles' new
+`mean()`, the empirical mean of the cloud, with `init_gaussian`
+redrawing the cloud from the same seed); object-safe, so a
+`Box<dyn Observer<M>>` holds any of them. Renamed to make room:
+`MortensenFilter::run` → `run_and_save` (the CLI examples' file
+outputs), `MortensenTracker::run` → `run_with_covariances`,
+`BoxTracker::forward` → `step` (returns the element shift; the trait's
+`forward` calls it) and `BoxTracker::init_gaussian` now takes (center,
+sigma) like the trait. Test `every_observer_converges_on_the_spring`
+drives the four as trait objects along one noisy reference at γ = 20
+(each estimate ends ≥ 2× closer to the reference; at γ = 1 the filter,
+window and tracker agree with each other but lag the reference, as the
+Kalman optimum does with q = 1, and the particles' killing barely
+selects — the reason for γ = 20 in the test);
 `viz/src/filtering.rs` as `crates/ode-observers/src/jobs.rs` (with `Progress`
-in `crates/ode-models/src/progress.rs`); `examples/` and `benches/` as
+in `crates/ode-models-spec/src/progress.rs`); `examples/` and `benches/` as
 `crates/ode-observers/...`; the old crate name `mortensen::` as
 `ode_models::` / `ode_observers::`. The viewer `viz/` is split:
 `viz/src/models/`, `noise.rs`, `palette.rs`, `playback.rs` are
@@ -367,7 +545,9 @@ filter iteration is the 4-step cycle in `src/filter.rs`:
    `TrackerParams::gamma`, 1 by default, 0 = observations off — in the
    tracker it multiplies the HᵀH and Hᵀr terms; the viewer exposes it in a
    shared Observation panel)
-2. **Model forward**: advance the reference state t^n → t^{n+1}
+2. **Model forward**: advance the reference state t^n → t^{n+1} (since
+   2026-09-14 this is the reference generator's step, not the observer's:
+   the observers receive y_n and do observation → transport → diffusion)
 3. **Transport**: p(ξ) ← p(φ⁻¹(ξ)) (spectral convection via `lobatto-grid`)
 4. **Diffusion**: ∂τ p = (ε/2) Σ_d q_d ∂²_d p over one dt (one implicit-Euler
    step, directionally split by default — see `DiffusionScheme`; q = diagonal
@@ -453,7 +633,7 @@ it proceeds — the to-do list below is architecture only.
     so `q_diag` model noise is what keeps p from collapsing; the inverse
     flow is expanding, so filter domains need generous margins. Tests:
     Jacobian, round-trip, C± stationary, boundedness, fourth order.
-  - `random_walk.rs` — `RandomWalkSystem`: the **random walk** toy (M = 2): a static
+  - `lamppost.rs` — `LamppostSystem`: the **lamppost** toy (M = 2; named `lamppost` until 2026-09-14 — the point is static by default, the name said what the reference *may* do): a static
     point (x, y) in the plane, d_t(x, y) = 0 (identity flow, Φ = I, no
     stepper), observed through its squared distance to a lamppost at the
     origin, h = x² + y²; reference (0, 1) (`DEFAULT_STATE`). The
@@ -463,10 +643,12 @@ it proceeds — the to-do list below is architecture only.
     `tracker_collapses_onto_one_point_of_the_ring`). The drunkness is the
     filter's model noise q (diffusion keeps the ring from collapsing);
     optional `with_walk(std, seed)` makes the reference itself
-    random-walk. Viz entry "Random walk" (scene: lamppost, man, walk trace,
+    random-walk. Viz entry "Lamppost" (scene: lamppost, man, walk trace,
     observed circle; `estimator_hints` sets the (−2, 2)² box at
     16×4 so the whole ring is on the grid).
-  - `gl4.rs` — the shared **const-generic** Gauss–Legendre 4 stepper
+  - `gl4.rs` (since 2026-09-14 at the crate root, `ode_models::gl4`,
+    public — a numerical method, not a model; `gl4_step` and
+    `gl4_step_with_jacobian` are `pub`) — the shared **const-generic** Gauss–Legendre 4 stepper
     (Newton + analytic Jacobian, nalgebra dynamic LU — the const-generic LU
     needs typenum bounds; **all linear solves go through nalgebra, never
     hand-written**). Symmetric ⇒ flow_inv = step with −dt. Used by every
@@ -551,7 +733,22 @@ it proceeds — the to-do list below is architecture only.
   `pub(crate)`). No estimate yet. Tests: Gaussian initial draw
   (mean/variance, Exp(1) clocks), pure flow with γ = 0 and no noise,
   misfit kills and births copy a survivor (cloud pulled to the observed
-  position), reproducibility in the seed, periodic wrap.
+  position), reproducibility in the seed, periodic wrap. **Parallel
+  with per-particle random streams since 2026-09-13** (the one change
+  to an observer's code in Odeon, on request, a performance one that
+  changes the random sequence but not the statistics): steps 1, 2 and 4
+  run particle by particle on rayon's pool; every particle at every step
+  has its own `SplitMix64` seeded by mixing the run seed, the step, the
+  index and the purpose (0 = move, 1 = birth) — `particles::stream` —
+  so the Brownian increments and the parent + clock of a birth are drawn
+  inside the parallel loops with no shared state; only the initial draw
+  keeps one sequential stream. Runs are deterministic in the seed and
+  independent of the thread count (tests
+  `runs_do_not_depend_on_the_thread_count`,
+  `particles_have_independent_streams`); `Mod: Model<M> + Sync` on the
+  impl and on `jobs::run_particles`. Measured (M4 Pro, 14 threads,
+  pendulum, γ = 1, ms/step, 1 thread → 14): N = 500: 0.86 → 0.32
+  (×2.7); N = 20 000: 16.1 → 2.3 (×7.1); N = 200 000: 155 → 23 (×6.8).
 - `src/output.rs` — output routines of the filter (binary snapshots of p,
   trajectory writer/printer, progress bar), kept out of the numerical core.
   New models go in `src/models/`; new output formats in `src/output.rs`.
@@ -624,7 +821,7 @@ it proceeds — the to-do list below is architecture only.
   jumped to −π, which looked like a non-periodic q₁)
   with a diamond at the current point — `FilterView::show_tracker`, on by
   default — so the Gaussian closure's single mode can be compared with the
-  density, e.g. on the random-walk ring or the θ-marginals; and the
+  density, e.g. on the lamppost ring or the θ-marginals; and the
   "tracker density" checkbox (`show_tracker_density`, on by default) adds
   a pane with the tracker's own density at the playback step, the
   Gaussian p ∝ exp(−½(x−x̂)ᵀS(x−x̂)/ε) max-marginalized on a plane of its
@@ -670,7 +867,7 @@ it proceeds — the to-do list below is architecture only.
   box-tracker-only, Outputs (planes, snapshots, memory estimate) serves
   both grid estimators; the Run button launches the selected estimator
   (`VizModel::model_spec` gives the drawn parameters as an
-  `ode_models::spec::ModelSpec`; the app wraps it with the estimator, the
+  `ode_models_spec::spec::ModelSpec`; the app wraps it with the estimator, the
   config, dt and steps in a `jobs::JobSpec` and spawns the typed
   `run_filter_spec` / `run_box_spec` / `run_particles_spec` /
   `run_tracker_spec`, which build the model through the visitor and call
@@ -813,24 +1010,27 @@ python scripts/visualize_model.py pendulum_forward    # trajectory time series
 python scripts/visualize_pendulum.py pendulum_forward # (x,y)-plane animation
 cargo bench --bench transport              # time the two transport paths (pendulum)
 cargo bench --bench diffusion              # lobatto-spectral vs lobatto-fft diffusion step (4D grids; -- --heavy for 26.6M/43M)
-cargo run -p odeon-observers-viewer --release   # observers viewer (GUI); odeon-models-viewer = models only
+cargo run -p odeon-observers-viewer --release   # observers viewer (GUI)
 ```
 
 Always use `--release` for the 4D examples.
 
 ## Key design points (current state)
 
-- **`Model` trait has two faces**: the grid filter consumes `discrepancy`
-  (scalar, fast per-grid-point path) and `flow_inv`; the tracker consumes
-  `flow`, `flow_jacobian` (exact tangent of the GL4 step from the stage
-  system — `gl4_step_with_jacobian`, one extra LU solve; the spring returns
-  T), `n_obs`/`h`/`y_obs`/`obs_jacobian` (analytic; the spring's opaque
-  observation closure is the one finite-difference exception, exact for its
-  linear observations) and the provided `innovation` (overridden by Kepler
-  for the bearing's angular difference). Vector observations (pendulum tip)
+- **`Model` trait: parameters and pure maps, no state** (since
+  2026-09-14, migration step 7). The grid filter consumes
+  `discrepancy(y, x)` (scalar, allocation-free per-grid-point path) and
+  `flow_inv`; the tracker consumes `flow`, `flow_jacobian` (exact tangent
+  of the GL4 step from the stage system — `gl4_step_with_jacobian`, one
+  extra LU solve; the spring returns T), `obs_dim`/`obs`/`obs_jacobian`
+  (analytic; the spring's opaque observation closure is the one
+  finite-difference exception, exact for its linear observations) and
+  `innovation(y, x)` (overridden by Kepler for the bearing's angular
+  difference). The observation y_n of every step comes from the
+  `Reference` the observer runs along. Vector observations (pendulum tip)
   are supported on the tracker side.
 - **Flat state convention**: `Model` exposes the state as one flat vector.
-  `discrepancy(&[f64])`, `flow_inv([f64; M])`, `states() -> &[DVector<f64>]`
+  `discrepancy(&[f64], &[f64])`, `flow_inv([f64; M])`, `Reference::states`
   and `state_labels()` all use the same component order (e.g. `[Y; V]` for
   springs, `(q₁,q₂,p₁,p₂)` for the pendulum). Any (position, momentum)
   structure lives inside the model, never in the filter.
@@ -911,15 +1111,14 @@ Always use `--release` for the 4D examples.
   not change the timings (memory churn, not a bottleneck); the remaining
   per-iteration allocations are internal to the crates (lobatto-spectral's
   sweep allocates two small fibre vectors per fibre).
-- **Observations are model-internal, optionally noisy**: the model caches
-  y_n = h(current reference state) + η_n at each `forward()`; the filter
-  queries `discrepancy(ξ) = y_n − h(ξ)`. η ≡ 0 by default; each model's
-  `with_obs_noise(noise, seed)` builder enables a `src/noise.rs`
-  `NoiseModel` (white Gaussian σ; bounded uniform a; colored AR(1) σ, τ) —
-  deterministic in the seed, so a run is reproducible and the viewer can
-  plot exactly the sequence the filter consumed. Decoupling observation
-  generation from the models entirely is still on the roadmap (see Future
-  state).
+- **Observations are external, optionally noisy**: a run's observations
+  are the `Reference`'s (`observations[n]` = y_n), generated by
+  `Reference::twin` as y_n = h(x_n) + η_n with η from a `noise.rs`
+  `NoiseModel` (white Gaussian σ; bounded uniform a; colored AR(1) σ, τ;
+  component j from the stream `seed + j`) — deterministic in the seed, so
+  a run is reproducible and the viewer plots exactly the sequence the
+  estimators consumed — or coming from real data. The observers query
+  `discrepancy(y_n, ξ)`.
 - **p is unnormalized**: overall mass decays over time; only the shape (and
   argmax) matters. `visualize.py` normalizes each snapshot by its max.
 - **Boundary conditions**: per direction via `FilterParams::periodic` —
@@ -993,22 +1192,17 @@ Always use `--release` for the 4D examples.
 
 ## Future state (where this is going)
 
-1. **Realistic twin experiments**: observations decoupled from the model — the
-   model only provides h(x) and the reference trajectory; a separate
-   observation component generates the sequence y_n = h(x_ref) + noise and
-   feeds the filter. This is a deliberate refactor of the `Model` trait /
-   filter interface.
+1. **Realistic twin experiments**: done (migration step 7) — the model
+   provides h(x) and the flow, `Reference::twin` generates y_n = h(x_ref)
+   + noise, and a `Reference` from real data feeds the observers the same
+   way.
 2. **Tractable 4D+ runs**: performance work, starting with profiling the
    current CPU/Rayon code (transport Newton per DOF and the diffusion
    solves are the suspected hotspots).
 
 ## To-do list (architecture only, in priority order)
 
-1. **Decouple observations + add noise**: refactor so observation generation
-   (reference + noise) lives outside the model; the model keeps only h(x).
-   An interface change (the `Model` trait / filter interface), not an
-   algorithm change; it fits naturally after the crate split.
-2. **Profile & optimize**: done so far: allocation-free transport on the
+1. **Profile & optimize**: done so far: allocation-free transport on the
    mortensen side (`p_buf`); real `p_field` (`Vec<f64>` +
    `solve_in_place_real`); and `pre_compute_flow_inv` now builds a lobatto-fft
    0.2.2 `EvalPlan` (`convect_plan`/`eval_with_plan`) — this was the "big
@@ -1066,5 +1260,3 @@ Always use `--release` for the 4D examples.
 ## Open questions (recorded, not decided)
 
 - Performance path beyond CPU optimization: GPU vs algorithmic reduction.
-- Exact interface of the decoupled observation component (noise model,
-  non-scalar observations).

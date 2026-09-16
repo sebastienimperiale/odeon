@@ -9,9 +9,11 @@
 //!
 //! Outputs go to examples/output/one_spring/.
 
-use ode_observers::filter::{DiffusionScheme, FilterParams, MortensenFilter};
+use ode_observers::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
 use ode_models::models::SpringSystem;
-use nalgebra::DVector;
+use ode_models_spec::noise::NoiseModel;
+use ode_models_spec::progress::Progress;
+use ode_models_spec::reference::Reference;
 
 fn main() {
     const N: usize = 1;
@@ -32,10 +34,9 @@ fn main() {
     // Initial data: displacements Y(0) = [ℓ, 2ℓ, …, Nℓ] — a stretched chain (the
     // model's equilibrium is Y = 0: y are displacements from rest), V(0) = 0
     let ell = 1.0 / N as f64;
-    let y0 = DVector::from_fn(N, |n, _| (n + 1) as f64 * ell);
-    let v0 = DVector::zeros(N);
+    let x0: [f64; M] = std::array::from_fn(|d| if d < N { (d + 1) as f64 * ell } else { 0.0 });
 
-    let sys = SpringSystem::new(N, rho, a, dt, y0, v0, h_obs);
+    let sys = SpringSystem::new(N, rho, a, dt, h_obs);
 
     println!("\nTransition matrix T (2NÃ2N, state = [Y; V]):");
     println!("{:.6}", sys.trans);
@@ -63,5 +64,7 @@ fn main() {
     filter.init_filter_quadratic(sigma);
 
     let n_steps = (t_end / dt).ceil() as usize;
-    filter.run(n_steps, 25, PLOT_PAIRS, "examples/output/one_spring");
+    // The twin experiment: the reference trajectory and its (noiseless) observations.
+    let reference = Reference::twin(&filter.model, x0, n_steps, NoiseModel::None, 0, None, &Progress::default());
+    filter.run_and_save(&reference, 25, PLOT_PAIRS, "examples/output/one_spring");
 }

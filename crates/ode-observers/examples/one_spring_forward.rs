@@ -10,7 +10,9 @@
 
 use ode_models::models::SpringSystem;
 use ode_observers::output::save_forward;
-use nalgebra::DVector;
+use ode_models_spec::noise::NoiseModel;
+use ode_models_spec::progress::Progress;
+use ode_models_spec::reference::Reference;
 
 fn main() {
     const N: usize = 1;
@@ -24,17 +26,14 @@ fn main() {
     // Initial data: displacements Y(0) = [ℓ, 2ℓ, …, Nℓ] — a stretched chain (the
     // model's equilibrium is Y = 0: y are displacements from rest), V(0) = 0
     let ell = 1.0 / N as f64;
-    let y0 = DVector::from_fn(N, |n, _| (n + 1) as f64 * ell);
-    let v0 = DVector::zeros(N);
+    let x0: [f64; M] = std::array::from_fn(|d| if d < N { (d + 1) as f64 * ell } else { 0.0 });
 
     // The observation is a filter-only concern; a pure forward solve never
     // uses it, so pass a placeholder.
-    let mut sys = SpringSystem::new(N, rho, a, dt, y0, v0, |x: &[f64]| x[0]);
+    let sys = SpringSystem::new(N, rho, a, dt, |x: &[f64]| x[0]);
 
     let n_steps = (t_end / dt).ceil() as usize;
-    for _ in 0..n_steps {
-        sys.forward();
-    }
+    let reference = Reference::twin(&sys, x0, n_steps, NoiseModel::None, 0, None, &Progress::default());
 
-    save_forward::<M, _>(&sys, "examples/output/one_spring_forward");
+    save_forward::<M, _>(&sys, &reference, "examples/output/one_spring_forward");
 }

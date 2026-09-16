@@ -8,8 +8,11 @@
 //!
 //! Outputs go to examples/output/kepler/.
 
-use ode_observers::filter::{DiffusionScheme, FilterParams, MortensenFilter};
+use ode_observers::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
 use ode_models::models::kepler::{DIM, KeplerObservation, KeplerSystem, perihelion_state};
+use ode_models_spec::noise::NoiseModel;
+use ode_models_spec::progress::Progress;
+use ode_models_spec::reference::Reference;
 
 fn main() {
     const M: usize = DIM;
@@ -35,7 +38,7 @@ fn main() {
         "softened Kepler: x0 = {x0:?}, dt = {dt}, t_end = {t_end:.3}, observation {OBSERVATION:?}\ndomain = {domain:?}"
     );
 
-    let sys = KeplerSystem::new(x0, dt, OBSERVATION);
+    let sys = KeplerSystem::new(dt, OBSERVATION);
 
     // ── Mortensen filter ─────────────────────────────────────────────────────
     let params = FilterParams {
@@ -59,5 +62,7 @@ fn main() {
     filter.init_filter_quadratic(sigma);
 
     let n_steps = (t_end / dt).ceil() as usize;
-    filter.run(n_steps, 25, PLOT_PAIRS, "examples/output/kepler");
+    // The twin experiment: the reference orbit and its (noiseless) observations.
+    let reference = Reference::twin(&filter.model, x0, n_steps, NoiseModel::None, 0, None, &Progress::default());
+    filter.run_and_save(&reference, 25, PLOT_PAIRS, "examples/output/kepler");
 }

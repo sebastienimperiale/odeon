@@ -8,9 +8,10 @@
 //!
 //! 1. **Observation — killing**: every particle carries a *budget* e_i,
 //!    drawn from the exponential law of parameter 1 at its creation, and a
-//!    running *misfit* a_i. With the current observation y_n and the
-//!    model's discrepancy d(y_n, h(x)) (the squared distance the filter
-//!    multiplies p by exp(−dt·γ·d/2ε) with), the misfit grows by
+//!    running *misfit* a_i. With the observation y_n of the step (given to
+//!    [`ParticleSystem::forward`]) and the model's discrepancy d(y_n, h(x))
+//!    (the squared distance the filter multiplies p by exp(−dt·γ·d/2ε)
+//!    with), the misfit grows by
 //!
 //!      a_i += dt · γ · d(y_n, h(Z^i)),
 //!
@@ -24,9 +25,7 @@
 //!    decided before any birth (order-independent). If no particle
 //!    survives the run panics: the misfit of the whole cloud exceeded the
 //!    clocks in one step (γ·dt·d too large, or N too small).
-//! 3. **Model forward**: the reference trajectory advances and the
-//!    observation is refreshed.
-//! 4. **Move**: every particle, the newborns included, follows the model's
+//! 3. **Move**: every particle, the newborns included, follows the model's
 //!    exact discrete flow and receives a Brownian increment,
 //!
 //!      Z^i ← φ(Z^i) + s·√(ε q_d dt)·G^i_d   (G^i_d standard normal, per direction),
@@ -43,9 +42,23 @@
 //! the rate of the energy \eqref{eq:energy}, not of the density's misfit
 //! factor, so that a small ε does not make the jump frequency explode
 //! (the note's own caveat).
+//!
+//! **Parallelism and randomness** (2026-09): steps 1, 2 and 3 run on
+//! rayon's thread pool, particle by particle. Every particle has its own
+//! random stream at every step — a `SplitMix64` seeded by mixing the run
+//! seed, the step number, the particle index and the purpose (birth or
+//! move), see `stream` — so the Brownian increments, and the parent and
+//! clock of a birth, are drawn inside the parallel loops without any
+//! shared state. A run is deterministic in its seed and independent of the
+//! number of threads (test `runs_do_not_depend_on_the_thread_count`);
+//! its random sequence differs from the former sequential implementation,
+//! which drew everything from one stream in index order, with the same
+//! statistics. Only the initial draw uses one sequential stream.
 
+use super::Observer;
 use ode_models::model::Model;
-use ode_models::noise::SplitMix64;
+use ode_models_spec::rng::SplitMix64;
+use rayon::prelude::*;
 
 /// Parameters of the [`ParticleSystem`]. Deliberately no `Default`.
 #[derive(Clone, Copy, Debug)]
@@ -84,8 +97,7 @@ pub struct ParticleParams<const M: usize> {
 
 /// The population of particles driving a [`Model`]'s flow.
 pub struct ParticleSystem<const M: usize, Mod: Model<M>> {
-    /// The forward model; its `states` hold the reference trajectory and
-    /// its cached observation feeds the killing.
+    /// The forward model (parameters and maps).
     pub model: Mod,
     /// Parameters the system was built with.
     pub params: ParticleParams<M>,
@@ -95,12 +107,24 @@ pub struct ParticleSystem<const M: usize, Mod: Model<M>> {
     /// Accumulated misfit a_i = Σ dt·γ·d of every particle since its
     /// creation; it dies when a_i ≥ e_i.
     spent: Vec<f64>,
-    rng: SplitMix64,
     step: usize,
     births: usize,
 }
 
-impl<const M: usize, Mod: Model<M>> ParticleSystem<M, Mod> {
+/// The random stream of particle `i` at step `step` for `purpose` (0 =
+/// move, 1 = birth): a `SplitMix64` seeded by mixing the run seed with the
+/// three indices, so that no two (step, particle, purpose) share a stream
+/// and no state is shared between threads.
+fn stream(seed: u64, step: usize, i: usize, purpose: u64) -> SplitMix64 {
+    let mut mix = SplitMix64::new(
+        seed ^ (step as u64).wrapping_mul(0xA24B_AED4_963E_E407)
+            ^ (i as u64).wrapping_mul(0x9FB2_1C65_1E98_DF25)
+            ^ purpose.wrapping_mul(0xD6E8_FEB8_6659_FD93),
+    );
+    SplitMix64::new(mix.next_u64())
+}
+
+impl<const M: usize, Mod: Model<M> + Sync> ParticleSystem<M, Mod> {
     /// Draw the initial population: N positions from the Gaussian prior
     /// (centre `center`, variance ε/σ_d per direction; uniform in the box
     /// where σ_d = 0; periodic directions wrapped), each with a budget
@@ -117,6 +141,23 @@ impl<const M: usize, Mod: Model<M>> ParticleSystem<M, Mod> {
             }),
             "each domain needs min < max, q_d ≥ 0 and σ_d ≥ 0"
         );
+        let mut sys = ParticleSystem {
+            model,
+            params,
+            positions: Vec::new(),
+            budget: Vec::new(),
+            spent: Vec::new(),
+            step: 0,
+            births: 0,
+        };
+        sys.draw_initial();
+        sys
+    }
+
+    /// (Re)draw the initial population from `params` (centre, stiffness,
+    /// box, seed): N positions, N budgets, no misfit, step 0.
+    fn draw_initial(&mut self) {
+        let params = self.params;
         let mut rng = SplitMix64::new(params.seed);
         let n = params.n_particles;
         let positions = (0..n)
@@ -133,16 +174,19 @@ impl<const M: usize, Mod: Model<M>> ParticleSystem<M, Mod> {
             })
             .collect();
         let budget: Vec<f64> = (0..n).map(|_| draw_budget(&mut rng)).collect();
-        ParticleSystem {
-            model,
-            params,
-            positions,
-            budget,
-            spent: vec![0.0; n],
-            rng,
-            step: 0,
-            births: 0,
-        }
+        self.positions = positions;
+        self.budget = budget;
+        self.spent = vec![0.0; n];
+        self.step = 0;
+        self.births = 0;
+    }
+
+    /// Empirical mean of the cloud, the estimate the common
+    /// [`Observer`] surface reports (a plain mean: on a periodic direction
+    /// it is only meaningful while the cloud does not straddle the seam).
+    pub fn mean(&self) -> [f64; M] {
+        let n = self.positions.len() as f64;
+        std::array::from_fn(|d| self.positions.iter().map(|z| z[d]).sum::<f64>() / n)
     }
 
     /// Particle positions (length N).
@@ -171,23 +215,27 @@ impl<const M: usize, Mod: Model<M>> ParticleSystem<M, Mod> {
         self.births
     }
 
-    /// One step: killing by the observation, births, model forward, move.
+    /// One step, given the observation `y` of this step: killing by the
+    /// observation, births, move.
     ///
     /// Panics if no particle survives the step.
-    pub fn forward(&mut self) {
+    pub fn forward(&mut self, y: &[f64]) {
         let dt = self.model.dt();
         let gamma = self.params.gamma;
 
         // 1. Observation: the misfit of every particle grows by dt·γ·d at
-        //    its current position, with the current observation.
-        let mut dead = Vec::new();
-        let mut alive = Vec::new();
-        for i in 0..self.positions.len() {
-            if gamma > 0.0 {
-                self.spent[i] += dt * gamma * self.model.discrepancy(&self.positions[i]);
+        //    its current position, with the observation y. The
+        //    discrepancies are pure functions of the positions: evaluated
+        //    in parallel, then applied in index order.
+        if gamma > 0.0 {
+            let misfit: Vec<f64> =
+                self.positions.par_iter().map(|z| dt * gamma * self.model.discrepancy(y, z)).collect();
+            for (a, m) in self.spent.iter_mut().zip(misfit) {
+                *a += m;
             }
-            if self.spent[i] >= self.budget[i] { dead.push(i) } else { alive.push(i) }
         }
+        let (dead, alive): (Vec<usize>, Vec<usize>) =
+            (0..self.positions.len()).partition(|&i| self.spent[i] >= self.budget[i]);
         assert!(
             !alive.is_empty(),
             "particle system: every particle died at step {} (N = {}): the misfit dt·γ·d of the \
@@ -197,26 +245,36 @@ impl<const M: usize, Mod: Model<M>> ParticleSystem<M, Mod> {
         );
 
         // 2. Births: each dead particle copies a survivor drawn uniformly
-        //    (deaths were all decided above: order-independent).
-        for &i in &dead {
-            let parent = alive[(self.rng.uniform() * alive.len() as f64).floor().min(alive.len() as f64 - 1.0) as usize];
-            self.positions[i] = self.positions[parent];
-            self.budget[i] = draw_budget(&mut self.rng);
+        //    (deaths were all decided above: order-independent), with its
+        //    own stream for the parent and the fresh clock.
+        let seed = self.params.seed;
+        let step = self.step;
+        let births: Vec<(usize, [f64; M], f64)> = dead
+            .par_iter()
+            .map(|&i| {
+                let mut r = stream(seed, step, i, 1);
+                let parent = alive[(r.uniform() * alive.len() as f64).floor().min(alive.len() as f64 - 1.0) as usize];
+                (i, self.positions[parent], draw_budget(&mut r))
+            })
+            .collect();
+        for (i, position, budget) in births {
+            self.positions[i] = position;
+            self.budget[i] = budget;
             self.spent[i] = 0.0;
         }
         self.births += dead.len();
 
-        // 3. Reference trajectory and observation.
-        self.model.forward();
-
-        // 4. Move: exact flow, then the Brownian increment, then the wrap.
+        // 3. Move: exact flow, then the Brownian increment from the
+        //    particle's own stream, then the wrap — all in parallel.
         let p = &self.params;
+        let model = &self.model;
         let std: [f64; M] = std::array::from_fn(|d| p.noise_scale * (p.eps * p.q_diag[d] * dt).sqrt());
-        for z in &mut self.positions {
-            let mut y = self.model.flow(*z);
+        self.positions.par_iter_mut().enumerate().for_each(|(i, z)| {
+            let mut r = stream(seed, step, i, 0);
+            let mut y = model.flow(*z);
             for d in 0..M {
                 if std[d] > 0.0 {
-                    y[d] += std[d] * self.rng.normal();
+                    y[d] += std[d] * r.normal();
                 }
                 if p.periodic[d] {
                     let (lo, hi) = p.domain[d];
@@ -224,7 +282,7 @@ impl<const M: usize, Mod: Model<M>> ParticleSystem<M, Mod> {
                 }
             }
             *z = y;
-        }
+        });
         self.step += 1;
     }
 }
@@ -234,23 +292,46 @@ fn draw_budget(rng: &mut SplitMix64) -> f64 {
     -rng.uniform().ln()
 }
 
+/// The common observer surface: the Gaussian prior redraws the cloud
+/// (same seed: the same population as a fresh system with these
+/// parameters); estimate = the empirical mean.
+impl<const M: usize, Mod: Model<M> + Sync> Observer<M> for ParticleSystem<M, Mod> {
+    fn dt(&self) -> f64 {
+        self.model.dt()
+    }
+
+    fn init_gaussian(&mut self, center: [f64; M], sigma: [f64; M]) {
+        assert!(sigma.iter().all(|&s| s >= 0.0), "sigma must be nonnegative");
+        self.params.center = center;
+        self.params.sigma = sigma;
+        self.draw_initial();
+    }
+
+    fn forward(&mut self, y: &[f64]) {
+        ParticleSystem::forward(self, y);
+    }
+
+    fn estimate(&self) -> [f64; M] {
+        self.mean()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ode_models::models::SpringSystem;
-    use nalgebra::DVector;
+    use ode_models_spec::noise::NoiseModel;
+    use ode_models_spec::progress::Progress;
+    use ode_models_spec::reference::Reference;
     use std::f64::consts::PI;
 
     fn spring(dt: f64) -> SpringSystem {
-        SpringSystem::new(
-            1,
-            1.0,
-            1.0,
-            dt,
-            DVector::from_row_slice(&[1.15]),
-            DVector::zeros(1),
-            |x: &[f64]| x[0],
-        )
+        SpringSystem::new(1, 1.0, 1.0, dt, |x: &[f64]| x[0])
+    }
+
+    /// The observations of the spring's noiseless reference from (1.15, 0).
+    fn observations(dt: f64, steps: usize) -> Vec<Vec<f64>> {
+        Reference::twin(&spring(dt), [1.15, 0.0], steps, NoiseModel::None, 0, None, &Progress::default()).observations
     }
 
     /// No prior (σ = 0): the initial draw is uniform in the box.
@@ -302,8 +383,8 @@ mod tests {
         let mut sys = ParticleSystem::<2, _>::new(spring(0.01), params(50, 0.0, 0.0, 1));
         let z0 = sys.positions().to_vec();
         let flow = spring(0.01);
-        for _ in 0..40 {
-            sys.forward();
+        for y in &observations(0.01, 40)[..40] {
+            sys.forward(y);
         }
         for (z, &z0) in sys.positions().iter().zip(&z0) {
             let mut y = z0;
@@ -323,8 +404,8 @@ mod tests {
     fn misfit_kills_and_births_copy_a_survivor() {
         let n = 300;
         let mut sys = ParticleSystem::<2, _>::new(spring(0.05), params(n, 0.0, 5.0, 7));
-        for _ in 0..40 {
-            sys.forward();
+        for y in &observations(0.05, 40)[..40] {
+            sys.forward(y);
             assert_eq!(sys.positions().len(), n);
             let (pos, e, a) = (sys.positions(), sys.budgets(), sys.spent());
             for i in 0..n {
@@ -350,13 +431,60 @@ mod tests {
     fn runs_are_reproducible_in_the_seed() {
         let run = |seed| {
             let mut sys = ParticleSystem::<2, _>::new(spring(0.01), params(100, 1.0, 1.0, seed));
-            for _ in 0..25 {
-                sys.forward();
+            for y in &observations(0.01, 25)[..25] {
+                sys.forward(y);
             }
             sys.positions().to_vec()
         };
         assert_eq!(run(3), run(3));
         assert_ne!(run(3), run(4));
+    }
+
+    /// The parallel evaluations (discrepancies, flows) are pure per-particle
+    /// functions and every random draw stays in index order: a run does not
+    /// depend on the number of threads, bit for bit.
+    #[test]
+    fn runs_do_not_depend_on_the_thread_count() {
+        let run = || {
+            let mut sys = ParticleSystem::<2, _>::new(spring(0.01), params(300, 1.0, 1.0, 5));
+            for y in &observations(0.01, 25)[..25] {
+                sys.forward(y);
+            }
+            (sys.positions().to_vec(), sys.spent().to_vec(), sys.budgets().to_vec(), sys.births())
+        };
+        let pool = |n| rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap();
+        let one = pool(1).install(run);
+        let four = pool(4).install(run);
+        assert!(one.3 > 0, "no birth in the test run");
+        assert_eq!(one, four);
+    }
+
+    /// Every particle has its own stream: particles started at the same
+    /// point receive different increments at the first step, and the same
+    /// particle receives different increments at successive steps (the
+    /// spring's flow is linear, so equal positions would stay equal
+    /// without noise).
+    #[test]
+    fn particles_have_independent_streams() {
+        let mut p = params(200, 1.0, 0.0, 9); // unit noise, no killing
+        p.sigma = [1e12; 2]; // a Dirac initial draw
+        let mut sys = ParticleSystem::<2, _>::new(spring(0.01), p);
+        let start = sys.positions().to_vec();
+        assert!(start.iter().all(|z| (z[0] - start[0][0]).abs() < 1e-5));
+        // Increment of every particle at a step = new position − flow(old).
+        let increments = |sys: &ParticleSystem<2, SpringSystem>, before: &[[f64; 2]]| -> Vec<f64> {
+            sys.positions().iter().zip(before).map(|(z, b)| z[0] - sys.model.flow(*b)[0]).collect()
+        };
+        sys.forward(&[1.15]);
+        let first = sys.positions().to_vec();
+        let inc1 = increments(&sys, &start);
+        let mut sorted = inc1.clone();
+        sorted.sort_by(f64::total_cmp);
+        sorted.dedup();
+        assert_eq!(sorted.len(), 200, "some particles received the same increment");
+        sys.forward(&[1.15]);
+        let inc2 = increments(&sys, &first);
+        assert!(inc1.iter().zip(&inc2).all(|(a, b)| (a - b).abs() > 1e-12), "a stream repeated across steps");
     }
 
     /// Periodic directions are wrapped onto the box after every move.
@@ -366,8 +494,8 @@ mod tests {
         p.domain[0] = (-PI, PI);
         p.periodic[0] = true;
         let mut sys = ParticleSystem::<2, _>::new(spring(0.01), p);
-        for _ in 0..20 {
-            sys.forward();
+        for y in &observations(0.01, 20)[..20] {
+            sys.forward(y);
             assert!(sys.positions().iter().all(|z| (-PI..PI).contains(&z[0])));
         }
     }

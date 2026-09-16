@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 ode-models       = { path = "../ode-models" }
+ode-models-spec  = { path = "../ode-models-spec" }
 lobatto-grid     = "0.1.0"
 lobatto-spectral = "0.2.0"
 nalgebra         = "0.34.1"

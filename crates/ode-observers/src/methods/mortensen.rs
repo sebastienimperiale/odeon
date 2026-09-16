@@ -21,7 +21,9 @@
 //! positivity of p.
 
 use serde::{Deserialize, Serialize};
+use super::Observer;
 use ode_models::model::Model;
+use ode_models_spec::reference::Reference;
 use crate::output::print_progress;
 use lobatto_grid::EvalPlan;
 use lobatto_spectral::solver::{BoundaryCondition, PoissonND};
@@ -186,13 +188,10 @@ fn outside_dirichlet<const M: usize>(params: &FilterParams<M>, y: &[f64; M]) -> 
 ///
 /// # Example
 /// ```
-/// use ode_observers::filter::{DiffusionScheme, FilterParams, MortensenFilter};
+/// use ode_observers::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
 /// use ode_models::models::SpringSystem;
-/// use nalgebra::DVector;
 ///
-/// let sys = SpringSystem::new(1, 1.0, 1.0, 0.005,
-///     DVector::from_row_slice(&[0.5]), DVector::zeros(1),
-///     |x: &[f64]| x[0]);
+/// let sys = SpringSystem::new(1, 1.0, 1.0, 0.005, |x: &[f64]| x[0]);
 /// let mut filter = MortensenFilter::<2, _>::new(sys, FilterParams {
 ///     domain: [(-3.0, 3.0); 2],
 ///     eps: 0.01,
@@ -206,11 +205,12 @@ fn outside_dirichlet<const M: usize>(params: &FilterParams<M>, y: &[f64; M]) -> 
 ///     pre_compute_flow_inv: false,
 /// });
 /// filter.init_filter_quadratic(10.0);
-/// filter.forward();
+/// filter.forward(&[0.5]); // one cycle, with the observation y₀ of this step
 /// ```
 pub struct MortensenFilter<const M: usize, Mod: Model<M> + Sync> {
     // ── Public ───────────────────────────────────────────────────────────────
-    /// The forward model; its `states` hold the reference trajectory so far.
+    /// The forward model (parameters and maps; the reference trajectory
+    /// and its observations are a [`Reference`] outside the filter).
     pub model: Mod,
     /// Numerical parameters the filter was built with (see [`FilterParams`]).
     pub params: FilterParams<M>,
@@ -257,8 +257,8 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
     /// * `params` — numerical parameters, see [`FilterParams`]
     pub fn new(model: Mod, params: FilterParams<M>) -> Self {
         assert_eq!(
-            model.states().last().map(|s| s.len()),
-            Some(M),
+            model.dim(),
+            M,
             "filter dimension M = {M} does not match the model's state dimension"
         );
         assert!(
@@ -523,30 +523,31 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
         });
     }
 
-    /// One Mortensen filter iteration, t^n → t^{n+1}:
-    /// observation → model forward → transport → diffusion.
+    /// One Mortensen filter iteration, t^n → t^{n+1}, given the observation
+    /// `y` = y_n of step n (length [`Model::n_obs`]): observation →
+    /// transport → diffusion. (The reference advancing t^n → t^{n+1}
+    /// between the observation and the transport is not the filter's
+    /// business: it lives in the [`Reference`] whose y_n this is.)
     ///
     /// Panics if called before [`init_filter`] / [`init_filter_quadratic`].
-    pub fn forward(&mut self) {
+    pub fn forward(&mut self, y: &[f64]) {
         assert!(
             !self.p_field.is_empty(),
             "filter not initialized: call init_filter(...) or init_filter_quadratic(...) first"
         );
-        // Step 1 — Observation (with the current reference state).
-        self.observe();
-        // Step 2 — Forward: evolve the reference state t^n → t^{n+1}.
-        self.model.forward();
-        // Step 3 — Transport:  p(xi) ← p( φ⁻¹(xi) ), into `p_buf`.
+        // Step 1 — Observation with y_n.
+        self.observe(y);
+        // Step 2 — Transport:  p(xi) ← p( φ⁻¹(xi) ), into `p_buf`.
         self.transport();
-        // Step 4 — Diffusion:  ∂τ p = (ε/2) Δp over δτ = dt, `p_buf` → `p_field`.
+        // Step 3 — Diffusion:  ∂τ p = (ε/2) Δp over δτ = dt, `p_buf` → `p_field`.
         self.diffuse();
     }
 
     /// Observation step, in place on `p_field`:
-    /// p ← p · exp( −ε⁻¹·dt·γ·d(y_n,h(xi))/2 ), with d(y_n,h(xi)) the model's
-    /// discrepancy at the current reference state and γ the observation
-    /// weight [`FilterParams::gamma`].
-    fn observe(&mut self) {
+    /// p ← p · exp( −ε⁻¹·dt·γ·d(y,h(xi))/2 ), with d(y,h(xi)) the model's
+    /// discrepancy between the observation `y` and the grid point and γ the
+    /// observation weight [`FilterParams::gamma`].
+    fn observe(&mut self, y: &[f64]) {
         let dt = self.model.dt();
         let eps = self.params.eps;
         let gamma = self.params.gamma;
@@ -555,7 +556,7 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
             .par_iter()
             .zip(self.p_field.par_iter_mut())
             .for_each(|(xi, pi)| {
-                let d = model.discrepancy(xi);
+                let d = model.discrepancy(y, xi);
                 *pi *= (-dt * gamma * d / (2.0 * eps)).exp();
             });
     }
@@ -628,8 +629,8 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
         std::mem::swap(&mut self.p_field, &mut self.p_buf);
     }
 
-    /// Run the full filter loop with outputs: `n_steps` iterations of
-    /// [`forward`](Self::forward), `n_snapshots` evenly spaced marginal
+    /// Run the full filter loop with outputs: one [`forward`](Self::forward)
+    /// per step of `reference` (with its observations), `n_snapshots` evenly spaced marginal
     /// snapshots (including t = 0; e.g. 25 gives a 5×5 grid in the plotting
     /// script), a
     /// progress bar on stderr, the reference-trajectory table on stdout, and
@@ -645,13 +646,14 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
     ///
     /// Panics if the filter is not initialized or a `plot_pairs` entry is out
     /// of range.
-    pub fn run(
+    pub fn run_and_save(
         &mut self,
-        n_steps: usize,
+        reference: &Reference,
         n_snapshots: usize,
         plot_pairs: &[(usize, usize)],
         out_dir: &str,
     ) {
+        let n_steps = reference.steps();
         for &(a, b) in plot_pairs {
             assert!(
                 a < M && b < M && a != b,
@@ -687,7 +689,7 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
         estimates.push(self.argmax_p());
 
         for n in 0..n_steps {
-            self.forward();
+            self.forward(&reference.observations[n]);
             estimates.push(self.argmax_p());
 
             let step = n + 1;
@@ -700,8 +702,8 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
         }
         eprintln!();
 
-        self.print_trajectory();
-        self.save_trajectory(out_dir);
+        self.print_trajectory(reference);
+        self.save_trajectory(reference, out_dir);
         self.save_estimate(&estimates, out_dir);
 
         let meta = format!(
@@ -734,12 +736,42 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
     }
 }
 
+/// The common observer surface: estimate = the node argmax of p.
+impl<const M: usize, Mod: Model<M> + Sync> Observer<M> for MortensenFilter<M, Mod> {
+    fn dt(&self) -> f64 {
+        self.model.dt()
+    }
+
+    fn init_gaussian(&mut self, center: [f64; M], sigma: [f64; M]) {
+        self.init_filter_gaussian(sigma, center);
+    }
+
+    fn forward(&mut self, y: &[f64]) {
+        MortensenFilter::forward(self, y);
+    }
+
+    fn estimate(&self) -> [f64; M] {
+        self.argmax_p()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ode_models::models::{PendulumSystem, SpringSystem};
-    use nalgebra::DVector;
+    use ode_models_spec::noise::NoiseModel;
+    use ode_models_spec::progress::Progress;
     use std::f64::consts::PI;
+
+    /// A noiseless reference of `steps` steps from `x0` (a fresh copy of
+    /// the model, the filter having taken its own).
+    fn twin<const M: usize, Mod: Model<M>>(model: &Mod, x0: [f64; M], steps: usize) -> Reference {
+        Reference::twin(model, x0, steps, NoiseModel::None, 0, None, &Progress::default())
+    }
+
+    fn spring(dt: f64) -> SpringSystem {
+        SpringSystem::new(1, 1.0, 1.0, dt, |x: &[f64]| x[0])
+    }
 
     /// `shift_by_elements` is an exact node-to-node translation: after a
     /// shift by k elements, p_new at a node equals p_old at the node k·h
@@ -759,16 +791,7 @@ mod tests {
             dirichlet: [true; 2],
             pre_compute_flow_inv: false,
         };
-        let sys = SpringSystem::new(
-            1,
-            1.0,
-            1.0,
-            0.01,
-            DVector::from_row_slice(&[0.3]),
-            DVector::zeros(1),
-            |x: &[f64]| x[0],
-        );
-        let mut filter = MortensenFilter::<2, _>::new(sys, params);
+        let mut filter = MortensenFilter::<2, _>::new(spring(0.01), params);
         filter.init_filter_gaussian([3.0, 2.0], [0.17, -0.31]);
         let old = filter.p_field().to_vec();
         let grid = filter.grid().to_vec();
@@ -804,7 +827,7 @@ mod tests {
     fn periodic_angle_wraps_across_the_boundary() {
         let run = |periodic: bool| {
             let x0 = [PI - 0.1, 0.0, 0.0, 0.0];
-            let sys = PendulumSystem::new(x0, 0.01);
+            let sys = PendulumSystem::new(0.01);
             let mut filter = MortensenFilter::<4, _>::new(
                 sys,
                 FilterParams {
@@ -822,7 +845,7 @@ mod tests {
             );
             filter.init_filter_gaussian([10.0; 4], x0);
             for _ in 0..30 {
-                filter.forward();
+                filter.forward(&[0.0, 0.0]); // γ = 0: the observation is irrelevant
             }
             let p = filter.p_field();
             let grid = filter.grid();
@@ -851,17 +874,8 @@ mod tests {
     #[test]
     fn gaussian_prior_is_wrapped_on_periodic_directions() {
         let (eps, sig, c) = (0.1, 2.0, PI - 0.3);
-        let sys = SpringSystem::new(
-            1,
-            1.0,
-            1.0,
-            0.01,
-            DVector::from_row_slice(&[0.0]),
-            DVector::zeros(1),
-            |x: &[f64]| x[0],
-        );
         let mut filter = MortensenFilter::<2, _>::new(
-            sys,
+            spring(0.01),
             FilterParams {
                 domain: [(-PI, PI), (-2.0, 2.0)],
                 eps,
@@ -926,7 +940,8 @@ mod tests {
             dirichlet: [false; 4],
             pre_compute_flow_inv: false,
         };
-        let sys = PendulumSystem::new([1.5, 1.4, 0.0, 0.0], 0.01);
+        let sys = PendulumSystem::new(0.01);
+        let r = twin(&sys, [1.5, 1.4, 0.0, 0.0], 3);
         let mut filter = MortensenFilter::<4, _>::new(sys, params);
         assert_eq!(
             filter.grid().len(),
@@ -935,8 +950,8 @@ mod tests {
         );
 
         filter.init_filter_quadratic(1.0);
-        for _ in 0..3 {
-            filter.forward();
+        for y in &r.observations[..3] {
+            filter.forward(y);
         }
         let max = filter
             .p_field()
@@ -950,17 +965,8 @@ mod tests {
     /// must produce the same p field as the per-iteration `convect` path.
     #[test]
     fn precomputed_transport_matches_convect() {
-        let sys = || {
-            SpringSystem::new(
-                1,
-                1.0,
-                1.0,
-                0.005,
-                DVector::from_row_slice(&[0.5]),
-                DVector::zeros(1),
-                |x: &[f64]| x[0],
-            )
-        };
+        let sys = || spring(0.005);
+        let r = twin(&sys(), [0.5, 0.0], 5);
         let params = |pre| FilterParams {
             domain: [(-3.0, 3.0); 2],
             eps: 0.01,
@@ -988,9 +994,9 @@ mod tests {
         on_the_fly.init_filter_quadratic(10.0);
         precomputed.init_filter_quadratic(10.0);
 
-        for _ in 0..5 {
-            on_the_fly.forward();
-            precomputed.forward();
+        for y in &r.observations[..5] {
+            on_the_fly.forward(y);
+            precomputed.forward(y);
         }
         for (pa, pb) in on_the_fly.p_field().iter().zip(precomputed.p_field()) {
             assert!(
@@ -1001,15 +1007,7 @@ mod tests {
     }
 
     fn spring_2d(dt: f64) -> SpringSystem {
-        SpringSystem::new(
-            1,
-            1.0,
-            1.0,
-            dt,
-            DVector::from_row_slice(&[0.5]),
-            DVector::zeros(1),
-            |x: &[f64]| x[0],
-        )
+        spring(dt)
     }
 
     /// γ weights the observation step: γ = 0 leaves p unchanged, and the
@@ -1033,7 +1031,7 @@ mod tests {
             let mut f = MortensenFilter::<2, _>::new(spring_2d(0.01), params(gamma));
             f.init_filter_quadratic(1.0);
             let before = f.p_field().to_vec();
-            f.observe();
+            f.observe(&[0.5]); // the observation of the reference (0.5, 0)
             (before, f.p_field().to_vec())
         };
         let (before, off) = observe(0.0);
@@ -1114,9 +1112,10 @@ mod tests {
             MortensenFilter::<2, _>::new(spring_2d(0.01), params(DiffusionScheme::Euler));
         split.init_filter_quadratic(10.0);
         unsplit.init_filter_quadratic(10.0);
-        for _ in 0..10 {
-            split.forward();
-            unsplit.forward();
+        let r = twin(&spring_2d(0.01), [0.5, 0.0], 10);
+        for y in &r.observations[..10] {
+            split.forward(y);
+            unsplit.forward(y);
         }
         let max = split.p_field().iter().copied().fold(f64::MIN, f64::max);
         let diff = split

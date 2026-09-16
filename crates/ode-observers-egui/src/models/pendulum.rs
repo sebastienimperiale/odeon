@@ -6,9 +6,9 @@
 use super::{SceneMap, VizModel, draw_trace};
 use crate::noise::NoiseModel;
 use crate::palette;
-use crate::playback::{Job, Trajectory};
-use ode_models::spec::ModelSpec;
-use ode_models::models::pendulum::{DIM, PendulumParams, PendulumSystem};
+use crate::playback::Trajectory;
+use ode_models::models::pendulum::{DIM, PendulumParams};
+use ode_models_spec::spec::{ModelSpec, TwinSpec};
 
 /// The paper's target trajectory (pendulum.pdf §5.2).
 const PAPER_IC: [f64; 4] = [1.5, 1.4, 0.0, 0.0];
@@ -131,60 +131,33 @@ impl VizModel for PendulumViz {
         ["q_1", "q_2", "p_1", "p_2"].map(String::from).to_vec()
     }
 
-    fn periodic(&self) -> Vec<bool> {
-        vec![true, true, false, false]
+    fn periodic(&self) -> Vec<Option<(f64, f64)>> {
+        use std::f64::consts::PI;
+        vec![Some((-PI, PI)), Some((-PI, PI)), None, None]
     }
 
     fn default_pairs(&self) -> Vec<(usize, usize)> {
         vec![(0, 2), (1, 3)]
     }
 
-    fn model_spec(&self) -> ModelSpec {
-        let p = &self.drawn;
-        ModelSpec::Pendulum { params: p.phys, x0: p.x0, noise: p.obs_noise, noise_seed: 2000 }
+    fn snapshot(&mut self) {
+        self.drawn = self.params.clone();
     }
 
-    fn make_job(&mut self, dt: f64, steps: usize) -> Job {
-        self.drawn = self.params.clone();
-        let p = self.params.clone();
-        Box::new(move |progress| {
-            let mut sys = PendulumSystem::with_params(p.phys, p.x0, dt);
-            for _ in 0..steps {
-                sys.forward();
-                progress.step();
-            }
-            let states: Vec<Vec<f64>> = sys.states.iter().map(|s| s.iter().copied().collect()).collect();
-            let mut observations: Vec<Vec<f64>> = states
-                .iter()
-                .map(|s| {
-                    if p.obs_on {
-                        sys.tip_position(s[0], s[1]).to_vec()
-                    } else {
-                        Vec::new()
-                    }
-                })
-                .collect();
-            if p.obs_on {
-                for j in 0..2 {
-                    let eta = p.obs_noise.realize(observations.len(), dt, 2000 + j as u64);
-                    for (obs, e) in observations.iter_mut().zip(eta) {
-                        obs[j] += e;
-                    }
-                }
-            }
-            let suffix = if p.obs_noise.is_none() { "" } else { " (noisy)" };
-            let obs_labels = if p.obs_on {
-                vec![format!("tip x{suffix}"), format!("tip y{suffix}")]
-            } else {
-                Vec::new()
-            };
-            Trajectory {
-                dt,
-                states,
-                observations,
-                obs_labels,
-            }
-        })
+    fn model_spec(&self) -> ModelSpec {
+        ModelSpec::Pendulum { params: self.drawn.phys }
+    }
+
+    /// The tip's two components draw independent noise (seeds 2000, 2001).
+    fn twin_spec(&self, dt: f64, steps: usize) -> TwinSpec {
+        let p = &self.drawn;
+        TwinSpec { model: self.model_spec(), x0: p.x0.to_vec(), dt, steps, noise: p.obs_noise, seed: 2000, walk: None }
+    }
+
+    fn obs_labels(&self) -> Vec<String> {
+        let p = &self.drawn;
+        let suffix = if p.obs_noise.is_none() { "" } else { " (noisy)" };
+        if p.obs_on { vec![format!("tip x{suffix}"), format!("tip y{suffix}")] } else { Vec::new() }
     }
 
     fn draw(

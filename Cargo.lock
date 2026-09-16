@@ -2693,18 +2693,16 @@ version = "0.1.0"
 dependencies = [
  "nalgebra",
  "serde",
- "serde_json",
 ]
 
 [[package]]
-name = "ode-models-egui"
+name = "ode-models-spec"
 version = "0.1.0"
 dependencies = [
- "egui",
- "egui_plot",
  "nalgebra",
  "ode-models",
- "web-time",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2717,6 +2715,7 @@ dependencies = [
  "nalgebra",
  "num-complex",
  "ode-models",
+ "ode-models-spec",
  "rayon",
  "serde",
  "serde_json",
@@ -2728,9 +2727,11 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "egui_plot",
+ "nalgebra",
  "ode-models",
- "ode-models-egui",
+ "ode-models-spec",
  "ode-observers",
+ "web-time",
 ]
 
 [[package]]
@@ -2738,18 +2739,11 @@ name = "ode-observers-remote"
 version = "0.1.0"
 dependencies = [
  "ehttp",
+ "ode-models-spec",
  "ode-observers",
  "serde",
  "serde_json",
  "web-time",
-]
-
-[[package]]
-name = "odeon-models-viewer"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "ode-models-egui",
 ]
 
 [[package]]
@@ -2758,6 +2752,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "log",
+ "ode-models-spec",
  "ode-observers",
  "ode-observers-egui",
  "ode-observers-remote",
@@ -2771,7 +2766,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "ehttp",
- "ode-models",
+ "ode-models-spec",
  "ode-observers",
  "ode-observers-remote",
  "serde",

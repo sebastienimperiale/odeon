@@ -48,7 +48,8 @@
 //! (localization, no flow) plus Newton solves on the entering elements
 //! only — a fraction ≈ |k_d|/n_el,d of the nodes per moved direction.
 
-use crate::filter::{DiffusionScheme, FilterParams, MortensenFilter, shifted_source};
+use super::Observer;
+use crate::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter, shifted_source};
 use ode_models::model::Model;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
@@ -56,9 +57,9 @@ use rayon::prelude::*;
 /// A model seen from a window centred at `offset`: every state-dependent
 /// quantity is evaluated at the physical point x̂ + ξ, and the flow is
 /// expressed in window coordinates, φ_ξ(ξ) = φ(x̂ + ξ) − x̂ (same for φ⁻¹).
-/// The reference trajectory, the observations and the time step are the
-/// inner model's, untouched. [`Model::is_autonomous`] is `false`: the window
-/// map changes whenever the offset does.
+/// The observations and the time step are the inner model's, untouched.
+/// [`Model::is_autonomous`] is `false`: the window map changes whenever the
+/// offset does.
 pub struct Shifted<Mod> {
     /// The physical model.
     pub inner: Mod,
@@ -96,16 +97,16 @@ impl<const M: usize, Mod: Model<M>> Model<M> for Shifted<Mod> {
         self.inner.dt()
     }
 
-    fn forward(&mut self) {
-        self.inner.forward()
+    fn dim(&self) -> usize {
+        self.inner.dim()
     }
 
-    fn discrepancy(&self, xi: &[f64]) -> f64 {
+    fn discrepancy(&self, y: &[f64], xi: &[f64]) -> f64 {
         let mut x = [0.0; M];
         for d in 0..M {
             x[d] = xi[d] + self.offset[d];
         }
-        self.inner.discrepancy(&x)
+        self.inner.discrepancy(y, &x)
     }
 
     fn flow_inv(&self, xi: [f64; M]) -> [f64; M] {
@@ -125,32 +126,30 @@ impl<const M: usize, Mod: Model<M>> Model<M> for Shifted<Mod> {
             .flow_jacobian(std::array::from_fn(|d| xi[d] + self.offset[d]))
     }
 
-    fn n_obs(&self) -> usize {
-        self.inner.n_obs()
+    fn obs_dim(&self) -> usize {
+        self.inner.obs_dim()
     }
 
-    fn h(&self, xi: &[f64]) -> DVector<f64> {
-        self.inner.h(&self.physical(xi))
-    }
-
-    fn y_obs(&self) -> DVector<f64> {
-        self.inner.y_obs()
+    fn obs(&self, xi: &[f64]) -> DVector<f64> {
+        self.inner.obs(&self.physical(xi))
     }
 
     fn obs_jacobian(&self, xi: &[f64]) -> DMatrix<f64> {
         self.inner.obs_jacobian(&self.physical(xi))
     }
 
-    fn innovation(&self, xi: &[f64]) -> DVector<f64> {
-        self.inner.innovation(&self.physical(xi))
+    fn innovation(&self, y: &[f64], xi: &[f64]) -> DVector<f64> {
+        self.inner.innovation(y, &self.physical(xi))
+    }
+
+    /// The inner periodic intervals, translated to window coordinates.
+    fn periodic(&self) -> [Option<(f64, f64)>; M] {
+        let p = self.inner.periodic();
+        std::array::from_fn(|d| p[d].map(|(lo, hi)| (lo - self.offset[d], hi - self.offset[d])))
     }
 
     fn is_autonomous(&self) -> bool {
         false
-    }
-
-    fn states(&self) -> &[DVector<f64>] {
-        self.inner.states()
     }
 
     fn state_labels(&self) -> Vec<String> {
@@ -275,13 +274,6 @@ impl<const M: usize, Mod: Model<M> + Sync> BoxTracker<M, Mod> {
         });
     }
 
-    /// Place the window at `center` with the Gaussian prior
-    /// V_0 = Σ_d σ_d (x_d − center_d)²/2, i.e. p_0 centred on the window.
-    pub fn init_gaussian(&mut self, sigma: [f64; M], center: [f64; M]) {
-        self.set_center(center);
-        self.filter.init_filter_gaussian(sigma, [0.0; M]);
-    }
-
     /// Place the window at `center` (arbitrary move: the whole preimage
     /// cache is recomputed).
     fn set_center(&mut self, center: [f64; M]) {
@@ -339,11 +331,13 @@ impl<const M: usize, Mod: Model<M> + Sync> BoxTracker<M, Mod> {
         self.filter.argmax_p()
     }
 
-    /// One step: the filter cycle on the window (observation and flow read
-    /// at x̂ + ξ, transport in the frozen frame, diffusion), then the
-    /// re-centring by whole elements. Returns the element shift applied.
-    pub fn forward(&mut self) -> [isize; M] {
-        self.filter.forward();
+    /// One step, given the observation `y` of this step: the filter cycle
+    /// on the window (observation and flow read at x̂ + ξ, transport in the
+    /// frozen frame, diffusion), then the re-centring by whole elements.
+    /// Returns the element shift applied ([`Observer::forward`] is the
+    /// same step without it).
+    pub fn step(&mut self, y: &[f64]) -> [isize; M] {
+        self.filter.forward(y);
         self.recentre()
     }
 
@@ -390,23 +384,45 @@ impl<const M: usize, Mod: Model<M> + Sync> BoxTracker<M, Mod> {
     }
 }
 
+/// The common observer surface: the Gaussian prior places the window at
+/// its centre; estimate = x̂ + argmax ρ.
+impl<const M: usize, Mod: Model<M> + Sync> Observer<M> for BoxTracker<M, Mod> {
+    fn dt(&self) -> f64 {
+        self.filter.model.dt()
+    }
+
+    /// Place the window at `center` with the Gaussian prior
+    /// V_0 = Σ_d σ_d (x_d − center_d)²/2, i.e. p_0 centred on the window.
+    fn init_gaussian(&mut self, center: [f64; M], sigma: [f64; M]) {
+        self.set_center(center);
+        self.filter.init_filter_gaussian(sigma, [0.0; M]);
+    }
+
+    fn forward(&mut self, y: &[f64]) {
+        self.step(y);
+    }
+
+    fn estimate(&self) -> [f64; M] {
+        BoxTracker::estimate(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::methods::kalman::{MortensenTracker, TrackerParams};
     use ode_models::models::SpringSystem;
-    use crate::tracker::{MortensenTracker, TrackerParams};
-    use nalgebra::DVector;
+    use ode_models_spec::noise::NoiseModel;
+    use ode_models_spec::progress::Progress;
+    use ode_models_spec::reference::Reference;
 
     fn spring(dt: f64) -> SpringSystem {
-        SpringSystem::new(
-            1,
-            1.0,
-            1.0,
-            dt,
-            DVector::from_row_slice(&[1.15]),
-            DVector::zeros(1),
-            |x: &[f64]| x[0],
-        )
+        SpringSystem::new(1, 1.0, 1.0, dt, |x: &[f64]| x[0])
+    }
+
+    /// The noiseless reference of the spring from (1.15, 0).
+    fn reference(dt: f64, steps: usize) -> Reference {
+        Reference::twin(&spring(dt), [1.15, 0.0], steps, NoiseModel::None, 0, None, &Progress::default())
     }
 
     /// The window on the linear spring: a box of half-width 1 (the
@@ -431,7 +447,7 @@ mod tests {
             pre_compute_flow_inv: true,
         };
         let mut window = BoxTracker::<2, _>::new(spring(dt), params);
-        window.init_gaussian(sigma, x_c);
+        window.init_gaussian(x_c, sigma);
         let mut tracker =
             MortensenTracker::<2, _>::new(spring(dt), TrackerParams { q_diag: q, gamma: 1.0 });
         tracker.init(x_c, sigma);
@@ -440,9 +456,10 @@ mod tests {
         let tol = 0.15;
         let h = window.element_size();
         let mut moved = false;
-        for step in 0..300 {
-            let k = window.forward();
-            tracker.forward();
+        let r = reference(dt, 300);
+        for (step, y) in r.observations[..300].iter().enumerate() {
+            let k = window.step(y);
+            tracker.forward(y);
             moved |= k.iter().any(|&kd| kd != 0);
             let (a, b) = (window.estimate(), tracker.estimate());
             for d in 0..2 {
@@ -484,12 +501,13 @@ mod tests {
         };
         let mut a = BoxTracker::<2, _>::new(spring(dt), params(true));
         let mut b = BoxTracker::<2, _>::new(spring(dt), params(false));
-        a.init_gaussian([20.0; 2], [1.0, 0.0]);
-        b.init_gaussian([20.0; 2], [1.0, 0.0]);
+        a.init_gaussian([1.0, 0.0], [20.0; 2]);
+        b.init_gaussian([1.0, 0.0], [20.0; 2]);
         let mut moves = 0;
-        for step in 0..250 {
-            let ka = a.forward();
-            let kb = b.forward();
+        let r = reference(dt, 250);
+        for (step, y) in r.observations[..250].iter().enumerate() {
+            let ka = a.step(y);
+            let kb = b.step(y);
             assert_eq!(ka, kb, "step {step}: shifts differ");
             moves += usize::from(ka.iter().any(|&k| k != 0));
             assert_eq!(a.center(), b.center(), "step {step}: centres differ");
@@ -519,10 +537,11 @@ mod tests {
             pre_compute_flow_inv: false,
         };
         let mut window = BoxTracker::<2, _>::new(spring(dt), params);
-        window.init_gaussian([20.0; 2], x0);
+        window.init_gaussian(x0, [20.0; 2]);
         let mut flow = x0;
-        for _ in 0..200 {
-            window.forward();
+        let r = reference(dt, 200);
+        for y in &r.observations[..200] {
+            window.forward(y);
             flow = window.model().flow(flow);
             let e = window.estimate();
             for d in 0..2 {

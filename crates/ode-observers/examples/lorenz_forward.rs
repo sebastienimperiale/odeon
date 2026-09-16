@@ -7,6 +7,9 @@
 
 use ode_models::models::lorenz::{DIM, LorenzObservation, LorenzSystem};
 use ode_observers::output::save_forward;
+use ode_models_spec::noise::NoiseModel;
+use ode_models_spec::progress::Progress;
+use ode_models_spec::reference::Reference;
 
 fn main() {
     let dt = 0.01;
@@ -16,12 +19,10 @@ fn main() {
     // (1, 1, 1) start, which has a short transient).
     let x0 = [-3.716171, -4.204785, 20.339103]; // on the attractor (t = 11.4 of the (1, 1, 1) start)
 
-    let mut sys = LorenzSystem::new(x0, dt, LorenzObservation::X);
+    let sys = LorenzSystem::new(dt, LorenzObservation::X);
 
     let n_steps = (t_end / dt).ceil() as usize;
-    for _ in 0..n_steps {
-        sys.forward();
-    }
+    let reference = Reference::twin(&sys, x0, n_steps, NoiseModel::None, 0, None, &Progress::default());
 
-    save_forward::<DIM, _>(&sys, "examples/output/lorenz_forward");
+    save_forward::<DIM, _>(&sys, &reference, "examples/output/lorenz_forward");
 }

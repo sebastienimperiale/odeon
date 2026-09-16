@@ -11,7 +11,7 @@
 //! has covariance ε·P — the 2σ band of the density is ±2√(εP), not ±2√P.
 
 use ode_observers::jobs::TrackerOutput;
-use ode_models_egui::palette;
+use crate::palette;
 
 /// Fraction of the run's steps skipped at the start when scaling the
 /// y-axis on the estimate.

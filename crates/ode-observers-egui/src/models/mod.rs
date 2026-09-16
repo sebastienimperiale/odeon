@@ -4,7 +4,7 @@
 //! the viewer needs a dimension-erased, drawable interface, not the filter's
 //! compile-time grid contract.
 
-mod random_walk;
+mod lamppost;
 pub mod kepler;
 mod lorenz;
 mod pendulum;
@@ -12,7 +12,7 @@ mod pendulum_rod;
 pub mod spring;
 
 use crate::playback::{Job, Trajectory};
-use ode_models::spec::ModelSpec;
+use ode_models_spec::spec::{ModelSpec, TwinSpec};
 
 /// One selectable model in the viewer.
 ///
@@ -67,25 +67,52 @@ pub trait VizModel {
 
     /// Noise-model row of observation `idx` (selector + parameters), shown
     /// in the Observation section under the selected entry. Returns `true`
-    /// when edited. With noise enabled, the *plotted* observation series is
-    /// the noisy one; the filter still uses the model-internal noiseless
-    /// y_n until observation generation is decoupled from the models.
+    /// when edited. With noise enabled, the observation series of the run
+    /// — plotted, and consumed by the estimators — is the noisy one.
     fn noise_ui(&mut self, ui: &mut egui::Ui, idx: usize) -> bool;
 
-    /// Snapshot the current form and build the trajectory computation; the
-    /// job runs on a worker thread and bumps the counter once per step.
-    /// Drawing uses the snapshot, so editing the form after a run cannot
-    /// desynchronize the scene from the trajectory being replayed. The job
-    /// also snapshots the observation labels into the `Trajectory`.
-    fn make_job(&mut self, dt: f64, steps: usize) -> Job;
+    /// Snapshot the current form as the *drawn* parameters: the scene, the
+    /// model description and the twin experiment are read from the
+    /// snapshot, so editing the form after a run cannot desynchronize the
+    /// scene from the trajectory being replayed.
+    fn snapshot(&mut self);
+
+    /// The twin experiment of the drawn parameters: the model, its initial
+    /// state, the observation noise with its seed, an optional walk of the
+    /// reference — everything the reference generator needs for `steps`
+    /// steps of `dt`.
+    fn twin_spec(&self, dt: f64, steps: usize) -> TwinSpec;
+
+    /// Labels of the plotted observation components of the drawn
+    /// parameters ("(noisy)" appended when a noise model is on); empty
+    /// when the model's observation is switched off in the form, in which
+    /// case the trajectory carries no observation to plot.
+    fn obs_labels(&self) -> Vec<String>;
+
+    /// Snapshot the current form and build the trajectory computation: the
+    /// reference of [`twin_spec`](Self::twin_spec) — states and
+    /// observations from `ode_models_spec::reference::Reference::twin` — with
+    /// the observation labels; the job runs on a worker thread and bumps
+    /// the counter once per step.
+    fn make_job(&mut self, dt: f64, steps: usize) -> Job {
+        self.snapshot();
+        let twin = self.twin_spec(dt, steps);
+        let obs_labels = self.obs_labels();
+        Box::new(move |progress| {
+            let r = twin.reference(progress);
+            let observations = if obs_labels.is_empty() { vec![Vec::new(); r.states.len()] } else { r.observations };
+            Trajectory { dt, states: r.states, observations, obs_labels }
+        })
+    }
 
     /// Flat state-component labels, in the model's filter order (matches
     /// `Trajectory.states` components).
     fn state_labels(&self) -> Vec<String>;
 
-    /// Per-component periodicity. Periodic components (angles) get a fixed
-    /// (−π, π) filter domain and periodic boundary conditions.
-    fn periodic(&self) -> Vec<bool>;
+    /// Per-component periodicity: `Some((lo, hi))` for a component defined
+    /// modulo hi − lo (the model's `Model::periodic`), which gets that
+    /// interval as filter domain and periodic boundary conditions.
+    fn periodic(&self) -> Vec<Option<(f64, f64)>>;
 
     /// The model's natural 2D output planes (a, b), pre-selected in the
     /// filter configuration (e.g. (qᵢ, pᵢ)).
@@ -99,19 +126,19 @@ pub trait VizModel {
     /// center the θ domain and the prior on the run's constant θ_true —
     /// handing the estimator the answer — so they fix the θ domain, make
     /// the direction cheap, set q_θ = 0 and center the prior at θ = 0. The
-    /// random walk widens the box to the whole ring. Applied by the app
+    /// lamppost widens the box to the whole ring. Applied by the app
     /// onto its configuration; this crate knows no observer.
     fn estimator_hints(&self) -> EstimatorHints {
         EstimatorHints::default()
     }
 
-    /// The *last-run* (drawn) model parameters as a plain-data model
-    /// description — the estimators re-run the model internally as their
-    /// twin reference, so it must match the trajectory on screen. The app
-    /// pairs it with the estimator choice and the configuration into a
-    /// `JobSpec` (`ode_observers::jobs`), which builds the concrete model at
-    /// its compile-time dimension: no model file names an observer, and
-    /// the same description can be sent to a compute server.
+    /// The drawn model as a plain-data description (parameters and
+    /// observation choice; the model of [`twin_spec`](Self::twin_spec)).
+    /// The app pairs it with the run's trajectory, the estimator choice and
+    /// the configuration into a `JobSpec` (`ode_observers::jobs`), which
+    /// builds the concrete model at its compile-time dimension: no model
+    /// file names an observer, and the same description can be sent to a
+    /// compute server.
     fn model_spec(&self) -> ModelSpec;
 
     /// Draw frame `frame` of `traj` into `rect`. Styling comes from
@@ -174,7 +201,7 @@ pub fn make(idx: usize) -> Box<dyn VizModel> {
         4 => Box::new(pendulum_rod::PendulumRodViz::default()),
         5 => Box::new(kepler::KeplerViz::default()),
         6 => Box::new(lorenz::LorenzViz::default()),
-        _ => Box::new(random_walk::RandomWalkViz::default()),
+        _ => Box::new(lamppost::LamppostViz::default()),
     }
 }
 

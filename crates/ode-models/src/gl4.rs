@@ -1,8 +1,10 @@
 //! Shared 2-stage Gauss–Legendre time step (order 4, implicit, symplectic,
 //! A-stable) for `M`-dimensional models, solved by Newton's method with an
 //! analytic Jacobian. Used by every model with a nonlinear flow
-//! ([`super::pendulum`], [`super::pendulum_rod`], [`super::kepler`],
-//! [`super::lorenz`]).
+//! ([`crate::models::pendulum`], [`crate::models::pendulum_rod`],
+//! [`crate::models::kepler`], [`crate::models::kepler_mu`],
+//! [`crate::models::lorenz`], [`crate::models::spring_mass`]); public, so a
+//! model written outside this crate can use the same stepper.
 //!
 //! [`gl4_step_with_jacobian`] additionally returns the exact tangent
 //! Φ = ∂x₁/∂x₀ of the discrete map (needed by the tracker's covariance
@@ -100,7 +102,7 @@ fn stages<const M: usize>(
 ///
 /// The scheme is symmetric: a step of size −h is the exact inverse of a step
 /// of size +h, so callers get an exact discrete inverse flow for free.
-pub(crate) fn gl4_step<const M: usize>(
+pub fn gl4_step<const M: usize>(
     rhs: impl Fn(&[f64; M]) -> [f64; M],
     jacobian: impl Fn(&[f64; M]) -> [[f64; M]; M],
     x: &[f64; M],
@@ -112,7 +114,7 @@ pub(crate) fn gl4_step<const M: usize>(
 
 /// [`gl4_step`] plus the exact Jacobian Φ = ∂x₁/∂x₀ of the discrete map
 /// (row i = gradient of component i of x₁), see the module docs.
-pub(crate) fn gl4_step_with_jacobian<const M: usize>(
+pub fn gl4_step_with_jacobian<const M: usize>(
     rhs: impl Fn(&[f64; M]) -> [f64; M],
     jacobian: impl Fn(&[f64; M]) -> [[f64; M]; M],
     x: &[f64; M],

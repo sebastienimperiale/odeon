@@ -2,29 +2,34 @@
 //! user interface ([`FilterConfig`]), the plain-data outputs kept for
 //! display ([`FilterOutput`], [`TrackerOutput`], [`BoxOutput`],
 //! [`ParticleOutput`]), the generic runners ([`run_filter`],
-//! [`run_tracker`], [`run_box`], [`run_particles`]) instantiating each
-//! observer at the model's compile-time dimension, and the **job
-//! description** ([`JobSpec`]: a [`ModelSpec`] + an [`Estimator`] + the
-//! configuration + dt + steps) whose [`run`](JobSpec::run) dispatches to the
-//! right runner through the [`ModelVisitor`] of `ode-models` — so a front
-//! end (or a server receiving the description) never names a model type or
-//! a dimension. UI-free.
+//! [`run_tracker`], [`run_box`], [`run_particles`]) driving each observer
+//! along a [`Reference`] (a trajectory with its observations) at the
+//! model's compile-time dimension, and the **job description**
+//! ([`JobSpec`]: a [`ModelSpec`] + the `Reference` + an [`Estimator`] + the
+//! configuration) whose [`run`](JobSpec::run) dispatches to the right
+//! runner through the [`ModelVisitor`] of `ode-models` — so a front end
+//! (or a server receiving the description) never names a model type or a
+//! dimension. The observations travel with the job: they may come from a
+//! twin experiment ([`JobSpec::from_twin`]) or from anywhere else. UI-free.
 
-use serde::{Deserialize, Serialize};
-use crate::progress::Progress;
-use crate::box_tracker::{BoxTracker, BoxTrackerParams};
-use crate::filter::{DiffusionScheme, FilterParams, MortensenFilter};
+use crate::methods::Observer;
+use crate::methods::mortensen_window::{BoxTracker, BoxTrackerParams};
+use crate::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
+use crate::methods::fleming_viot::{ParticleParams, ParticleSystem};
+use ode_models_spec::progress::Progress;
+use crate::methods::kalman::{MortensenTracker, TrackerParams};
 use ode_models::model::Model;
-use ode_models::spec::{ModelSpec, ModelVisitor};
-use crate::particles::{ParticleParams, ParticleSystem};
-use crate::tracker::{MortensenTracker, TrackerParams};
+use ode_models_spec::reference::Reference;
+use ode_models_spec::spec::{ModelSpec, ModelVisitor, TwinSpec};
+use serde::{Deserialize, Serialize};
 
 /// Filter settings of one state variable.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct VarConfig {
     pub label: String,
-    /// Periodic variables (angles) have their domain fixed to (−π, π) and
-    /// use periodic boundary conditions — shown in the UI but not editable.
+    /// Periodic variables (angles) have their domain fixed to the model's
+    /// interval and use periodic boundary conditions — shown in the UI but
+    /// not editable.
     pub periodic: bool,
     /// Dirichlet wall in this direction: p = 0 on the domain boundary
     /// (V = +∞ outside — absorbing; preimages leaving the box get p = 0)
@@ -72,7 +77,7 @@ pub struct FilterConfig {
     /// All candidate 2D output planes (a, b) with a < b, and whether each is
     /// selected (the marginal is the max of p over the other directions).
     pub pairs: Vec<((usize, usize), bool)>,
-    /// Settings of the particle solver (`crate::particles`).
+    /// Settings of the particle solver (`crate::methods::fleming_viot`).
     pub particles: ParticleConfig,
 }
 
@@ -82,23 +87,26 @@ pub struct FilterConfig {
 pub struct ParticleConfig {
     /// Number of particles N.
     pub n_particles: usize,
+    /// Seed of the particle system's generator; `None` draws one from the
+    /// clock at each run (the viewer's choice: every run a fresh sample).
+    pub seed: Option<u64>,
 }
 
 impl FilterConfig {
     /// Defaults computed from a completed run: non-periodic domains cover
     /// the reference trajectory's range with a ×1.3 margin, periodic
-    /// domains are fixed to (−π, π); the resolution default scales with the
+    /// components (`periodic[d] = Some((lo, hi))`, the model's interval)
+    /// get that interval as domain; the resolution default scales with the
     /// dimension (2D can afford the `one_spring` example's resolution, 4D+
     /// starts small enough to stay interactive). ε = 0.01 and σ_d = 0.01 (a wide
     /// p₀) for every model; the Gaussian center defaults to the run's
     /// initial state.
     pub fn defaults(
         labels: Vec<String>,
-        periodic: Vec<bool>,
+        periodic: Vec<Option<(f64, f64)>>,
         default_pairs: &[(usize, usize)],
         states: &[Vec<f64>],
     ) -> Self {
-        use std::f64::consts::PI;
         let dim = labels.len();
         let n_el = if dim <= 2 { 20 } else { 5 };
         let vars = labels
@@ -110,16 +118,17 @@ impl FilterConfig {
                     mn = mn.min(s[d]);
                     mx = mx.max(s[d]);
                 }
-                let domain = if periodic[d] {
-                    (-PI, PI)
-                } else {
-                    let center = 0.5 * (mn + mx);
-                    let half = (0.65 * (mx - mn)).max(0.5);
-                    (center - half, center + half)
+                let domain = match periodic[d] {
+                    Some(interval) => interval,
+                    None => {
+                        let center = 0.5 * (mn + mx);
+                        let half = (0.65 * (mx - mn)).max(0.5);
+                        (center - half, center + half)
+                    }
                 };
                 VarConfig {
                     label,
-                    periodic: periodic[d],
+                    periodic: periodic[d].is_some(),
                     dirichlet: false,
                     domain,
                     n_el,
@@ -144,7 +153,7 @@ impl FilterConfig {
             n_snapshots: states.len().max(1),
             vars,
             pairs,
-            particles: ParticleConfig { n_particles: 500 },
+            particles: ParticleConfig { n_particles: 500, seed: None },
         }
     }
 
@@ -195,7 +204,7 @@ pub struct FilterOutput {
 }
 
 /// In-memory outputs of one tracker run (the second-order / Gaussian
-/// closure, `crate::tracker`): the estimate and its covariance at every
+/// closure, `crate::methods::kalman`): the estimate and its covariance at every
 /// step, with the reference trajectory it ran against.
 #[derive(Serialize, Deserialize)]
 pub struct TrackerOutput {
@@ -214,17 +223,17 @@ pub struct TrackerOutput {
     pub reference: Vec<Vec<f64>>,
 }
 
-/// Run the Mortensen tracker to completion (same initial data and
+/// Run the Mortensen tracker along `reference` (same initial data and
 /// model-noise q as the filter configuration; ε, grid and outputs are
 /// irrelevant to it), bumping `progress` once per iteration and stopping
 /// early (partial output) if it is cancelled.
 pub fn run_tracker<const M: usize, Mod: Model<M>>(
     model: Mod,
+    reference: &Reference,
     cfg: &FilterConfig,
-    n_steps: usize,
     progress: &Progress,
 ) -> TrackerOutput {
-    assert_eq!(cfg.vars.len(), M, "FilterConfig dimension mismatch");
+    check_dimensions::<M, _>(&model, reference, cfg);
     let labels = model.state_labels();
     let dt = model.dt();
     let mut tracker = MortensenTracker::<M, _>::new(
@@ -239,57 +248,68 @@ pub fn run_tracker<const M: usize, Mod: Model<M>>(
         std::array::from_fn(|d| cfg.vars[d].sigma),
     );
     // The tracker works with unwrapped angles (its flow and innovation are
-    // 2π-periodic, so nothing depends on the branch), while the models store
-    // the reference wrapped to [−π, π): wrap the estimate the same way for
-    // display, or a winding pendulum's x̂ runs past π while the reference
-    // jumps back to −π.
-    let periodic: Vec<bool> = cfg.vars.iter().map(|v| v.periodic).collect();
-    let wrap = |x: [f64; M]| -> Vec<f64> {
-        use std::f64::consts::PI;
-        (0..M)
-            .map(|d| if periodic[d] { (x[d] + PI).rem_euclid(2.0 * PI) - PI } else { x[d] })
-            .collect()
-    };
+    // 2π-periodic, so nothing depends on the branch), while the reference
+    // stores its angles wrapped to [−π, π): wrap the estimate the same way
+    // for display, or a winding pendulum's x̂ runs past π while the
+    // reference jumps back to −π.
+    let wrap = wrapper::<M>(cfg);
     let mut estimates = vec![wrap(tracker.estimate())];
     let mut covariances = vec![tracker.covariance().map(|p| p.transpose().as_slice().to_vec())];
-    for _ in 0..n_steps {
+    for y in &reference.observations[..reference.steps()] {
         if progress.cancelled() {
             break;
         }
-        tracker.forward();
+        tracker.forward(y);
         estimates.push(wrap(tracker.estimate()));
         // nalgebra is column-major: transpose to store row-major.
         covariances.push(tracker.covariance().map(|p| p.transpose().as_slice().to_vec()));
         progress.step();
     }
-    let reference = tracker
-        .model
-        .states()
-        .iter()
-        .map(|s| s.iter().copied().collect())
-        .collect();
     TrackerOutput {
         dt,
         eps: cfg.eps,
         labels,
+        reference: reference.states[..estimates.len()].to_vec(),
         estimates,
         covariances,
-        reference,
     }
 }
 
-/// Run the Mortensen filter to completion, bumping `progress` once per
+/// The configuration's periodic components wrapped into their domain, as
+/// the reference generator stores them.
+fn wrapper<const M: usize>(cfg: &FilterConfig) -> impl Fn([f64; M]) -> Vec<f64> {
+    let periodic: Vec<Option<(f64, f64)>> = cfg.vars.iter().map(|v| v.periodic.then_some(v.domain)).collect();
+    move |x: [f64; M]| {
+        (0..M)
+            .map(|d| match periodic[d] {
+                Some((lo, hi)) => lo + (x[d] - lo).rem_euclid(hi - lo),
+                None => x[d],
+            })
+            .collect()
+    }
+}
+
+/// The model, the reference and the configuration must agree on the
+/// dimension, and the reference on the model's time step.
+fn check_dimensions<const M: usize, Mod: Model<M>>(model: &Mod, reference: &Reference, cfg: &FilterConfig) {
+    assert_eq!(cfg.vars.len(), M, "FilterConfig dimension mismatch");
+    assert_eq!(model.dim(), M, "model dimension mismatch");
+    assert_eq!(reference.dim(), M, "reference dimension mismatch");
+    assert_eq!(reference.obs_dim(), model.obs_dim(), "reference observation dimension mismatch");
+    assert_eq!(reference.dt, model.dt(), "the reference and the model disagree on dt");
+}
+
+/// Run the Mortensen filter along `reference`, bumping `progress` once per
 /// iteration and stopping early (partial output) if it is cancelled — the
 /// check is once per iteration, after the (uninterruptible) construction of
-/// the filter and its transport plan. Called on a worker thread by each
-/// model's `make_filter_job` with its concrete dimension and model type.
+/// the filter and its transport plan.
 pub fn run_filter<const M: usize, Mod: Model<M> + Sync>(
     model: Mod,
+    reference: &Reference,
     cfg: &FilterConfig,
-    n_steps: usize,
     progress: &Progress,
 ) -> FilterOutput {
-    assert_eq!(cfg.vars.len(), M, "FilterConfig dimension mismatch");
+    check_dimensions::<M, _>(&model, reference, cfg);
     let params = FilterParams::<M> {
         domain: std::array::from_fn(|d| cfg.vars[d].domain),
         eps: cfg.eps,
@@ -315,6 +335,7 @@ pub fn run_filter<const M: usize, Mod: Model<M> + Sync>(
     let pairs = cfg.selected_pairs();
     let snapshot =
         |f: &MortensenFilter<M, Mod>| pairs.iter().map(|&p| f.marginal_2d(p)).collect::<Vec<_>>();
+    let n_steps = reference.steps();
     let save_at = snapshot_schedule(n_steps, cfg.n_snapshots);
 
     let mut saved_steps = Vec::new();
@@ -324,11 +345,11 @@ pub fn run_filter<const M: usize, Mod: Model<M> + Sync>(
         marginals.push(snapshot(&filter));
     }
     let mut estimates = vec![filter.argmax_p().to_vec()];
-    for n in 0..n_steps {
+    for (n, y) in reference.observations[..n_steps].iter().enumerate() {
         if progress.cancelled() {
             break;
         }
-        filter.forward();
+        filter.forward(y);
         estimates.push(filter.argmax_p().to_vec());
         let step = n + 1;
         if save_at[step] {
@@ -338,12 +359,6 @@ pub fn run_filter<const M: usize, Mod: Model<M> + Sync>(
         progress.step();
     }
 
-    let reference = filter
-        .model
-        .states()
-        .iter()
-        .map(|s| s.iter().copied().collect())
-        .collect();
     FilterOutput {
         dt,
         labels,
@@ -356,8 +371,8 @@ pub fn run_filter<const M: usize, Mod: Model<M> + Sync>(
         pairs,
         saved_steps,
         marginals,
+        reference: reference.states[..estimates.len()].to_vec(),
         estimates,
-        reference,
     }
 }
 
@@ -379,7 +394,7 @@ fn snapshot_schedule(n_steps: usize, n_snapshots: usize) -> Vec<bool> {
     save_at
 }
 
-/// In-memory outputs of one particle run (`crate::particles`): the whole
+/// In-memory outputs of one particle run (`crate::methods::fleming_viot`): the whole
 /// population at every step, with each particle's exponential budget e and
 /// accumulated misfit a (the Particles view shrinks a particle's Gaussian
 /// with its relative life expectancy (e − a)/e), and the reference
@@ -403,25 +418,27 @@ pub struct ParticleOutput {
     pub reference: Vec<Vec<f64>>,
 }
 
-/// Run the particle solver to completion: the killing uses the
+/// Run the particle solver along `reference`: the killing uses the
 /// configuration's γ (misfit dt·γ·d per step against an Exp(1) clock), the
 /// initial population is drawn from the configuration's Gaussian initial
 /// data (centre x_c, variance ε/σ_d; uniform in the domain where σ_d = 0),
 /// the Brownian increment is the filter's √(ε q_d dt) (ε drives the noise;
-/// the library's scale s is fixed to 1 here), and the seed is drawn from
-/// the clock — every run is a fresh sample.
-/// Bumps `progress` once per step; stops early if cancelled.
-pub fn run_particles<const M: usize, Mod: Model<M>>(
+/// the library's scale s is fixed to 1 here), and the seed is the
+/// configuration's or, without one, drawn from the clock — every run a
+/// fresh sample. Bumps `progress` once per step; stops early if cancelled.
+pub fn run_particles<const M: usize, Mod: Model<M> + Sync>(
     model: Mod,
+    reference: &Reference,
     cfg: &FilterConfig,
-    n_steps: usize,
     progress: &Progress,
 ) -> ParticleOutput {
-    assert_eq!(cfg.vars.len(), M, "FilterConfig dimension mismatch");
+    check_dimensions::<M, _>(&model, reference, cfg);
     let pc = cfg.particles;
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
+    let seed = pc.seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+    });
     let params = ParticleParams::<M> {
         n_particles: pc.n_particles.max(2),
         center: std::array::from_fn(|d| cfg.vars[d].x0),
@@ -452,34 +469,28 @@ pub fn run_particles<const M: usize, Mod: Model<M>>(
         a.push(z);
     };
     push(&sys, &mut positions, &mut budget, &mut spent);
-    for _ in 0..n_steps {
+    for y in &reference.observations[..reference.steps()] {
         if progress.cancelled() {
             break;
         }
-        sys.forward();
+        sys.forward(y);
         push(&sys, &mut positions, &mut budget, &mut spent);
         progress.step();
     }
-    let reference = sys
-        .model
-        .states()
-        .iter()
-        .map(|s| s.iter().copied().collect())
-        .collect();
     ParticleOutput {
         dt,
         labels,
         periodic: cfg.vars.iter().map(|v| v.periodic).collect(),
         domain: cfg.vars.iter().map(|v| v.domain).collect(),
         n_particles: params.n_particles,
+        reference: reference.states[..positions.len()].to_vec(),
         positions,
         budget,
         spent,
-        reference,
     }
 }
 
-/// In-memory outputs of one translating-window run (`crate::box_tracker`).
+/// In-memory outputs of one translating-window run (`crate::methods::mortensen_window`).
 #[derive(Serialize, Deserialize)]
 pub struct BoxOutput {
     /// The window's own grid and snapshots, in *window coordinates*
@@ -493,20 +504,19 @@ pub struct BoxOutput {
     pub centers: Vec<Vec<f64>>,
 }
 
-/// Run the translating window to completion: the grid filter on the box
-/// ∏[−L_d, L_d] around x̂, re-centred by whole elements after every step
-/// (`BoxTracker`), with the configuration's initial data (the window
+/// Run the translating window along `reference`: the grid filter on the
+/// box ∏[−L_d, L_d] around x̂, re-centred by whole elements after every
+/// step (`BoxTracker`), with the configuration's initial data (the window
 /// starts at the Gaussian centre x_c), model noise, ε, γ and scheme; the
 /// per-variable window size is `half_width` / `win_n_el` / `p_ord`.
 /// Bumps `progress` once per iteration; stops early if cancelled.
 pub fn run_box<const M: usize, Mod: Model<M> + Sync>(
     model: Mod,
+    reference: &Reference,
     cfg: &FilterConfig,
-    n_steps: usize,
     progress: &Progress,
 ) -> BoxOutput {
-    use std::f64::consts::PI;
-    assert_eq!(cfg.vars.len(), M, "FilterConfig dimension mismatch");
+    check_dimensions::<M, _>(&model, reference, cfg);
     let params = BoxTrackerParams::<M> {
         half_width: std::array::from_fn(|d| cfg.vars[d].half_width),
         eps: cfg.eps,
@@ -523,22 +533,18 @@ pub fn run_box<const M: usize, Mod: Model<M> + Sync>(
     let dt = model.dt();
     let mut window = BoxTracker::<M, _>::new(model, params);
     window.init_gaussian(
-        std::array::from_fn(|d| cfg.vars[d].sigma),
         std::array::from_fn(|d| cfg.vars[d].x0),
+        std::array::from_fn(|d| cfg.vars[d].sigma),
     );
-    // Periodic components of the reference are stored wrapped to [−π, π);
-    // the window's position is not — wrap it the same way for display.
-    let periodic: Vec<bool> = cfg.vars.iter().map(|v| v.periodic).collect();
-    let wrap = |x: [f64; M]| -> Vec<f64> {
-        (0..M)
-            .map(|d| if periodic[d] { (x[d] + PI).rem_euclid(2.0 * PI) - PI } else { x[d] })
-            .collect()
-    };
+    // The window's position is not wrapped; the reference is — wrap it
+    // the same way for display.
+    let wrap = wrapper::<M>(cfg);
 
     let pairs = cfg.selected_pairs();
     let snapshot = |w: &BoxTracker<M, Mod>| {
         pairs.iter().map(|&p| w.filter.marginal_2d(p)).collect::<Vec<_>>()
     };
+    let n_steps = reference.steps();
     let save_at = snapshot_schedule(n_steps, cfg.n_snapshots);
     let mut saved_steps = Vec::new();
     let mut marginals = Vec::new();
@@ -548,11 +554,11 @@ pub fn run_box<const M: usize, Mod: Model<M> + Sync>(
     }
     let mut estimates = vec![wrap(window.estimate())];
     let mut centers = vec![wrap(window.center())];
-    for n in 0..n_steps {
+    for (n, y) in reference.observations[..n_steps].iter().enumerate() {
         if progress.cancelled() {
             break;
         }
-        window.forward();
+        window.forward(y);
         estimates.push(wrap(window.estimate()));
         centers.push(wrap(window.center()));
         let step = n + 1;
@@ -563,12 +569,6 @@ pub fn run_box<const M: usize, Mod: Model<M> + Sync>(
         progress.step();
     }
 
-    let reference = window
-        .model()
-        .states()
-        .iter()
-        .map(|s| s.iter().copied().collect())
-        .collect();
     BoxOutput {
         window: FilterOutput {
             dt,
@@ -582,15 +582,15 @@ pub fn run_box<const M: usize, Mod: Model<M> + Sync>(
             pairs,
             saved_steps,
             marginals,
+            reference: reference.states[..estimates.len()].to_vec(),
             estimates,
-            reference,
         },
         centers,
     }
 }
 
-// ── Job descriptions: model + estimator + configuration, dispatched through
-//    the model visitor. ───────────────────────────────────────────────────
+// ── Job descriptions: model + reference + estimator + configuration,
+//    dispatched through the model visitor. ───────────────────────────────
 
 /// Which observer a job runs: the grid filter (density p on the spectral
 /// grid), the translating window (the same density on a small box following
@@ -613,16 +613,17 @@ impl Estimator {
 }
 
 /// A complete, self-contained description of one observer run: the model
-/// as data, the estimator, its configuration, the time step and the number
-/// of steps. Plain data — what a viewer builds from its forms and what a
-/// server receives; [`run`](Self::run) executes it.
+/// as data, the reference (trajectory + observations) to run along, the
+/// estimator and its configuration. Plain data — what a viewer builds from
+/// its forms and its run, and what a server receives; [`run`](Self::run)
+/// executes it. The number of steps and the time step are the
+/// reference's.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobSpec {
     pub model: ModelSpec,
+    pub reference: Reference,
     pub estimator: Estimator,
     pub config: FilterConfig,
-    pub dt: f64,
-    pub steps: usize,
 }
 
 /// The output of a [`JobSpec`], one variant per [`Estimator`].
@@ -668,28 +669,42 @@ output_from_job!(ParticleOutput, Particles, "particles");
 output_from_job!(TrackerOutput, Tracker, "tracker");
 
 impl JobSpec {
+    /// The job of a twin experiment: the reference generated from `twin`
+    /// (bumping `progress` once per step), then `estimator` with `config`.
+    pub fn from_twin(twin: &TwinSpec, estimator: Estimator, config: FilterConfig, progress: &Progress) -> JobSpec {
+        JobSpec {
+            model: twin.model.clone(),
+            reference: twin.reference(progress),
+            estimator,
+            config,
+        }
+    }
+
+    /// Number of steps of the run (the reference's).
+    pub fn steps(&self) -> usize {
+        self.reference.steps()
+    }
+
     /// Run the described job to completion (or until `progress` is
     /// cancelled), bumping `progress` once per step. Panics if the
-    /// configuration's dimension does not match the model's.
+    /// configuration's or the reference's dimension is not the model's.
     pub fn run(&self, progress: &Progress) -> JobOutput {
-        let (m, cfg, dt, steps) = (&self.model, &self.config, self.dt, self.steps);
+        let (m, r, cfg) = (&self.model, &self.reference, &self.config);
         match self.estimator {
-            Estimator::Filter => JobOutput::Filter(run_filter_spec(m, cfg, dt, steps, progress)),
-            Estimator::Window => JobOutput::Window(run_box_spec(m, cfg, dt, steps, progress)),
-            Estimator::Particles => {
-                JobOutput::Particles(run_particles_spec(m, cfg, dt, steps, progress))
-            }
-            Estimator::Tracker => JobOutput::Tracker(run_tracker_spec(m, cfg, dt, steps, progress)),
+            Estimator::Filter => JobOutput::Filter(run_filter_spec(m, r, cfg, progress)),
+            Estimator::Window => JobOutput::Window(run_box_spec(m, r, cfg, progress)),
+            Estimator::Particles => JobOutput::Particles(run_particles_spec(m, r, cfg, progress)),
+            Estimator::Tracker => JobOutput::Tracker(run_tracker_spec(m, r, cfg, progress)),
         }
     }
 }
 
-/// The visitor behind the `run_*_spec` functions: the configuration, the
-/// step count and the progress handle of one run, applied to whatever
+/// The visitor behind the `run_*_spec` functions: the reference, the
+/// configuration and the progress handle of one run, applied to whatever
 /// model the spec builds.
 struct Runner<'a> {
+    reference: &'a Reference,
     cfg: &'a FilterConfig,
-    steps: usize,
     progress: &'a Progress,
 }
 
@@ -699,15 +714,14 @@ macro_rules! spec_runner {
         impl ModelVisitor for $visitor<'_> {
             type Output = $out;
             fn visit<const M: usize, Mod: Model<M> + Send + Sync + 'static>(self, model: Mod) -> $out {
-                $run::<M, _>(model, self.0.cfg, self.0.steps, self.0.progress)
+                $run::<M, _>(model, self.0.reference, self.0.cfg, self.0.progress)
             }
         }
         $(#[$doc])*
         pub fn $name(
             model: &ModelSpec,
+            reference: &Reference,
             cfg: &FilterConfig,
-            dt: f64,
-            steps: usize,
             progress: &Progress,
         ) -> $out {
             assert_eq!(
@@ -718,14 +732,22 @@ macro_rules! spec_runner {
                 model.kind(),
                 model.dim()
             );
-            model.visit(dt, $visitor(Runner { cfg, steps, progress }))
+            assert_eq!(
+                reference.dim(),
+                model.dim(),
+                "the reference has {} components, the {} model {}",
+                reference.dim(),
+                model.kind(),
+                model.dim()
+            );
+            model.visit(reference.dt, $visitor(Runner { reference, cfg, progress }))
         }
     };
 }
 
 spec_runner!(
-    /// [`run_filter`] on the model a [`ModelSpec`] describes, built with time
-    /// step `dt`.
+    /// [`run_filter`] on the model a [`ModelSpec`] describes, built with the
+    /// reference's time step.
     run_filter_spec, FilterVisitor, run_filter, FilterOutput
 );
 spec_runner!(
@@ -744,8 +766,27 @@ spec_runner!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ode_models::models::SpringSystem;
-    use nalgebra::DVector;
+    use ode_models::models::{LorenzObservation, LorenzParams, SpringSystem};
+    use ode_models_spec::noise::NoiseModel;
+
+    fn spring(dt: f64) -> SpringSystem {
+        SpringSystem::new(1, 1.0, 1.0, dt, |x: &[f64]| x[0])
+    }
+
+    /// The single spring's noiseless reference from (1.15, 0).
+    fn spring_reference(dt: f64, steps: usize) -> Reference {
+        Reference::twin(&spring(dt), [1.15, 0.0], steps, NoiseModel::None, 0, None, &Progress::default())
+    }
+
+    /// The configuration defaults of a spring run.
+    fn spring_cfg(reference: &Reference) -> FilterConfig {
+        FilterConfig::defaults(
+            vec!["y_1".into(), "v_1".into()],
+            vec![None, None],
+            &[(0, 1)],
+            &reference.states,
+        )
+    }
 
     /// The window path on the single spring: a box a quarter of the state
     /// range wide follows the reference (which swings beyond it), the
@@ -753,27 +794,8 @@ mod tests {
     /// grid, and the estimates stay close to the reference.
     #[test]
     fn spring_window_job_produces_outputs() {
-        let sys = SpringSystem::new(
-            1,
-            1.0,
-            1.0,
-            0.01,
-            DVector::from_row_slice(&[1.15]),
-            DVector::zeros(1),
-            |x: &[f64]| x[0],
-        );
-        let states: Vec<Vec<f64>> = (0..=300)
-            .map(|i| {
-                let t = i as f64 * 0.01;
-                vec![1.15 * t.cos(), -1.15 * t.sin()]
-            })
-            .collect();
-        let mut cfg = FilterConfig::defaults(
-            vec!["y_1".into(), "v_1".into()],
-            vec![false, false],
-            &[(0, 1)],
-            &states,
-        );
+        let r = spring_reference(0.01, 300);
+        let mut cfg = spring_cfg(&r);
         for v in &mut cfg.vars {
             v.sigma = 20.0;
             v.half_width = 0.8;
@@ -782,7 +804,7 @@ mod tests {
         cfg.eps = 0.05;
         cfg.n_snapshots = 4;
         let progress = Progress::default();
-        let out = run_box::<2, _>(sys, &cfg, 300, &progress);
+        let out = run_box::<2, _>(spring(0.01), &r, &cfg, &progress);
         assert_eq!(progress.done(), 300);
         let w = &out.window;
         assert_eq!(w.dirichlet, vec![true, true]);
@@ -791,6 +813,7 @@ mod tests {
         assert_eq!(w.saved_steps, vec![0, 100, 200, 300]);
         assert_eq!(out.centers.len(), 301);
         assert_eq!(w.estimates.len(), 301);
+        assert_eq!(w.reference, r.states);
         assert!(w.marginals.iter().all(|m| m[0].iter().all(|v| v.is_finite())));
         // The window moved, and the estimate followed the reference.
         assert!(out.centers[0][0] != out.centers[300][0]);
@@ -805,30 +828,15 @@ mod tests {
     /// only). This is what the viewer's Cancel button relies on.
     #[test]
     fn cancelled_jobs_stop_at_once() {
-        let sys = || {
-            SpringSystem::new(
-                1,
-                1.0,
-                1.0,
-                0.005,
-                DVector::from_row_slice(&[1.15]),
-                DVector::zeros(1),
-                |x: &[f64]| x[0],
-            )
-        };
-        let cfg = FilterConfig::defaults(
-            vec!["y_1".into(), "v_1".into()],
-            vec![false, false],
-            &[(0, 1)],
-            &vec![vec![1.15, 0.0]; 21],
-        );
+        let r = spring_reference(0.005, 20);
+        let cfg = spring_cfg(&r);
         let progress = Progress::default();
         progress.cancel();
-        let out = run_filter::<2, _>(sys(), &cfg, 20, &progress);
+        let out = run_filter::<2, _>(spring(0.005), &r, &cfg, &progress);
         assert_eq!(progress.done(), 0);
         assert_eq!(out.estimates.len(), 1);
         assert_eq!(out.reference.len(), 1);
-        let out = run_tracker::<2, _>(sys(), &cfg, 20, &progress);
+        let out = run_tracker::<2, _>(spring(0.005), &r, &cfg, &progress);
         assert_eq!(progress.done(), 0);
         assert_eq!(out.estimates.len(), 1);
     }
@@ -837,31 +845,17 @@ mod tests {
     /// defaults from a run, filter execution, output shapes and finiteness.
     #[test]
     fn spring_filter_job_produces_outputs() {
-        let sys = SpringSystem::new(
-            1,
-            1.0,
-            1.0,
-            0.005,
-            DVector::from_row_slice(&[1.15]),
-            DVector::zeros(1),
-            |x: &[f64]| x[0],
-        );
-        let cfg = FilterConfig::defaults(
-            vec!["y_1".into(), "v_1".into()],
-            vec![false, false],
-            &[(0, 1)],
-            // A 21-state "run" (the defaults size the snapshot count from it).
-            &vec![vec![1.15, 0.0]; 21],
-        );
+        let r = spring_reference(0.005, 20);
+        let cfg = spring_cfg(&r);
         assert_eq!(cfg.n_snapshots, 21);
         assert!(cfg.vars.iter().all(|v| v.domain.0 < v.domain.1));
 
         let progress = Progress::default();
-        let out = run_filter::<2, _>(sys, &cfg, 20, &progress);
+        let out = run_filter::<2, _>(spring(0.005), &r, &cfg, &progress);
 
         assert_eq!(progress.done(), 20);
         assert_eq!(out.estimates.len(), 21);
-        assert_eq!(out.reference.len(), 21);
+        assert_eq!(out.reference, r.states);
         assert_eq!(out.reference[0].len(), 2);
         assert_eq!(out.pairs, vec![(0, 1)]);
         assert_eq!(out.saved_steps.len(), out.marginals.len());
@@ -881,27 +875,14 @@ mod tests {
     /// observed component.
     #[test]
     fn spring_tracker_job_produces_outputs() {
-        let sys = SpringSystem::new(
-            1,
-            1.0,
-            1.0,
-            0.01,
-            DVector::from_row_slice(&[1.15]),
-            DVector::zeros(1),
-            |x: &[f64]| x[0],
-        );
-        let mut cfg = FilterConfig::defaults(
-            vec!["y_1".into(), "v_1".into()],
-            vec![false, false],
-            &[(0, 1)],
-            &vec![vec![1.15, 0.0]; 201],
-        );
+        let r = spring_reference(0.01, 200);
+        let mut cfg = spring_cfg(&r);
         for v in &mut cfg.vars {
             v.sigma = 1.0;
             v.x0 += 0.3; // start off the reference
         }
         let progress = Progress::default();
-        let out = run_tracker::<2, _>(sys, &cfg, 200, &progress);
+        let out = run_tracker::<2, _>(spring(0.01), &r, &cfg, &progress);
         assert_eq!(progress.done(), 200);
         assert_eq!(out.estimates.len(), 201);
         assert_eq!(out.covariances.len(), 201);
@@ -915,27 +896,14 @@ mod tests {
     /// and the run stays finite with positive mass.
     #[test]
     fn config_dirichlet_reaches_the_filter() {
-        let sys = SpringSystem::new(
-            1,
-            1.0,
-            1.0,
-            0.02,
-            DVector::from_row_slice(&[1.15]),
-            DVector::zeros(1),
-            |x: &[f64]| x[0],
-        );
-        let mut cfg = FilterConfig::defaults(
-            vec!["y_1".into(), "v_1".into()],
-            vec![false, false],
-            &[(0, 1)],
-            &vec![vec![1.15, 0.0]; 11],
-        );
+        let r = spring_reference(0.02, 10);
+        let mut cfg = spring_cfg(&r);
         for v in &mut cfg.vars {
             v.sigma = 5.0;
             v.dirichlet = true;
         }
         cfg.eps = 1.0;
-        let out = run_filter::<2, _>(sys, &cfg, 10, &Progress::default());
+        let out = run_filter::<2, _>(spring(0.02), &r, &cfg, &Progress::default());
         for d in 0..2 {
             assert!(out.dirichlet[d]);
             assert_eq!(
@@ -958,23 +926,8 @@ mod tests {
     /// reach the filter: q = (1, 0) and q = (1, 1) give different densities.
     #[test]
     fn config_q_changes_the_filter_output() {
-        let sys = || {
-            SpringSystem::new(
-                1,
-                1.0,
-                1.0,
-                0.02,
-                DVector::from_row_slice(&[1.15]),
-                DVector::zeros(1),
-                |x: &[f64]| x[0],
-            )
-        };
-        let mut cfg = FilterConfig::defaults(
-            vec!["y_1".into(), "v_1".into()],
-            vec![false, false],
-            &[(0, 1)],
-            &vec![vec![1.15, 0.0]; 11],
-        );
+        let r = spring_reference(0.02, 10);
+        let mut cfg = spring_cfg(&r);
         cfg.eps = 1.0;
         for v in &mut cfg.vars {
             v.sigma = 5.0;
@@ -982,7 +935,7 @@ mod tests {
         let run = |q1: f64| {
             let mut cfg = cfg.clone();
             cfg.vars[1].q = q1;
-            run_filter::<2, _>(sys(), &cfg, 10, &Progress::default())
+            run_filter::<2, _>(spring(0.02), &r, &cfg, &Progress::default())
         };
         let (a, b) = (run(0.0), run(1.0));
         let (ma, mb) = (&a.marginals.last().unwrap()[0], &b.marginals.last().unwrap()[0]);
@@ -990,44 +943,31 @@ mod tests {
         let max = mb.iter().copied().fold(0.0, f64::max);
         assert!(diff / max > 1e-3, "q had no effect: relative difference {:e}", diff / max);
     }
-    /// The single-spring spec of the viewer's "Single spring" entry.
-    fn spring_spec(dt_unused: f64) -> ModelSpec {
-        let _ = dt_unused;
-        ModelSpec::Spring {
-            n: 1,
-            rho: 1.0,
-            a: 1.0,
-            y0: vec![1.15],
-            v0: vec![0.0],
-            obs: 0,
-            noise: ode_models::noise::NoiseModel::None,
-            noise_seed: 1000,
+
+    /// The single-spring twin experiment of the viewer's "Single spring"
+    /// entry: Gaussian observation noise, seed 1000.
+    fn spring_twin(dt: f64, steps: usize) -> TwinSpec {
+        TwinSpec {
+            model: ModelSpec::Spring { n: 1, rho: 1.0, a: 1.0, obs: 0 },
+            x0: vec![0.15, 0.0],
+            dt,
+            steps,
+            noise: NoiseModel::Gaussian { std: 0.01 },
+            seed: 1000,
+            walk: None,
         }
     }
 
     /// Running through the job description gives exactly the run of the
-    /// hand-built model: same estimates and marginals, bit for bit (the
-    /// visitor rebuilds the very same system; no numerics are touched).
+    /// hand-built model along the same reference: same estimates and
+    /// marginals, bit for bit (the visitor rebuilds the very same system).
     #[test]
     fn spec_run_equals_the_hand_built_run() {
-        let dt = 0.02;
-        let cfg = FilterConfig::defaults(
-            vec!["y_1".into(), "v_1".into()],
-            vec![false, false],
-            &[(0, 1)],
-            &vec![vec![1.15, 0.0]; 11],
-        );
-        let sys = SpringSystem::new(
-            1,
-            1.0,
-            1.0,
-            dt,
-            DVector::from_row_slice(&[1.15]),
-            DVector::zeros(1),
-            |x: &[f64]| x[0],
-        );
-        let direct = run_filter::<2, _>(sys, &cfg, 10, &Progress::default());
-        let via_spec = run_filter_spec(&spring_spec(dt), &cfg, dt, 10, &Progress::default());
+        let twin = spring_twin(0.02, 10);
+        let r = twin.reference(&Progress::default());
+        let cfg = spring_cfg(&r);
+        let direct = run_filter::<2, _>(spring(0.02), &r, &cfg, &Progress::default());
+        let via_spec = run_filter_spec(&twin.model, &r, &cfg, &Progress::default());
         assert_eq!(direct.estimates, via_spec.estimates);
         assert_eq!(direct.reference, via_spec.reference);
         assert_eq!(direct.saved_steps, via_spec.saved_steps);
@@ -1040,52 +980,64 @@ mod tests {
     /// matches the requested estimator.
     #[test]
     fn job_spec_runs_every_estimator() {
-        let dt = 0.02;
-        let mut cfg = FilterConfig::defaults(
-            vec!["y_1".into(), "v_1".into()],
-            vec![false, false],
-            &[(0, 1)],
-            &vec![vec![1.15, 0.0]; 11],
-        );
+        let twin = spring_twin(0.02, 10);
+        let r = twin.reference(&Progress::default());
+        let mut cfg = spring_cfg(&r);
         for v in &mut cfg.vars {
             v.sigma = 5.0;
             v.half_width = 0.8;
         }
         cfg.particles.n_particles = 20;
         for estimator in Estimator::ALL {
-            let job = JobSpec { model: spring_spec(dt), estimator, config: cfg.clone(), dt, steps: 10 };
+            let job = JobSpec::from_twin(&twin, estimator, cfg.clone(), &Progress::default());
+            assert_eq!(job.steps(), 10);
             let progress = Progress::default();
             let out = job.run(&progress);
             assert_eq!(progress.done(), 10, "{estimator:?}");
             assert_eq!(out.estimator(), estimator);
-            let (dt_out, n_ref) = match &out {
-                JobOutput::Filter(o) => (o.dt, o.reference.len()),
-                JobOutput::Window(o) => (o.window.dt, o.window.reference.len()),
-                JobOutput::Particles(o) => (o.dt, o.reference.len()),
-                JobOutput::Tracker(o) => (o.dt, o.reference.len()),
+            let (dt_out, reference) = match &out {
+                JobOutput::Filter(o) => (o.dt, &o.reference),
+                JobOutput::Window(o) => (o.window.dt, &o.window.reference),
+                JobOutput::Particles(o) => (o.dt, &o.reference),
+                JobOutput::Tracker(o) => (o.dt, &o.reference),
             };
-            assert_eq!(dt_out, dt);
-            assert_eq!(n_ref, 11);
+            assert_eq!(dt_out, 0.02);
+            assert_eq!(reference, &r.states);
         }
     }
 
+    /// A seeded particle configuration is reproducible; an unseeded one is
+    /// a fresh sample.
+    #[test]
+    fn particle_seed_makes_runs_reproducible() {
+        let r = spring_reference(0.02, 10);
+        let mut cfg = spring_cfg(&r);
+        for v in &mut cfg.vars {
+            v.sigma = 5.0;
+        }
+        cfg.particles = ParticleConfig { n_particles: 20, seed: Some(3) };
+        let a = run_particles::<2, _>(spring(0.02), &r, &cfg, &Progress::default());
+        let b = run_particles::<2, _>(spring(0.02), &r, &cfg, &Progress::default());
+        assert_eq!(a.positions, b.positions);
+        cfg.particles.seed = None;
+        let c = run_particles::<2, _>(spring(0.02), &r, &cfg, &Progress::default());
+        assert_ne!(a.positions, c.positions);
+    }
+
     /// A job description and its output survive a JSON round trip: the
-    /// description unchanged, the output field by field — what a server
-    /// receives and returns.
+    /// description unchanged (its reference included), the output field by
+    /// field — what a server receives and returns.
     #[test]
     fn job_spec_and_output_round_trip_through_json() {
-        let dt = 0.02;
-        let mut cfg = FilterConfig::defaults(
-            vec!["y_1".into(), "v_1".into()],
-            vec![false, false],
-            &[(0, 1)],
-            &vec![vec![1.15, 0.0]; 11],
-        );
+        let twin = spring_twin(0.02, 10);
+        let r = twin.reference(&Progress::default());
+        let mut cfg = spring_cfg(&r);
         cfg.vars[1].dirichlet = true;
         cfg.diffusion = DiffusionScheme::Euler;
-        let job = JobSpec { model: spring_spec(dt), estimator: Estimator::Tracker, config: cfg, dt, steps: 10 };
+        let job = JobSpec::from_twin(&twin, Estimator::Tracker, cfg, &Progress::default());
         let json = serde_json::to_string(&job).unwrap();
         assert!(json.contains("\"estimator\":\"tracker\"") && json.contains("\"diffusion\":\"euler\""), "{json}");
+        assert!(json.contains("\"observations\":[["), "{json}");
         let back: JobSpec = serde_json::from_str(&json).unwrap();
         assert!(back == job);
 
@@ -1108,20 +1060,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "FilterConfig has 2 variables")]
     fn job_spec_checks_the_dimension() {
-        let cfg = FilterConfig::defaults(
-            vec!["y_1".into(), "v_1".into()],
-            vec![false, false],
-            &[(0, 1)],
-            &vec![vec![1.15, 0.0]; 11],
-        );
+        let r = spring_reference(0.01, 1);
+        let cfg = spring_cfg(&r);
         let model = ModelSpec::Lorenz {
-            params: ode_models::models::LorenzParams::default(),
-            x0: [1.0, 1.0, 1.0],
-            observation: ode_models::models::LorenzObservation::X,
-            noise: ode_models::noise::NoiseModel::None,
-            noise_seed: 0,
+            params: LorenzParams::default(),
+            observation: LorenzObservation::X,
         };
-        run_tracker_spec(&model, &cfg, 0.01, 1, &Progress::default());
+        run_tracker_spec(&model, &r, &cfg, &Progress::default());
     }
 }
 
@@ -1131,7 +1076,7 @@ mod tests {
 mod anisotropy {
     use super::*;
     use ode_models::models::SpringSystem;
-    use nalgebra::DVector;
+    use ode_models_spec::noise::NoiseModel;
 
     /// (std_y, std_v) of the max-marginal of plane 0 at snapshot `k`.
     fn widths(out: &FilterOutput, k: usize) -> (f64, f64) {
@@ -1163,22 +1108,13 @@ mod anisotropy {
     fn q_from_the_config_diffuses_anisotropically() {
         let dt = 0.005;
         let n = 20;
-        let sys = || {
-            SpringSystem::new(
-                1,
-                1.0,
-                1.0,
-                dt,
-                DVector::from_row_slice(&[1.15]),
-                DVector::zeros(1),
-                |x: &[f64]| x[0],
-            )
-        };
+        let sys = || SpringSystem::new(1, 1.0, 1.0, dt, |x: &[f64]| x[0]);
+        let r = Reference::twin(&sys(), [1.15, 0.0], n, NoiseModel::None, 0, None, &Progress::default());
         let mut cfg = FilterConfig::defaults(
             vec!["y".into(), "v".into()],
-            vec![false, false],
+            vec![None, None],
             &[(0, 1)],
-            &vec![vec![1.15, 0.0]; n + 1],
+            &r.states,
         );
         for v in &mut cfg.vars {
             v.sigma = 10.0;
@@ -1190,7 +1126,7 @@ mod anisotropy {
             let mut c = cfg.clone();
             c.vars[0].q = q[0];
             c.vars[1].q = q[1];
-            let out = run_filter::<2, _>(sys(), &c, n, &Progress::default());
+            let out = run_filter::<2, _>(sys(), &r, &c, &Progress::default());
             widths(&out, n)
         };
         let (y_only_y, y_only_v) = run([100.0, 0.0]);

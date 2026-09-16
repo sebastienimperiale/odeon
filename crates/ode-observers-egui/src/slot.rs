@@ -1,7 +1,6 @@
 //! One model in a viewer: the model, its run settings, its trajectory and
-//! playback clock, and the background run producing the trajectory. Shared
-//! by the models-only viewer and the estimator viewer (which keeps its
-//! estimator state beside it).
+//! playback clock, and the background run producing the trajectory. The
+//! application keeps its estimator state beside it.
 
 use crate::models::VizModel;
 use crate::playback::{Playback, Progress, RunHandle, Trajectory};

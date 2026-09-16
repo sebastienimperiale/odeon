@@ -1,9 +1,10 @@
 //! Output routines of the [`MortensenFilter`]: binary snapshots of p, the
 //! reference trajectory (binary + stdout table), and the progress bar.
-//! The numerical cycle itself lives in [`crate::filter`].
+//! The numerical cycle itself lives in [`crate::methods::mortensen`].
 
-use crate::filter::MortensenFilter;
+use crate::methods::mortensen::MortensenFilter;
 use ode_models::model::Model;
+use ode_models_spec::reference::Reference;
 use rayon::prelude::*;
 use std::io::Write;
 
@@ -69,15 +70,8 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
 
     /// Write the reference trajectory to `{out_dir}/trajectory.bin`: the flat
     /// state of every step, f64 LE.
-    pub fn save_trajectory(&self, out_dir: &str) {
-        let f = std::fs::File::create(format!("{out_dir}/trajectory.bin"))
-            .expect("cannot create trajectory.bin");
-        let mut f = std::io::BufWriter::new(f);
-        for x in self.model.states() {
-            for &c in x.iter() {
-                f.write_all(&c.to_le_bytes()).unwrap();
-            }
-        }
+    pub fn save_trajectory(&self, reference: &Reference, out_dir: &str) {
+        write_states(&reference.states, &format!("{out_dir}/trajectory.bin"));
     }
 
     /// Write the estimator trajectory x̂_n = argmax p to
@@ -96,7 +90,7 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
 
     /// Print the reference trajectory as a table on stdout (one row every
     /// ~0.1 time units), with the model's state labels as columns.
-    pub fn print_trajectory(&self) {
+    pub fn print_trajectory(&self, reference: &Reference) {
         let labels = self.model.state_labels();
         let dt = self.model.dt();
         let print_every = ((0.1 / dt).round() as usize).max(1);
@@ -112,7 +106,7 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
         }
         println!();
 
-        for (step, x) in self.model.states().iter().enumerate() {
+        for (step, x) in reference.states.iter().enumerate() {
             if step == 0 || step % print_every == 0 {
                 print!("{:<8.4}", step as f64 * dt);
                 for c in x.iter() {
@@ -125,14 +119,14 @@ impl<const M: usize, Mod: Model<M> + Sync> MortensenFilter<M, Mod> {
 }
 
 /// Save a model-only run (no filter): print the per-component state ranges
-/// and write `trajectory.bin` + `meta.txt` (M, dt, labels) to `out_dir` —
-/// the layout `scripts/visualize_model.py` reads. Used by the `*_forward`
-/// examples to choose filter-domain intervals.
-pub fn save_forward<const M: usize, Mod: Model<M>>(model: &Mod, out_dir: &str) {
+/// of `reference` and write `trajectory.bin` + `meta.txt` (M, dt, labels)
+/// to `out_dir` — the layout `scripts/visualize_model.py` reads. Used by
+/// the `*_forward` examples to choose filter-domain intervals.
+pub fn save_forward<const M: usize, Mod: Model<M>>(model: &Mod, reference: &Reference, out_dir: &str) {
     let labels = model.state_labels();
-    let states = model.states();
-    let dt = model.dt();
-    let n_steps = states.len() - 1;
+    let states = &reference.states;
+    let dt = reference.dt;
+    let n_steps = reference.steps();
 
     println!(
         "state ranges over t ∈ [0, {}]  (dt = {dt}, {n_steps} steps):\n",
@@ -149,18 +143,22 @@ pub fn save_forward<const M: usize, Mod: Model<M>>(model: &Mod, out_dir: &str) {
     }
 
     std::fs::create_dir_all(out_dir).expect("cannot create output dir");
-    let f = std::fs::File::create(format!("{out_dir}/trajectory.bin"))
-        .expect("cannot create trajectory.bin");
-    let mut f = std::io::BufWriter::new(f);
-    for x in states {
-        for &c in x.iter() {
-            f.write_all(&c.to_le_bytes()).unwrap();
-        }
-    }
+    write_states(states, &format!("{out_dir}/trajectory.bin"));
 
     let meta = format!("M={M}\ndt={dt}\nlabels={}\n", labels.join(","));
     std::fs::write(format!("{out_dir}/meta.txt"), meta).expect("cannot write meta.txt");
     println!("\nSaved trajectory to {out_dir}/");
+}
+
+/// Write flat states one after the other as f64 LE.
+fn write_states(states: &[Vec<f64>], path: &str) {
+    let f = std::fs::File::create(path).unwrap_or_else(|e| panic!("cannot create {path}: {e}"));
+    let mut f = std::io::BufWriter::new(f);
+    for x in states {
+        for &c in x {
+            f.write_all(&c.to_le_bytes()).unwrap();
+        }
+    }
 }
 
 /// In-place progress bar on stderr:  [#####-----] 123/600  20%  12.3s elapsed, ETA 49.1s

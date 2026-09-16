@@ -2,6 +2,7 @@
 //! and the background worker that produces trajectories without blocking the
 //! UI thread.
 
+use ode_models_spec::reference::Reference;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use web_time::Instant;
@@ -30,6 +31,12 @@ impl Trajectory {
     /// Frame index closest to time `t`, clamped to the trajectory.
     pub fn frame_at(&self, t: f64) -> usize {
         ((t / self.dt).round().max(0.0) as usize).min(self.len().saturating_sub(1))
+    }
+
+    /// The trajectory as the [`Reference`] an estimator job runs along:
+    /// the same states and observations (a copy).
+    pub fn reference(&self) -> Reference {
+        Reference { dt: self.dt, states: self.states.clone(), observations: self.observations.clone() }
     }
 }
 
@@ -68,7 +75,7 @@ impl Playback {
     }
 }
 
-pub use ode_models::progress::Progress;
+pub use ode_models_spec::progress::Progress;
 
 /// A computation snapshotted from the current parameter form and ready to
 /// run on a worker thread, producing a `T`. Bumps the [`Progress`] counter

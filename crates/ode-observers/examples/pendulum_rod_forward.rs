@@ -8,6 +8,9 @@
 
 use ode_models::models::pendulum_rod::{DIM, PendulumRodSystem};
 use ode_observers::output::save_forward;
+use ode_models_spec::noise::NoiseModel;
+use ode_models_spec::progress::Progress;
+use ode_models_spec::reference::Reference;
 use std::io::Write;
 
 fn main() {
@@ -17,15 +20,13 @@ fn main() {
     // Initial data: released from rest.
     let x0 = [2.453, -2.7727, 0.0, 0.0];
 
-    let mut sys = PendulumRodSystem::new(x0, dt);
+    let sys = PendulumRodSystem::new(dt);
 
     let n_steps = (t_end / dt).ceil() as usize;
-    for _ in 0..n_steps {
-        sys.forward();
-    }
+    let reference = Reference::twin(&sys, x0, n_steps, NoiseModel::None, 0, None, &Progress::default());
 
     let out_dir = "examples/output/pendulum_rod_forward";
-    save_forward::<DIM, _>(&sys, out_dir);
+    save_forward::<DIM, _>(&sys, &reference, out_dir);
 
     // The (x, y)-plane script needs the rod lengths; the model-agnostic meta
     // written by save_forward cannot know them, so append (both rods = L).

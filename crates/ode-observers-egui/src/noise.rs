@@ -1,11 +1,11 @@
 //! UI for the library's observation-noise models
-//! ([`ode_models::noise::NoiseModel`]): a selector plus parameter fields,
+//! ([`ode_models_spec::noise::NoiseModel`]): a selector plus parameter fields,
 //! one row per observation, shown in the Observation section. The noise
-//! itself lives in the library — the same model/seed drives both the
-//! plotted observation series and the filter's model-internal observations,
-//! so what the filter consumes is exactly what is plotted.
+//! itself lives in the library: the reference generator draws it with the
+//! entry's seed, and the run's observations are what the estimators
+//! consume — what is plotted is exactly what the filter sees.
 
-pub use ode_models::noise::NoiseModel;
+pub use ode_models_spec::noise::NoiseModel;
 
 const KIND_NAMES: [&str; 4] = ["no noise", "Gaussian", "Uniform", "AR(1)"];
 

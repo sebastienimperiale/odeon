@@ -2,11 +2,10 @@
 resolver = "3"
 members = [
     "crates/ode-models",
+    "crates/ode-models-spec",
     "crates/ode-observers",
-    "crates/ode-models-egui",
     "crates/ode-observers-egui",
     "crates/ode-observers-remote",
-    "apps/models-viewer",
     "apps/observers-viewer",
     "apps/observers-server",
     "apps/observers-client",

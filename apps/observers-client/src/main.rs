@@ -1,11 +1,14 @@
 //! The observers viewer as a client of an `observers-server`: the same
 //! interface as `observers-viewer`, but every estimator job is posted to
-//! the server (`ode_observers_remote::RemoteRun`) and its output fetched
-//! back; only the trajectories are computed here. Builds as a desktop
+//! the server as a *twin experiment* (`POST /twin-runs`,
+//! `ode_observers_remote::RemoteRun::spawn_twin`: a few kilobytes — the
+//! server regenerates the reference from the same seeds) and its output
+//! fetched back; only the trajectories on screen are computed here. Builds as a desktop
 //! application and as a web page (wasm, `trunk`).
 //!
 //! Desktop: the server URL comes from `ODEON_SERVER` (default
-//! `http://127.0.0.1:8787`) and is editable in the estimator section.
+//! `http://127.0.0.1:8787`) and the server's token, if it needs one, from
+//! `ODEON_TOKEN`; both are editable in the estimator section.
 //!
 //! ```sh
 //! cargo run -p odeon-observers-server --release      # terminal 1
@@ -19,7 +22,9 @@
 //! (GitHub Pages, say) is shared as one link naming the server:
 //! `https://you.github.io/Odeon/?server=https://my-mac.example.net`.
 //! Editing the field in the estimator section updates the remembered
-//! value. (A page served over HTTPS can only call an HTTPS server.)
+//! value. The token works the same way: `?token=…`, remembered under
+//! `odeon.token`, editable. (A page served over HTTPS can only call an
+//! HTTPS server.)
 //!
 //! ```sh
 //! cd apps/observers-client && trunk build --release        # → dist/
@@ -33,70 +38,91 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
+use ode_models_spec::spec::TwinSpec;
 use ode_observers::jobs::{JobOutput, JobSpec};
 use ode_observers_egui::app::{App, Compute, EstimatorRun, LocalRunner};
+use ode_observers_remote::protocol::TwinJob;
 use ode_observers_remote::RemoteRun;
 
-/// Jobs posted to the observers server at `url`.
+/// Jobs posted to the observers server at `url`, as twin experiments,
+/// with its bearer `token` when it requires one (empty = none).
 struct RemoteCompute {
     url: String,
+    token: String,
 }
 
 impl Default for RemoteCompute {
-    /// Desktop: `ODEON_SERVER` or the local default port. Web: the
-    /// `?server=` parameter, the remembered value, or the page's origin.
+    /// Desktop: `ODEON_SERVER` or the local default port, `ODEON_TOKEN`.
+    /// Web: the `?server=` / `?token=` parameters, the remembered values,
+    /// or the page's origin and no token.
     fn default() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        let url = std::env::var("ODEON_SERVER")
-            .ok()
-            .filter(|u| !u.trim().is_empty())
-            .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
+        let (url, token) = {
+            let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+            (var("ODEON_SERVER").unwrap_or_else(|| "http://127.0.0.1:8787".to_string()), var("ODEON_TOKEN").unwrap_or_default())
+        };
         #[cfg(target_arch = "wasm32")]
-        let url = web::server_url();
-        RemoteCompute { url }
+        let (url, token) = (web::server_url(), web::token());
+        RemoteCompute { url, token }
     }
 }
 
-/// Where the web page learns the server URL from, and remembers it.
+/// Where the web page learns the server URL and token from, and remembers
+/// them.
 #[cfg(target_arch = "wasm32")]
 mod web {
-    const STORAGE_KEY: &str = "odeon.server";
+    pub const SERVER_KEY: &str = "odeon.server";
+    pub const TOKEN_KEY: &str = "odeon.token";
 
     fn storage() -> Option<web_sys::Storage> {
         web_sys::window()?.local_storage().ok().flatten()
     }
 
-    /// Remember `url` for the next visit (best effort).
-    pub fn remember(url: &str) {
+    /// Remember `value` under `key` for the next visit (best effort).
+    pub fn remember(key: &str, value: &str) {
         if let Some(storage) = storage() {
-            let _ = storage.set_item(STORAGE_KEY, url.trim());
+            let _ = storage.set_item(key, value.trim());
         }
     }
 
-    /// `?server=…` of the page's address (remembered when present), else
-    /// the remembered value, else the page's origin.
-    pub fn server_url() -> String {
-        let window = web_sys::window();
-        let location = window.as_ref().map(|w| w.location());
-        let from_query = location
-            .as_ref()
-            .and_then(|l| l.search().ok())
+    /// `?name=…` of the page's address, if present and non-empty.
+    fn query(name: &str) -> Option<String> {
+        web_sys::window()?
+            .location()
+            .search()
+            .ok()
             .and_then(|q| web_sys::UrlSearchParams::new_with_str(&q).ok())
-            .and_then(|p| p.get("server"))
+            .and_then(|p| p.get(name))
             .map(|u| u.trim().to_string())
-            .filter(|u| !u.is_empty());
-        if let Some(url) = from_query {
-            remember(&url);
-            return url;
+            .filter(|u| !u.is_empty())
+    }
+
+    fn remembered(key: &str) -> Option<String> {
+        storage()?.get_item(key).ok().flatten().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    }
+
+    /// The query parameter (remembered when present), else the remembered
+    /// value.
+    fn setting(name: &str, key: &str) -> Option<String> {
+        if let Some(value) = query(name) {
+            remember(key, &value);
+            return Some(value);
         }
-        if let Some(url) = storage().and_then(|s| s.get_item(STORAGE_KEY).ok().flatten()) {
-            if !url.trim().is_empty() {
-                return url;
-            }
-        }
-        location
-            .and_then(|l| l.origin().ok())
-            .unwrap_or_else(|| "http://127.0.0.1:8787".to_string())
+        remembered(key)
+    }
+
+    /// `?server=…`, else the remembered URL, else the page's origin.
+    pub fn server_url() -> String {
+        setting("server", SERVER_KEY).unwrap_or_else(|| {
+            web_sys::window()
+                .and_then(|w| w.location().origin().ok())
+                .unwrap_or_else(|| "http://127.0.0.1:8787".to_string())
+        })
+    }
+
+    /// `?token=…`, else the remembered token, else none.
+    pub fn token() -> String {
+        setting("token", TOKEN_KEY).unwrap_or_default()
     }
 }
 
@@ -119,11 +145,13 @@ impl<T: TryFrom<JobOutput, Error = String>> EstimatorRun<T> for Remote<T> {
 }
 
 impl Compute for RemoteCompute {
-    fn spawn<T>(&self, job: JobSpec, _local: LocalRunner<T>) -> Box<dyn EstimatorRun<T>>
+    fn spawn<T>(&self, job: JobSpec, twin: TwinSpec, _local: LocalRunner<T>) -> Box<dyn EstimatorRun<T>>
     where
         T: TryFrom<JobOutput, Error = String> + Send + 'static,
     {
-        Box::new(Remote(RemoteRun::spawn(&self.url, &job)))
+        let JobSpec { estimator, config, .. } = job;
+        let token = Some(self.token.as_str()).filter(|t| !t.trim().is_empty());
+        Box::new(Remote(RemoteRun::spawn_twin_with_token(&self.url, token, &TwinJob { twin, estimator, config })))
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
@@ -138,7 +166,22 @@ impl Compute for RemoteCompute {
                 .changed();
             #[cfg(target_arch = "wasm32")]
             if edited {
-                web::remember(&self.url);
+                web::remember(web::SERVER_KEY, &self.url);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = edited;
+        });
+        ui.horizontal(|ui| {
+            ui.label("token").on_hover_text(
+                "Access token of the server, if it was started with ODEON_TOKEN (leave \
+                 empty for an open server; ODEON_TOKEN in the environment pre-fills it).",
+            );
+            let edited = ui
+                .add(egui::TextEdit::singleline(&mut self.token).password(true).desired_width(ui.available_width() - 8.0))
+                .changed();
+            #[cfg(target_arch = "wasm32")]
+            if edited {
+                web::remember(web::TOKEN_KEY, &self.token);
             }
             #[cfg(not(target_arch = "wasm32"))]
             let _ = edited;

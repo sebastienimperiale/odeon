@@ -137,7 +137,7 @@ pub fn config_ui(
             });
             ui.add_enabled_ui(is_filter || is_window, |ui| {
                 ui.horizontal(|ui| {
-                    use ode_observers::filter::DiffusionScheme;
+                    use ode_observers::methods::mortensen::DiffusionScheme;
                     ui.selectable_value(
                         &mut cfg.diffusion,
                         DiffusionScheme::SplitEuler,

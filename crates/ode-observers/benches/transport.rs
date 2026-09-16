@@ -7,18 +7,28 @@
 //!
 //! Run with `cargo bench --bench transport`.
 
-use ode_observers::filter::{DiffusionScheme, FilterParams, MortensenFilter};
 use ode_models::models::pendulum::{DIM, PendulumSystem};
+use ode_models_spec::noise::NoiseModel;
+use ode_models_spec::progress::Progress;
+use ode_models_spec::reference::Reference;
+use ode_observers::methods::Observer;
+use ode_observers::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
 use std::f64::consts::PI;
 use std::time::Instant;
 
 const N_STEPS: usize = 10;
+const X0: [f64; DIM] = [1.5, 1.4, 0.0, 0.0];
+
+/// The pendulum's noiseless reference over the benchmark's steps.
+fn reference() -> Reference {
+    Reference::twin(&PendulumSystem::new(0.01), X0, N_STEPS, NoiseModel::None, 0, None, &Progress::default())
+}
 
 /// Build the pendulum filter; returns the filter and the construction time
 /// (which includes building the transport plan when `pre_compute_flow_inv`
 /// is on).
 fn build(pre_compute_flow_inv: bool) -> (MortensenFilter<DIM, PendulumSystem>, f64) {
-    let sys = PendulumSystem::new([1.5, 1.4, 0.0, 0.0], 0.01);
+    let sys = PendulumSystem::new(0.01);
     let t0 = Instant::now();
     let mut filter = MortensenFilter::<DIM, _>::new(
         sys,
@@ -43,9 +53,10 @@ fn build(pre_compute_flow_inv: bool) -> (MortensenFilter<DIM, PendulumSystem>, f
 /// Returns (setup seconds, seconds per iteration).
 fn bench(label: &str, pre: bool) -> (f64, f64) {
     let (mut filter, setup) = build(pre);
+    let r = reference();
     let t0 = Instant::now();
-    for _ in 0..N_STEPS {
-        filter.forward();
+    for y in &r.observations[..N_STEPS] {
+        filter.forward(y);
     }
     let per_step = t0.elapsed().as_secs_f64() / N_STEPS as f64;
     println!("{label:<22}  setup {setup:7.3}s   {per_step:7.4}s / iteration");
@@ -56,8 +67,8 @@ fn bench(label: &str, pre: bool) -> (f64, f64) {
 /// half-width 1 (19⁴ ≈ 130k DOFs), preimage cache (plan path, refreshed on
 /// the entering elements when the window moves) vs `convect`.
 fn bench_window(label: &str, pre: bool) -> f64 {
-    use ode_observers::box_tracker::{BoxTracker, BoxTrackerParams};
-    let sys = PendulumSystem::new([1.5, 1.4, 0.0, 0.0], 0.01);
+    use ode_observers::methods::mortensen_window::{BoxTracker, BoxTrackerParams};
+    let sys = PendulumSystem::new(0.01);
     let t0 = Instant::now();
     let mut window = BoxTracker::<DIM, _>::new(
         sys,
@@ -72,12 +83,13 @@ fn bench_window(label: &str, pre: bool) -> f64 {
             pre_compute_flow_inv: pre,
         },
     );
-    window.init_gaussian([5.0; DIM], [1.5, 1.4, 0.0, 0.0]);
+    window.init_gaussian(X0, [5.0; DIM]);
     let setup = t0.elapsed().as_secs_f64();
+    let r = reference();
     let t0 = Instant::now();
     let mut moves = 0;
-    for _ in 0..N_STEPS {
-        moves += usize::from(window.forward().iter().any(|&k| k != 0));
+    for y in &r.observations[..N_STEPS] {
+        moves += usize::from(window.step(y).iter().any(|&k| k != 0));
     }
     let per_step = t0.elapsed().as_secs_f64() / N_STEPS as f64;
     println!("{label:<22}  setup {setup:7.3}s   {per_step:7.4}s / iteration   ({moves} window moves)");

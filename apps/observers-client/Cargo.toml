@@ -11,6 +11,7 @@ name = "observers-client"
 path = "src/main.rs"
 
 [dependencies]
+ode-models-spec      = { path = "../../crates/ode-models-spec" }
 ode-observers        = { path = "../../crates/ode-observers" }
 ode-observers-egui   = { path = "../../crates/ode-observers-egui" }
 ode-observers-remote = { path = "../../crates/ode-observers-remote" }

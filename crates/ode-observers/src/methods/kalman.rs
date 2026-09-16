@@ -10,7 +10,7 @@
 //! distance in observation space — Euclidean in general, the angular
 //! distance for a bearing; see [`Model::discrepancy`]). An observation
 //! weight γ ([`TrackerParams::gamma`], 1 by default, matching
-//! [`crate::filter::FilterParams::gamma`]) scales the right-hand side to
+//! [`crate::methods::mortensen::FilterParams::gamma`]) scales the right-hand side to
 //! γ·d²/2, i.e. an observation-noise covariance R = I/γ. The ansatz
 //! V(x) ≈ V₀ + ½ (x − x̂)ᵀ S (x − x̂), with f and h linearized at x̂
 //! (F = ∂f/∂x, H = ∇h) and d(y, h(x))² ≈ |r − H(x − x̂)|² where
@@ -26,14 +26,13 @@
 //! the closure is exact and the tracker *is* the Kalman filter — the
 //! reference the grid filter is validated against.
 //!
-//! The discretization mirrors [`crate::filter::MortensenFilter::forward`]
+//! The discretization mirrors [`crate::methods::mortensen::MortensenFilter::forward`]
 //! step by step, with the same dt and the same order, so both estimators can
 //! be compared at every step:
 //!
-//!   1. observation:  S ← S + dt·γ·HᵀH,   x̂ ← x̂ + dt·γ·S⁻¹Hᵀ r(x̂)
-//!   2. model forward (reference state and observation t^n → t^{n+1})
-//!   3. transport:    x̂ ← φ(x̂),   S ← Φ⁻ᵀ S Φ⁻¹   (Φ = ∂φ/∂x, exact)
-//!   4. diffusion:    S ← (S⁻¹ + dt·Q)⁻¹ = S (I + dt·Q S)⁻¹
+//!   1. observation:  S ← S + dt·γ·HᵀH,   x̂ ← x̂ + dt·γ·S⁻¹Hᵀ r(x̂)   (with y_n)
+//!   2. transport:    x̂ ← φ(x̂),   S ← Φ⁻ᵀ S Φ⁻¹   (Φ = ∂φ/∂x, exact)
+//!   3. diffusion:    S ← (S⁻¹ + dt·Q)⁻¹ = S (I + dt·Q S)⁻¹
 //!
 //! The information form S (rather than P = S⁻¹) is used throughout because
 //! it tolerates a flat prior (S₀ singular); only the x̂ correction needs
@@ -41,17 +40,19 @@
 //! The tracker is unimodal by construction: it cannot represent a density
 //! with several local maxima — that is precisely what the grid filter adds.
 
+use super::Observer;
 use ode_models::model::Model;
+use ode_models_spec::reference::Reference;
 use nalgebra::{DMatrix, DVector};
 
 /// Parameters of the [`MortensenTracker`].
 #[derive(Clone, Copy, Debug)]
 pub struct TrackerParams<const M: usize> {
     /// Diagonal of the model-noise covariance Q (same meaning as
-    /// [`crate::filter::FilterParams::q_diag`]).
+    /// [`crate::methods::mortensen::FilterParams::q_diag`]).
     pub q_diag: [f64; M],
     /// γ — observation weight (same meaning as
-    /// [`crate::filter::FilterParams::gamma`]): the observation step becomes
+    /// [`crate::methods::mortensen::FilterParams::gamma`]): the observation step becomes
     /// S ← S + dt·γ·HᵀH, x̂ ← x̂ + dt·γ·S⁻¹Hᵀr. 1 is the standard cycle;
     /// 0 switches the observations off. Must be ≥ 0.
     pub gamma: f64,
@@ -61,22 +62,19 @@ pub struct TrackerParams<const M: usize> {
 ///
 /// # Example
 /// ```
-/// use ode_observers::tracker::{MortensenTracker, TrackerParams};
+/// use ode_observers::methods::kalman::{MortensenTracker, TrackerParams};
 /// use ode_models::models::SpringSystem;
-/// use nalgebra::DVector;
 ///
-/// let sys = SpringSystem::new(1, 1.0, 1.0, 0.01,
-///     DVector::from_row_slice(&[0.5]), DVector::zeros(1),
-///     |x: &[f64]| x[0]);
+/// let sys = SpringSystem::new(1, 1.0, 1.0, 0.01, |x: &[f64]| x[0]);
 /// let mut tracker = MortensenTracker::<2, _>::new(sys,
 ///     TrackerParams { q_diag: [1.0; 2], gamma: 1.0 });
 /// tracker.init([0.4, 0.1], [10.0, 10.0]); // Gaussian prior: center, stiffness σ_d
-/// tracker.forward();
+/// tracker.forward(&[0.5]); // one cycle, with the observation y₀ of this step
 /// let x_hat = tracker.estimate();
 /// let p = tracker.covariance().expect("S is definite");
 /// ```
 pub struct MortensenTracker<const M: usize, Mod: Model<M>> {
-    /// The forward model; its `states` hold the reference trajectory.
+    /// The forward model (parameters and maps).
     pub model: Mod,
     /// Parameters the tracker was built with.
     pub params: TrackerParams<M>,
@@ -90,8 +88,8 @@ impl<const M: usize, Mod: Model<M>> MortensenTracker<M, Mod> {
     /// [`forward`](Self::forward).
     pub fn new(model: Mod, params: TrackerParams<M>) -> Self {
         assert_eq!(
-            model.states().last().map(|s| s.len()),
-            Some(M),
+            model.dim(),
+            M,
             "tracker dimension M = {M} does not match the model's state dimension"
         );
         assert!(
@@ -113,7 +111,7 @@ impl<const M: usize, Mod: Model<M>> MortensenTracker<M, Mod> {
     }
 
     /// Gaussian initial data V₀ = Σ_d σ_d (x_d − x_c,d)²/2 — the same prior
-    /// as [`crate::filter::MortensenFilter::init_filter_gaussian`]: x̂₀ = x_c,
+    /// as [`crate::methods::mortensen::MortensenFilter::init_filter_gaussian`]: x̂₀ = x_c,
     /// S₀ = diag(σ). σ_d = 0 leaves direction d flat (no prior).
     pub fn init(&mut self, center: [f64; M], sigma: [f64; M]) {
         assert!(sigma.iter().all(|&s| s >= 0.0), "sigma must be nonnegative");
@@ -138,15 +136,16 @@ impl<const M: usize, Mod: Model<M>> MortensenTracker<M, Mod> {
         self.s.clone().try_inverse()
     }
 
-    /// One tracker iteration, t^n → t^{n+1}: observation → model forward →
-    /// transport → diffusion (see the module docs).
-    pub fn forward(&mut self) {
+    /// One tracker iteration, t^n → t^{n+1}, given the observation `y` =
+    /// y_n of step n: observation → transport → diffusion (see the module
+    /// docs).
+    pub fn forward(&mut self, y: &[f64]) {
         let dt = self.model.dt();
 
         // Step 1 — observation at x̂ₙ with yₙ, weighted by γ.
         let gamma = self.params.gamma;
         let h_jac = self.model.obs_jacobian(&self.x_hat);
-        let innov = self.model.innovation(&self.x_hat);
+        let innov = self.model.innovation(y, &self.x_hat);
         self.s += dt * gamma * h_jac.transpose() * &h_jac;
         let rhs = dt * gamma * h_jac.transpose() * innov;
         // S may still be singular (flat prior, partially observed): solve
@@ -161,10 +160,7 @@ impl<const M: usize, Mod: Model<M>> MortensenTracker<M, Mod> {
             self.x_hat[d] += delta[d];
         }
 
-        // Step 2 — reference model forward (also refreshes yₙ₊₁).
-        self.model.forward();
-
-        // Step 3 — transport along the discrete flow, S ← Φ⁻ᵀ S Φ⁻¹.
+        // Step 2 — transport along the discrete flow, S ← Φ⁻ᵀ S Φ⁻¹.
         let phi = self.model.flow_jacobian(self.x_hat);
         self.x_hat = self.model.flow(self.x_hat);
         let phi = DMatrix::from_fn(M, M, |r, c| phi[r][c]);
@@ -173,7 +169,7 @@ impl<const M: usize, Mod: Model<M>> MortensenTracker<M, Mod> {
             .expect("discrete flow Jacobian is invertible (symmetric scheme)");
         self.s = phi_inv.transpose() * &self.s * &phi_inv;
 
-        // Step 4 — diffusion: S ← S (I + dt·Q S)⁻¹, valid for singular S too.
+        // Step 3 — diffusion: S ← S (I + dt·Q S)⁻¹, valid for singular S too.
         let q = DMatrix::from_diagonal(&DVector::from_row_slice(&self.params.q_diag));
         let m = DMatrix::<f64>::identity(M, M) + dt * &q * &self.s;
         let m_inv = m
@@ -184,15 +180,17 @@ impl<const M: usize, Mod: Model<M>> MortensenTracker<M, Mod> {
         self.s = 0.5 * (&self.s + self.s.transpose());
     }
 
-    /// Run `n_steps` iterations, returning the estimate at every step
-    /// (including t = 0) and the covariance where defined.
-    pub fn run(&mut self, n_steps: usize) -> (Vec<[f64; M]>, Vec<Option<DMatrix<f64>>>) {
+    /// Run one iteration per step of `reference` (with its observations),
+    /// returning the estimate at every step (including t = 0) and the
+    /// covariance where defined.
+    pub fn run_with_covariances(&mut self, reference: &Reference) -> (Vec<[f64; M]>, Vec<Option<DMatrix<f64>>>) {
+        let n_steps = reference.steps();
         let mut estimates = Vec::with_capacity(n_steps + 1);
         let mut covariances = Vec::with_capacity(n_steps + 1);
         estimates.push(self.estimate());
         covariances.push(self.covariance());
-        for _ in 0..n_steps {
-            self.forward();
+        for y in &reference.observations[..n_steps] {
+            self.forward(y);
             estimates.push(self.estimate());
             covariances.push(self.covariance());
         }
@@ -200,23 +198,41 @@ impl<const M: usize, Mod: Model<M>> MortensenTracker<M, Mod> {
     }
 }
 
+/// The common observer surface.
+impl<const M: usize, Mod: Model<M>> Observer<M> for MortensenTracker<M, Mod> {
+    fn dt(&self) -> f64 {
+        self.model.dt()
+    }
+
+    fn init_gaussian(&mut self, center: [f64; M], sigma: [f64; M]) {
+        self.init(center, sigma);
+    }
+
+    fn forward(&mut self, y: &[f64]) {
+        MortensenTracker::forward(self, y);
+    }
+
+    fn estimate(&self) -> [f64; M] {
+        MortensenTracker::estimate(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter::{DiffusionScheme, FilterParams, MortensenFilter};
+    use crate::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
     use ode_models::models::{LorenzObservation, LorenzSystem, SpringSystem};
-    use ode_models::noise::NoiseModel;
+    use ode_models_spec::noise::NoiseModel;
+    use ode_models_spec::progress::Progress;
 
     fn spring(dt: f64) -> SpringSystem {
-        SpringSystem::new(
-            1,
-            1.0,
-            1.0,
-            dt,
-            DVector::from_row_slice(&[1.15]),
-            DVector::zeros(1),
-            |x: &[f64]| x[0],
-        )
+        SpringSystem::new(1, 1.0, 1.0, dt, |x: &[f64]| x[0])
+    }
+
+    /// The spring's reference from (1.15, 0) with the given observation
+    /// noise.
+    fn spring_reference(dt: f64, steps: usize, noise: NoiseModel, seed: u64) -> Reference {
+        Reference::twin(&spring(dt), [1.15, 0.0], steps, noise, seed, None, &Progress::default())
     }
 
     /// On the linear spring the tracker must reproduce the discrete Kalman
@@ -231,29 +247,27 @@ mod tests {
         let q = [0.3, 0.7];
         let sigma = [4.0, 9.0];
         let x_c = [1.0, 0.2];
-        let sys = spring(dt).with_obs_noise(NoiseModel::Gaussian { std: 0.05 }, 7);
+        let r = spring_reference(dt, 200, NoiseModel::Gaussian { std: 0.05 }, 7);
         let mut tracker =
-            MortensenTracker::<2, _>::new(sys, TrackerParams { q_diag: q, gamma: 1.0 });
+            MortensenTracker::<2, _>::new(spring(dt), TrackerParams { q_diag: q, gamma: 1.0 });
         tracker.init(x_c, sigma);
 
         // Independent Kalman filter on the same observation sequence.
-        let mut kf_sys = spring(dt).with_obs_noise(NoiseModel::Gaussian { std: 0.05 }, 7);
         let mut x = DVector::from_row_slice(&x_c);
         let mut p = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0 / sigma[0], 1.0 / sigma[1]]));
-        let phi = kf_sys.trans.clone();
+        let phi = spring(dt).trans.clone();
         let qm = DMatrix::from_diagonal(&DVector::from_row_slice(&q));
         let h = DMatrix::from_row_slice(1, 2, &[1.0, 0.0]);
 
-        for _ in 0..200 {
-            tracker.forward();
+        for n in 0..200 {
+            tracker.forward(&r.observations[n]);
 
-            let y = <SpringSystem as Model<2>>::y_obs(&kf_sys);
+            let y = DVector::from_row_slice(&r.observations[n]);
             let innov = &y - &h * &x;
             let s_inn = &h * &p * h.transpose() + DMatrix::identity(1, 1) / dt;
             let k = &p * h.transpose() * s_inn.try_inverse().unwrap();
             x = &x + &k * innov;
             p = (DMatrix::<f64>::identity(2, 2) - &k * &h) * &p;
-            kf_sys.forward();
             x = &phi * &x;
             p = &phi * &p * phi.transpose() + dt * &qm;
 
@@ -295,9 +309,10 @@ mod tests {
 
         // Node spacing near the center ≈ 6/(24·4)·(Lobatto clustering) ≲ 0.08.
         let tol = 0.12;
-        for _ in 0..100 {
-            filter.forward();
-            tracker.forward();
+        let r = spring_reference(dt, 100, NoiseModel::None, 0);
+        for y in &r.observations[..100] {
+            filter.forward(y);
+            tracker.forward(y);
             let (a, b) = (filter.argmax_p(), tracker.estimate());
             for d in 0..2 {
                 assert!(
@@ -315,13 +330,13 @@ mod tests {
     fn gamma_zero_reduces_to_the_flow() {
         let dt = 0.01;
         let x0 = [0.9, -0.3];
-        let sys = spring(dt).with_obs_noise(NoiseModel::Gaussian { std: 0.05 }, 3);
+        let r = spring_reference(dt, 50, NoiseModel::Gaussian { std: 0.05 }, 3);
         let mut tracker =
-            MortensenTracker::<2, _>::new(sys, TrackerParams { q_diag: [1.0; 2], gamma: 0.0 });
+            MortensenTracker::<2, _>::new(spring(dt), TrackerParams { q_diag: [1.0; 2], gamma: 0.0 });
         tracker.init(x0, [5.0; 2]);
         let mut flow = x0;
-        for _ in 0..50 {
-            tracker.forward();
+        for y in &r.observations[..50] {
+            tracker.forward(y);
             flow = tracker.model.flow(flow);
             let e = tracker.estimate();
             for d in 0..2 {
@@ -340,14 +355,15 @@ mod tests {
     fn tracks_lorenz_from_x_observations() {
         let dt = 0.01;
         let x0 = [-3.716171, -4.204785, 20.339103];
-        let sys = LorenzSystem::new(x0, dt, LorenzObservation::X);
+        let sys = LorenzSystem::new(dt, LorenzObservation::X);
+        let r = Reference::twin(&sys, x0, 1000, NoiseModel::None, 0, None, &Progress::default());
         let mut tracker =
             MortensenTracker::<3, _>::new(sys, TrackerParams { q_diag: [1.0; 3], gamma: 1.0 });
         tracker.init([x0[0] + 2.0, x0[1] - 2.0, x0[2] + 3.0], [1.0; 3]);
         let mut max_err_late = 0.0_f64;
         for n in 0..1000 {
-            tracker.forward();
-            let s = tracker.model.states().last().unwrap();
+            tracker.forward(&r.observations[n]);
+            let s = &r.states[n + 1];
             let e = tracker.estimate();
             let err = (0..3).map(|d| (e[d] - s[d]).abs()).fold(0.0, f64::max);
             assert!(err.is_finite() && err < 50.0, "diverged at step {n}: {err}");

@@ -6,9 +6,9 @@
 use super::{SceneMap, VizModel, draw_trace};
 use crate::noise::NoiseModel;
 use crate::palette;
-use crate::playback::{Job, Trajectory};
-use ode_models::spec::ModelSpec;
-use ode_models::models::pendulum_rod::{PendulumRodParams, PendulumRodSystem};
+use crate::playback::Trajectory;
+use ode_models::models::pendulum_rod::PendulumRodParams;
+use ode_models_spec::spec::{ModelSpec, TwinSpec};
 
 /// Initial state of the heart-shaped tip orbit (released from rest).
 const HEART: [f64; 4] = [2.453, -2.7727, 0.0, 0.0];
@@ -128,55 +128,35 @@ impl VizModel for PendulumRodViz {
         ["q_1", "q_2", "p_1", "p_2"].map(String::from).to_vec()
     }
 
-    fn periodic(&self) -> Vec<bool> {
-        vec![true, true, false, false]
+    fn periodic(&self) -> Vec<Option<(f64, f64)>> {
+        use std::f64::consts::PI;
+        vec![Some((-PI, PI)), Some((-PI, PI)), None, None]
     }
 
     fn default_pairs(&self) -> Vec<(usize, usize)> {
         vec![(0, 2), (1, 3)]
     }
 
-    fn model_spec(&self) -> ModelSpec {
-        let p = &self.drawn;
-        ModelSpec::PendulumRod { params: p.phys, x0: p.x0, noise: p.obs_noise, noise_seed: 3000 }
+    fn snapshot(&mut self) {
+        self.drawn = self.params.clone();
     }
 
-    fn make_job(&mut self, dt: f64, steps: usize) -> Job {
-        self.drawn = self.params.clone();
-        let p = self.params.clone();
-        Box::new(move |progress| {
-            let mut sys = PendulumRodSystem::with_params(p.phys, p.x0, dt);
-            for _ in 0..steps {
-                sys.forward();
-                progress.step();
-            }
-            let states: Vec<Vec<f64>> = sys.states.iter().map(|s| s.iter().copied().collect()).collect();
-            let mut observations: Vec<Vec<f64>> = states
-                .iter()
-                .map(|s| if p.obs_on { vec![s[0].cos()] } else { Vec::new() })
-                .collect();
-            if p.obs_on {
-                let eta = p.obs_noise.realize(observations.len(), dt, 3000);
-                for (obs, e) in observations.iter_mut().zip(eta) {
-                    obs[0] += e;
-                }
-            }
-            let obs_labels = if p.obs_on {
-                vec![if p.obs_noise.is_none() {
-                    "cos q₁".to_string()
-                } else {
-                    "cos q₁ (noisy)".to_string()
-                }]
-            } else {
-                Vec::new()
-            };
-            Trajectory {
-                dt,
-                states,
-                observations,
-                obs_labels,
-            }
-        })
+    fn model_spec(&self) -> ModelSpec {
+        ModelSpec::PendulumRod { params: self.drawn.phys }
+    }
+
+    fn twin_spec(&self, dt: f64, steps: usize) -> TwinSpec {
+        let p = &self.drawn;
+        TwinSpec { model: self.model_spec(), x0: p.x0.to_vec(), dt, steps, noise: p.obs_noise, seed: 3000, walk: None }
+    }
+
+    fn obs_labels(&self) -> Vec<String> {
+        let p = &self.drawn;
+        if p.obs_on {
+            vec![if p.obs_noise.is_none() { "cos q₁".to_string() } else { "cos q₁ (noisy)".to_string() }]
+        } else {
+            Vec::new()
+        }
     }
 
     fn draw(

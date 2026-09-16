@@ -2,8 +2,7 @@
 //! form with the Observation and Simulation sections, the Run-simulation
 //! button, the bottom observation panel (playback controls + y(t) plot with
 //! a time cursor) and the central scene with its "About this model"
-//! header. A models-only viewer is exactly these; the estimator viewer adds
-//! its own sections beside them.
+//! header. The application adds its estimator sections beside them.
 
 use crate::palette;
 use crate::slot::ModelSlot;

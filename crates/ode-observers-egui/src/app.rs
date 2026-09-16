@@ -1,14 +1,15 @@
-//! The observers application: the models-only viewer (model choice +
+//! The observers application: the model side (model choice +
 //! parameter form + run settings on the left, the animated scene in the
 //! middle, the observation plot below — all drawn by
-//! `ode_models_egui::panels`) plus the Mortensen estimators: their
+//! `ode_observers_egui::model_panels`) plus the Mortensen estimators: their
 //! configuration panels and Run button in the left panel
 //! ([`crate::panels`]), and the result views as tabs of the central panel.
 //! Each model keeps its own trajectory, playback clock and estimator
 //! outputs, so switching models never loses a run.
 //!
 //! [`App`] is generic over a [`Compute`] backend — *how* an estimator job
-//! (`ode_observers::jobs::JobSpec`) is started: [`LocalCompute`] runs it on
+//! (`ode_observers::jobs::JobSpec`: the model, the run on screen as the
+//! reference, the estimator and its configuration) is started: [`LocalCompute`] runs it on
 //! a worker thread of this process; the `observers-client` binary supplies
 //! a backend posting it to an `observers-server`. The same job description
 //! and the same views either way; a binary is `App::new(backend)` plus the
@@ -19,11 +20,12 @@ use crate::filter_view::FilterView;
 use crate::panels;
 use crate::particles_view::ParticlesView;
 use crate::tracker_view;
-use ode_models::spec::ModelSpec;
-use ode_models_egui::models::{self, EstimatorHints, VizModel};
-use ode_models_egui::panels as model_panels;
-use ode_models_egui::playback::{Progress, RunHandle};
-use ode_models_egui::slot::ModelSlot;
+use ode_models_spec::reference::Reference;
+use ode_models_spec::spec::{ModelSpec, TwinSpec};
+use crate::models::{self, EstimatorHints, VizModel};
+use crate::model_panels;
+use crate::playback::{Progress, RunHandle};
+use crate::slot::ModelSlot;
 use ode_observers::jobs::{
     self, BoxOutput, Estimator, FilterConfig, FilterOutput, JobOutput, JobSpec, ParticleOutput,
     TrackerOutput,
@@ -44,7 +46,7 @@ enum CentralView {
 /// The typed runner of `ode_observers::jobs` a backend may execute locally
 /// (`run_filter_spec`, `run_tracker_spec`, …): the slot's result type picks
 /// it, `JobSpec::estimator` is what the user selected.
-pub type LocalRunner<T> = fn(&ModelSpec, &FilterConfig, f64, usize, &Progress) -> T;
+pub type LocalRunner<T> = fn(&ModelSpec, &Reference, &FilterConfig, &Progress) -> T;
 
 /// An estimator run in flight, whatever executes it: progress for the bar,
 /// the result when done, and — for backends that can fail — why it died.
@@ -79,8 +81,11 @@ impl<T: Send + 'static> EstimatorRun<T> for RunHandle<T> {
 /// talking to an `observers-server`.
 pub trait Compute {
     /// Start `job`, whose result is a `T` (one of the four outputs);
-    /// `local` is the typed runner a local backend calls.
-    fn spawn<T>(&self, job: JobSpec, local: LocalRunner<T>) -> Box<dyn EstimatorRun<T>>
+    /// `local` is the typed runner a local backend calls on the job (its
+    /// reference is the run on screen), and `twin` the twin experiment
+    /// that run came from — a remote backend sends `twin` (a few
+    /// kilobytes) and lets the server regenerate the reference.
+    fn spawn<T>(&self, job: JobSpec, twin: TwinSpec, local: LocalRunner<T>) -> Box<dyn EstimatorRun<T>>
     where
         T: TryFrom<JobOutput, Error = String> + Send + 'static;
 
@@ -93,13 +98,13 @@ pub trait Compute {
 pub struct LocalCompute;
 
 impl Compute for LocalCompute {
-    fn spawn<T>(&self, job: JobSpec, local: LocalRunner<T>) -> Box<dyn EstimatorRun<T>>
+    fn spawn<T>(&self, job: JobSpec, _twin: TwinSpec, local: LocalRunner<T>) -> Box<dyn EstimatorRun<T>>
     where
         T: TryFrom<JobOutput, Error = String> + Send + 'static,
     {
-        let steps = job.steps;
+        let steps = job.steps();
         Box::new(RunHandle::spawn(
-            Box::new(move |p| local(&job.model, &job.config, job.dt, job.steps, p)),
+            Box::new(move |p| local(&job.model, &job.reference, &job.config, p)),
             steps,
         ))
     }
@@ -371,32 +376,36 @@ impl<C: Compute> App<C> {
                             })
                             .clicked();
                         if clicked
-                            && let Some(cfg) = &slot.filter_cfg
+                            && let (Some(cfg), Some(traj)) = (&slot.filter_cfg, slot.base.completed())
                         {
+                            // The run on screen is the reference the estimator
+                            // runs along: same states, same observations — and
+                            // the twin experiment it came from, for a backend
+                            // that regenerates it elsewhere.
                             let job = JobSpec {
                                 model: slot.base.model.model_spec(),
+                                reference: traj.reference(),
                                 estimator: slot.estimator,
                                 config: cfg.clone(),
-                                dt: slot.base.dt,
-                                steps,
                             };
+                            let twin = slot.base.model.twin_spec(slot.base.dt, traj.len().saturating_sub(1));
                             slot.run_error = None;
                             match slot.estimator {
                                 Estimator::Filter => {
                                     slot.filter_run =
-                                        Some(compute.spawn(job, jobs::run_filter_spec));
+                                        Some(compute.spawn(job, twin, jobs::run_filter_spec));
                                 }
                                 Estimator::Window => {
                                     slot.box_run =
-                                        Some(compute.spawn(job, jobs::run_box_spec));
+                                        Some(compute.spawn(job, twin, jobs::run_box_spec));
                                 }
                                 Estimator::Particles => {
                                     slot.particle_run =
-                                        Some(compute.spawn(job, jobs::run_particles_spec));
+                                        Some(compute.spawn(job, twin, jobs::run_particles_spec));
                                 }
                                 Estimator::Tracker => {
                                     slot.tracker_run =
-                                        Some(compute.spawn(job, jobs::run_tracker_spec));
+                                        Some(compute.spawn(job, twin, jobs::run_tracker_spec));
                                 }
                             }
                         }
@@ -534,7 +543,7 @@ impl<C: Compute> App<C> {
 }
 
 /// Apply a model's estimator hints onto the freshly computed defaults:
-/// every `Some` field of a [`VarHint`](ode_models_egui::VarHint) replaces
+/// every `Some` field of a [`VarHint`](crate::VarHint) replaces
 /// the default of that variable, and `eps` replaces the temperature.
 /// Hints for more variables than the configuration has are ignored.
 fn apply_hints(cfg: &mut FilterConfig, hints: &EstimatorHints) {
@@ -563,9 +572,9 @@ fn apply_hints(cfg: &mut FilterConfig, hints: &EstimatorHints) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ode_models_egui::models::kepler::KeplerViz;
-    use ode_models_egui::playback::Progress;
-    use ode_models_egui::models::spring::SpringViz;
+    use crate::models::kepler::KeplerViz;
+    use crate::playback::Progress;
+    use crate::models::spring::SpringViz;
 
     /// The default configuration of a viewer entry: the generic defaults
     /// from a fake completed run at the model's initial state, with the
@@ -582,16 +591,9 @@ mod tests {
         cfg
     }
 
-    /// The initial state of a model entry, through its own model spec.
+    /// The initial state of a model entry, from its twin experiment.
     fn initial_state(viz: &dyn VizModel) -> Vec<f64> {
-        struct X0;
-        impl ode_models::spec::ModelVisitor for X0 {
-            type Output = Vec<f64>;
-            fn visit<const M: usize, Mod: ode_models::model::Model<M>>(self, model: Mod) -> Vec<f64> {
-                model.states()[0].as_slice().to_vec()
-            }
-        }
-        viz.model_spec().visit(0.02, X0)
+        viz.twin_spec(0.02, 0).x0
     }
 
     /// A spring entry with the estimator-only "unknown free-end mass"
@@ -639,13 +641,7 @@ mod tests {
                 v.sigma = 1.0;
             }
             cfg.n_snapshots = 2;
-            let job = JobSpec {
-                model: viz.model_spec(),
-                estimator: Estimator::Filter,
-                config: cfg,
-                dt: 0.02,
-                steps: 5,
-            };
+            let job = JobSpec::from_twin(&viz.twin_spec(0.02, 5), Estimator::Filter, cfg, &Progress::default());
             let progress = Progress::default();
             let out = match job.run(&progress) {
                 jobs::JobOutput::Filter(out) => out,
@@ -671,18 +667,19 @@ mod tests {
         assert!(cfg.vars.iter().all(|v| v.q == 1.0 && v.n_el == 5));
     }
 
-    /// The random walk's hints cover the ring, and a short filter run
+    /// The lamppost's hints cover the ring, and a short filter run
     /// through the pipeline produces it: high p at the four axis points of
     /// the unit circle, low at the origin.
     #[test]
     fn hinted_defaults_and_ring_through_the_viewer() {
         let viz = models::make(7);
-        assert_eq!(viz.name(), "Random walk");
+        assert_eq!(viz.name(), "Lamppost");
         let x0 = initial_state(viz.as_ref());
         let mut cfg = default_cfg(viz.as_ref(), &x0);
         assert!(cfg.vars.iter().all(|v| v.domain == (-2.0, 2.0)));
         cfg.n_snapshots = 2;
-        let out = jobs::run_filter_spec(&viz.model_spec(), &cfg, 0.05, 40, &Progress::default());
+        let r = viz.twin_spec(0.05, 40).reference(&Progress::default());
+        let out = jobs::run_filter_spec(&viz.model_spec(), &r, &cfg, &Progress::default());
         let marg = &out.marginals.last().unwrap()[0];
         let (ax, ay) = (&out.axes[0], &out.axes[1]);
         let max = marg.iter().copied().fold(f64::MIN, f64::max);

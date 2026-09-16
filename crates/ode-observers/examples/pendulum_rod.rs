@@ -12,8 +12,11 @@
 //!
 //! Outputs go to examples/output/pendulum_rod/.
 
-use ode_observers::filter::{DiffusionScheme, FilterParams, MortensenFilter};
+use ode_observers::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
 use ode_models::models::pendulum_rod::{DIM, PendulumRodSystem};
+use ode_models_spec::noise::NoiseModel;
+use ode_models_spec::progress::Progress;
+use ode_models_spec::reference::Reference;
 use std::f64::consts::PI;
 
 fn main() {
@@ -38,7 +41,7 @@ fn main() {
 
     println!("double rod pendulum: x0 = {x0:?}, dt = {dt}, t_end = {t_end}\ndomain = {domain:?}");
 
-    let sys = PendulumRodSystem::new(x0, dt);
+    let sys = PendulumRodSystem::new(dt);
 
     // ââ Mortensen filter âââââââââââââââââââââââââââââââââââââââââââââââââââââ
     let params = FilterParams {
@@ -66,7 +69,8 @@ fn main() {
     filter.init_filter_quadratic(sigma);
 
     let n_steps = (t_end / dt).ceil() as usize;
-    filter.run(n_steps, 25, PLOT_PAIRS, "examples/output/pendulum_rod");
+    let reference = Reference::twin(&filter.model, x0, n_steps, NoiseModel::None, 0, None, &Progress::default());
+    filter.run_and_save(&reference, 25, PLOT_PAIRS, "examples/output/pendulum_rod");
 
     // The (x, y)-plane script needs the rod lengths; the model-agnostic
     // filter meta cannot know them, so append them here (both rods = L).

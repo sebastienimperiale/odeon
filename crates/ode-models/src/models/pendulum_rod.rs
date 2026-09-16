@@ -24,9 +24,9 @@
 //! Gauss–Legendre 4 scheme as [`crate::models::pendulum`] is used, so
 //! flow_inv = one step with −dt is exact.)
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use crate::model::Model;
-use crate::noise::{NoiseModel, NoiseSampler};
 use nalgebra::{DMatrix, DVector};
 
 /// State dimension: (q₁, q₂, p₁, p₂).
@@ -34,7 +34,8 @@ pub const DIM: usize = 4;
 
 /// Physical parameters of the compound pendulum (both rods identical).
 /// [`Default`] gives the swaptube values: m = 1, ℓ = 1, g = 9.8.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PendulumRodParams {
     /// Mass of each rod.
     pub m: f64,
@@ -66,74 +67,32 @@ impl Default for PendulumRodParams {
 /// ```
 /// use ode_models::models::pendulum_rod::{DIM, PendulumRodSystem};
 ///
-/// let mut sys = PendulumRodSystem::new([2.453, -2.7727, 0.0, 0.0], 0.01);
-/// sys.forward();                    // one step: t^0 → t^1
-/// // sys.states[n] = [Q_n; P_n]
+/// let sys = PendulumRodSystem::new(0.01);
+/// let x1 = sys.flow(&[2.453, -2.7727, 0.0, 0.0]); // one step: t^0 → t^1
 /// ```
 pub struct PendulumRodSystem {
     // ── Public ───────────────────────────────────────────────────────────────
     pub dt: f64,
     /// Physical parameters (rod mass, rod length, gravity).
     pub params: PendulumRodParams,
-    /// Trajectory so far: `states[n]` = [Q_n; P_n] (flat, angles then
-    /// momenta). Holds the initial condition after [`new`]; each [`forward`]
-    /// call appends one state. The last entry is the current state.
-    pub states: Vec<DVector<f64>>,
 
-    // ── Private (observation) ────────────────────────────────────────────────
-    /// Cached observation of the current state, y_n = h(x_n) + η_n with
-    /// h(x) = cos q₁ (η ≡ 0 without
-    /// [`with_obs_noise`](Self::with_obs_noise)); refreshed by [`forward`].
-    y_obs: f64,
-    /// Observation-noise draws, one per step.
-    noise: NoiseSampler,
 }
 
 impl PendulumRodSystem {
     /// Build the system with the swaptube physical parameters
     /// ([`PendulumRodParams::default`]).
     ///
-    /// * `x0`    — initial state (q₁, q₂, p₁, p₂)
+    /// The state is (q₁, q₂, p₁, p₂).
+    ///
     /// * `dt`    — time step
-    pub fn new(x0: [f64; DIM], dt: f64) -> Self {
-        Self::with_params(PendulumRodParams::default(), x0, dt)
+    pub fn new(dt: f64) -> Self {
+        Self::with_params(PendulumRodParams::default(), dt)
     }
 
     /// Build the system from explicit physical parameters (see [`new`](Self::new)
     /// for the other arguments).
-    pub fn with_params(params: PendulumRodParams, x0: [f64; DIM], dt: f64) -> Self {
-        let x0 = [
-            Self::wrap_angle(x0[0]),
-            Self::wrap_angle(x0[1]),
-            x0[2],
-            x0[3],
-        ];
-        PendulumRodSystem {
-            dt,
-            params,
-            states: vec![DVector::from_row_slice(&x0)],
-            y_obs: x0[0].cos(),
-            noise: NoiseModel::None.sampler(dt, 0),
-        }
-    }
-
-    /// Add observation noise: from now on the cached observation is
-    /// y_n = h(x_n) + η_n with η drawn from `noise` (deterministic in
-    /// `seed`). Re-caches the current observation with the first draw, so
-    /// call this right after construction.
-    pub fn with_obs_noise(mut self, noise: NoiseModel, seed: u64) -> Self {
-        self.noise = noise.sampler(self.dt, seed);
-        let x = self.states.last().expect("states holds the initial condition");
-        self.y_obs = x[0].cos() + self.noise.next_sample();
-        self
-    }
-
-    /// Wrap an angle to [−π, π). The dynamics are 2π-periodic in each angle
-    /// (they enter only through sin/cos), so wrapping the stored state
-    /// changes nothing physically — it only normalizes the representation.
-    fn wrap_angle(q: f64) -> f64 {
-        use std::f64::consts::PI;
-        (q + PI).rem_euclid(2.0 * PI) - PI
+    pub fn with_params(params: PendulumRodParams, dt: f64) -> Self {
+        PendulumRodSystem { dt, params }
     }
 
     /// (x, y) position of the free end of the second rod — depends only on
@@ -149,34 +108,10 @@ impl PendulumRodSystem {
         ]
     }
 
-    /// Forward operator: advance the current state one Gauss–Legendre step,
-    /// t^n → t^{n+1}.
-    ///
-    /// The current state is the last entry of [`states`]; the new state is
-    /// appended and becomes the current one.
-    pub fn forward(&mut self) {
-        let x = self
-            .states
-            .last()
-            .expect("states holds the initial condition");
-        let x = std::array::from_fn(|i| x[i]);
-        let mut x_next = self.gl4_step(&x, self.dt);
-        // Store angles wrapped to [−π, π) — exact for the dynamics (2π-
-        // periodic in each angle), and keeps the reference inside the
-        // filter's periodic angle box even when the orbit winds.
-        x_next[0] = Self::wrap_angle(x_next[0]);
-        x_next[1] = Self::wrap_angle(x_next[1]);
-
-        self.y_obs = x_next[0].cos() + self.noise.next_sample();
-
-        self.states.push(DVector::from_row_slice(&x_next));
-    }
-
-    /// Squared discrepancy |y_n − cos(x[0])|² between the current observation
-    /// y_n = h(x_n) (the last entry of [`states`]) and the observation of an
-    /// arbitrary input state, with h(x) = cos q₁.
-    pub fn discrepancy(&self, xi: &[f64]) -> f64 {
-        let d = self.y_obs - xi[0].cos();
+    /// Squared discrepancy |y − cos q₁|² between an observation `y` (one
+    /// component) and h(xi) = cos q₁ of an arbitrary input state.
+    pub fn discrepancy(&self, y: &[f64], xi: &[f64]) -> f64 {
+        let d = y[0] - xi[0].cos();
         d * d
     }
 
@@ -260,9 +195,9 @@ impl PendulumRodSystem {
     }
 
     /// One step of the fourth-order Gauss–Legendre method (shared solver,
-    /// see [`super::gl4`]).
+    /// see [`crate::gl4`]).
     fn gl4_step(&self, x: &[f64; DIM], h: f64) -> [f64; DIM] {
-        super::gl4::gl4_step(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, h)
+        crate::gl4::gl4_step(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, h)
     }
 
     /// Discrete flow map φ: one Gauss–Legendre step of size `dt`.
@@ -271,9 +206,9 @@ impl PendulumRodSystem {
     }
 
     /// φ(x) together with its exact Jacobian ∂φ/∂x (see
-    /// [`super::gl4::gl4_step_with_jacobian`]).
+    /// [`crate::gl4::gl4_step_with_jacobian`]).
     pub fn flow_with_jacobian(&self, x: &[f64; DIM]) -> ([f64; DIM], [[f64; DIM]; DIM]) {
-        super::gl4::gl4_step_with_jacobian(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, self.dt)
+        crate::gl4::gl4_step_with_jacobian(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, self.dt)
     }
 
     /// Inverse discrete flow map φ⁻¹: one Gauss–Legendre step of size `−dt`.
@@ -290,12 +225,8 @@ impl Model<DIM> for PendulumRodSystem {
         self.dt
     }
 
-    fn forward(&mut self) {
-        PendulumRodSystem::forward(self);
-    }
-
-    fn discrepancy(&self, xi: &[f64]) -> f64 {
-        PendulumRodSystem::discrepancy(self, xi)
+    fn discrepancy(&self, y: &[f64], xi: &[f64]) -> f64 {
+        PendulumRodSystem::discrepancy(self, y, xi)
     }
 
     fn flow_inv(&self, xi: [f64; DIM]) -> [f64; DIM] {
@@ -310,16 +241,19 @@ impl Model<DIM> for PendulumRodSystem {
         self.flow_with_jacobian(&xi).1
     }
 
-    fn n_obs(&self) -> usize {
+    /// The two angles live on [−π, π) (the dynamics are 2π-periodic in
+    /// each); the momenta are plain.
+    fn periodic(&self) -> [Option<(f64, f64)>; DIM] {
+        use std::f64::consts::PI;
+        [Some((-PI, PI)), Some((-PI, PI)), None, None]
+    }
+
+    fn obs_dim(&self) -> usize {
         1
     }
 
-    fn h(&self, xi: &[f64]) -> DVector<f64> {
+    fn obs(&self, xi: &[f64]) -> DVector<f64> {
         DVector::from_element(1, xi[0].cos())
-    }
-
-    fn y_obs(&self) -> DVector<f64> {
-        DVector::from_element(1, self.y_obs)
     }
 
     /// ∇(cos q₁) = (−sin q₁, 0, 0, 0).
@@ -331,10 +265,6 @@ impl Model<DIM> for PendulumRodSystem {
     /// same at every step: autonomous.
     fn is_autonomous(&self) -> bool {
         true
-    }
-
-    fn states(&self) -> &[DVector<f64>] {
-        &self.states
     }
 
     fn state_labels(&self) -> Vec<String> {
@@ -371,43 +301,24 @@ mod tests {
         // orders of magnitude more, independently of dt).
         let x0 = [1.5, 1.4, 0.0, 0.0];
         let dt = 0.0025;
-        let mut sys = PendulumRodSystem::new(x0, dt);
-        for _ in 0..2000 {
-            sys.forward(); // 2000 steps of dt = 0.0025 → t = 5
-        }
-        let h0 = sys.hamiltonian(&x0);
-        for x in &sys.states {
-            let x = std::array::from_fn(|i| x[i]);
-            assert!(
-                (sys.hamiltonian(&x) - h0).abs() < 1e-7 * h0.abs(),
-                "energy drift: H = {} vs H0 = {h0}",
-                sys.hamiltonian(&x)
-            );
-        }
-    }
-
-    #[test]
-    fn energy_is_conserved_with_custom_params() {
-        let x0 = [1.5, 1.4, 0.0, 0.0];
-        let mut sys = PendulumRodSystem::with_params(ODD_PARAMS, x0, 0.0025);
-        for _ in 0..2000 {
-            sys.forward();
-        }
-        let h0 = sys.hamiltonian(&x0);
-        for x in &sys.states {
-            let x = std::array::from_fn(|i| x[i]);
-            assert!(
-                (sys.hamiltonian(&x) - h0).abs() < 1e-7 * h0.abs(),
-                "energy drift: H = {} vs H0 = {h0}",
-                sys.hamiltonian(&x)
-            );
+        for sys in [PendulumRodSystem::new(dt), PendulumRodSystem::with_params(ODD_PARAMS, dt)] {
+            let h0 = sys.hamiltonian(&x0);
+            let mut x = x0;
+            for _ in 0..2000 {
+                x = sys.flow(&x); // 2000 steps of dt = 0.0025 → t = 5
+                assert!(
+                    (sys.hamiltonian(&x) - h0).abs() < 1e-7 * h0.abs(),
+                    "energy drift: H = {} vs H0 = {h0}",
+                    sys.hamiltonian(&x)
+                );
+            }
         }
     }
 
     #[test]
     fn jacobian_matches_finite_differences() {
         // Run at non-unit parameters so every parameter enters the check.
-        let sys = PendulumRodSystem::with_params(ODD_PARAMS, X0, 0.01);
+        let sys = PendulumRodSystem::with_params(ODD_PARAMS, 0.01);
         let x = [1.3, -0.7, 0.8, -1.9];
         let jac = sys.rhs_jacobian(&x);
         let eps = 1e-6;
@@ -431,7 +342,7 @@ mod tests {
 
     #[test]
     fn flow_inv_inverts_flow() {
-        let sys = PendulumRodSystem::new(X0, 0.01);
+        let sys = PendulumRodSystem::new(0.01);
         let y = sys.flow(&X0);
         let z = sys.flow_inv(&y);
         for i in 0..DIM {

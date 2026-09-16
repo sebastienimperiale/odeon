@@ -2,17 +2,26 @@
 //! which must not depend on `ode-observers`): the tracker's parameter
 //! identification on the unknown-μ Kepler problem and the unknown-mass
 //! spring chain, the grid filter's smoke runs in 3D and 5D, and the
-//! random walk's ring (found by the grid filter, collapsed by the tracker).
+//! lamppost's ring (found by the grid filter, collapsed by the tracker).
 
 #![allow(clippy::excessive_precision)]
 
 use ode_models::models::kepler::perihelion_state;
 use ode_models::models::kepler_mu::{augmented_state, KeplerMuSystem, DIM};
-use ode_models::models::random_walk::{RandomWalkSystem, DEFAULT_STATE};
+use ode_models::models::lamppost::{LamppostSystem, DEFAULT_STATE};
 use ode_models::models::spring_mass::SpringMassSystem;
+use ode_models::model::Model;
 use ode_models::models::KeplerObservation;
-use ode_observers::filter::{DiffusionScheme, FilterParams, MortensenFilter};
-use ode_observers::tracker::{MortensenTracker, TrackerParams};
+use ode_models_spec::noise::NoiseModel;
+use ode_models_spec::progress::Progress;
+use ode_models_spec::reference::Reference;
+use ode_observers::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
+use ode_observers::methods::kalman::{MortensenTracker, TrackerParams};
+
+/// The noiseless reference of `model` from `x0` over `steps` steps.
+fn twin<const M: usize, Mod: Model<M>>(model: &Mod, x0: [f64; M], steps: usize) -> Reference {
+    Reference::twin(model, x0, steps, NoiseModel::None, 0, None, &Progress::default())
+}
 
 /// Identifiability of the parameter: observing q₁ alone, the tracker
 /// started at the *correct* (q, p) but the *wrong* θ converges to the
@@ -32,7 +41,8 @@ fn tracker_estimates_theta_from_q1_observations() {
     let theta_true = 0.1;
     let dt = 0.01;
     let x0 = augmented_state(perihelion_state(0.3), theta_true);
-    let sys = KeplerMuSystem::new(x0, dt, KeplerObservation::Q1);
+    let sys = KeplerMuSystem::new(dt, KeplerObservation::Q1);
+    let r = twin(&sys, x0, 2000); // t = 20 ≈ 3 orbital periods
     let mut tracker =
         MortensenTracker::<DIM, _>::new(sys, TrackerParams { q_diag: [0.0; DIM], gamma: 1.0 });
     // Prior centered at the true (q, p) but θ̂₀ = 0 (i.e. μ̂ = μ₀).
@@ -40,8 +50,8 @@ fn tracker_estimates_theta_from_q1_observations() {
         [x0[0], x0[1], x0[2], x0[3], 0.0],
         [1000.0, 1000.0, 1000.0, 1000.0, 1.0],
     );
-    for _ in 0..2000 {
-        tracker.forward(); // t = 20 ≈ 3 orbital periods
+    for y in &r.observations[..2000] {
+        tracker.forward(y);
     }
     let theta_hat = tracker.estimate()[4];
     assert!(
@@ -61,10 +71,11 @@ fn tracker_estimates_theta_from_q1_observations() {
 /// positive, with the transport plan active.
 #[test]
 fn grid_filter_runs_in_5d() {
-    use ode_observers::filter::{DiffusionScheme, FilterParams, MortensenFilter};
+    use ode_observers::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
     let theta_true = 0.3;
     let x0 = augmented_state(perihelion_state(0.3), theta_true);
-    let sys = KeplerMuSystem::new(x0, 0.02, KeplerObservation::Range);
+    let sys = KeplerMuSystem::new(0.02, KeplerObservation::Range);
+    let r = twin(&sys, x0, 5);
     let mut filter = MortensenFilter::<DIM, _>::new(
         sys,
         FilterParams {
@@ -81,8 +92,8 @@ fn grid_filter_runs_in_5d() {
         },
     );
     filter.init_filter_gaussian([5.0, 5.0, 5.0, 5.0, 1.0], [x0[0], x0[1], x0[2], x0[3], 0.0]);
-    for _ in 0..5 {
-        filter.forward();
+    for y in &r.observations[..5] {
+        filter.forward(y);
     }
     let max = filter.p_field().iter().copied().fold(f64::MIN, f64::max);
     assert!(max.is_finite() && max > 0.0, "p degenerated: max = {max}");
@@ -97,8 +108,9 @@ fn grid_filter_runs_in_5d() {
 #[test]
 fn grid_filter_finds_the_ring() {
     let dt = 0.05;
+    let r = twin(&LamppostSystem::new(dt), DEFAULT_STATE, 40);
     let mut filter = MortensenFilter::<2, _>::new(
-        RandomWalkSystem::new(DEFAULT_STATE, dt),
+        LamppostSystem::new(dt),
         FilterParams {
             domain: [(-2.0, 2.0); 2],
             eps: 0.05,
@@ -113,8 +125,8 @@ fn grid_filter_finds_the_ring() {
         },
     );
     filter.init_filter_gaussian([0.0; 2], [0.0; 2]); // flat prior
-    for _ in 0..40 {
-        filter.forward();
+    for y in &r.observations[..40] {
+        filter.forward(y);
     }
     let p = filter.p_field();
     let grid = filter.grid();
@@ -144,13 +156,14 @@ fn grid_filter_finds_the_ring() {
 /// at distance 1 — the one selected by its prior — with a definite S.
 #[test]
 fn tracker_collapses_onto_one_point_of_the_ring() {
+    let r = twin(&LamppostSystem::new(0.05), DEFAULT_STATE, 600);
     let mut tracker = MortensenTracker::<2, _>::new(
-        RandomWalkSystem::new(DEFAULT_STATE, 0.05),
+        LamppostSystem::new(0.05),
         TrackerParams { q_diag: [0.0; 2], gamma: 1.0 },
     );
     tracker.init([0.5, 0.3], [1.0; 2]);
-    for _ in 0..600 {
-        tracker.forward();
+    for y in &r.observations[..600] {
+        tracker.forward(y);
     }
     let e = tracker.estimate();
     let r = (e[0] * e[0] + e[1] * e[1]).sqrt();
@@ -169,11 +182,12 @@ fn tracker_estimates_theta_from_a_position() {
     let dt = 0.01;
 
     let x0 = SpringMassSystem::<2>::state([0.0, 0.5], [0.0, 0.0], theta_true);
-    let sys = SpringMassSystem::<2>::new(&x0, dt, 0);
+    let sys = SpringMassSystem::<2>::new(dt, 0);
+    let r = twin(&sys, x0, 3000); // t = 30, several periods
     let mut tracker = MortensenTracker::<5, _>::new(sys, TrackerParams { q_diag: [0.0; 5], gamma: 1.0 });
     tracker.init([x0[0], x0[1], x0[2], x0[3], 0.0], [1000.0, 1000.0, 1000.0, 1000.0, 1.0]);
-    for _ in 0..3000 {
-        tracker.forward(); // t = 30, several periods
+    for y in &r.observations[..3000] {
+        tracker.forward(y);
     }
     let theta_hat = tracker.estimate()[4];
     assert!((theta_hat - theta_true).abs() < 0.03, "N=2: θ̂ = {theta_hat} vs {theta_true}");
@@ -182,11 +196,12 @@ fn tracker_estimates_theta_from_a_position() {
     assert!(p_theta < 0.2, "N=2: no information gained about θ: P_θθ = {p_theta}");
 
     let x0 = SpringMassSystem::<1>::state([0.5], [0.0], theta_true);
-    let sys = SpringMassSystem::<1>::new(&x0, dt, 0);
+    let sys = SpringMassSystem::<1>::new(dt, 0);
+    let r = twin(&sys, x0, 3000);
     let mut tracker = MortensenTracker::<3, _>::new(sys, TrackerParams { q_diag: [0.0; 3], gamma: 1.0 });
     tracker.init([x0[0], x0[1], 0.0], [1000.0, 1000.0, 1.0]);
-    for _ in 0..3000 {
-        tracker.forward();
+    for y in &r.observations[..3000] {
+        tracker.forward(y);
     }
     let theta_hat = tracker.estimate()[2];
     assert!((theta_hat - theta_true).abs() < 0.03, "N=1: θ̂ = {theta_hat} vs {theta_true}");
@@ -197,11 +212,12 @@ fn tracker_estimates_theta_from_a_position() {
 /// positive, with the transport plan.
 #[test]
 fn grid_filter_runs_in_3d_and_5d() {
-    use ode_observers::filter::{DiffusionScheme, FilterParams, MortensenFilter};
+    use ode_observers::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
 
     let x0 = SpringMassSystem::<1>::state([0.5], [0.0], 0.3);
+    let r = twin(&SpringMassSystem::<1>::new(0.02, 0), x0, 10);
     let mut filter = MortensenFilter::<3, _>::new(
-        SpringMassSystem::<1>::new(&x0, 0.02, 0),
+        SpringMassSystem::<1>::new(0.02, 0),
         FilterParams {
             domain: [(-1.0, 1.0), (-1.5, 1.5), (-1.0, 1.0)],
             eps: 0.1,
@@ -216,15 +232,16 @@ fn grid_filter_runs_in_3d_and_5d() {
         },
     );
     filter.init_filter_gaussian([5.0, 5.0, 1.0], [x0[0], x0[1], 0.0]);
-    for _ in 0..10 {
-        filter.forward();
+    for y in &r.observations[..10] {
+        filter.forward(y);
     }
     let max = filter.p_field().iter().copied().fold(f64::MIN, f64::max);
     assert!(max.is_finite() && max > 0.0, "N=1: p degenerated: max = {max}");
 
     let x0 = SpringMassSystem::<2>::state([0.0, 0.5], [0.0, 0.0], 0.3);
+    let r = twin(&SpringMassSystem::<2>::new(0.02, 0), x0, 5);
     let mut filter = MortensenFilter::<5, _>::new(
-        SpringMassSystem::<2>::new(&x0, 0.02, 0),
+        SpringMassSystem::<2>::new(0.02, 0),
         FilterParams {
             domain: [(-1.0, 1.0), (-1.0, 1.0), (-1.5, 1.5), (-1.5, 1.5), (-1.0, 1.0)],
             eps: 0.1,
@@ -239,8 +256,8 @@ fn grid_filter_runs_in_3d_and_5d() {
         },
     );
     filter.init_filter_gaussian([5.0, 5.0, 5.0, 5.0, 1.0], [x0[0], x0[1], x0[2], x0[3], 0.0]);
-    for _ in 0..5 {
-        filter.forward();
+    for y in &r.observations[..5] {
+        filter.forward(y);
     }
     let max = filter.p_field().iter().copied().fold(f64::MIN, f64::max);
     assert!(max.is_finite() && max > 0.0, "N=2: p degenerated: max = {max}");

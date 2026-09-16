@@ -23,9 +23,9 @@
 //! exact inverse of the discrete flow). The Mortensen transport step should
 //! convect with `|xi| sys.flow_inv(xi)`.
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use crate::model::Model;
-use crate::noise::{NoiseModel, NoiseSampler};
 use nalgebra::{DMatrix, DVector};
 
 /// State dimension: (q₁, q₂, p₁, p₂).
@@ -33,7 +33,8 @@ pub const DIM: usize = 4;
 
 /// Physical parameters of the double pendulum. [`Default`] gives the values
 /// of pendulum.pdf, §5.2: ℓ₁ = ℓ₂ = 1, m₁ = m₂ = 1, g = 9.8.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PendulumParams {
     /// Rod lengths ℓ₁, ℓ₂.
     pub l1: f64,
@@ -67,27 +68,15 @@ impl Default for PendulumParams {
 /// ```
 /// use ode_models::models::pendulum::{DIM, PendulumSystem};
 ///
-/// let mut sys = PendulumSystem::new([2.453,   - 2.7727, 0.0, 0.0], 0.01);
-/// sys.forward();                    // one step: t^0 → t^1
-/// // sys.states[n] = [Q_n; P_n]
+/// let sys = PendulumSystem::new(0.01);
+/// let x1 = sys.flow(&[2.453, -2.7727, 0.0, 0.0]); // one step: t^0 → t^1
 /// ```
 pub struct PendulumSystem {
     // ── Public ───────────────────────────────────────────────────────────────
     pub dt: f64,
     /// Physical parameters (rod lengths, masses, gravity).
     pub params: PendulumParams,
-    /// Trajectory so far: `states[n]` = [Q_n; P_n] (flat, angles then
-    /// momenta). Holds the initial condition after [`new`]; each [`forward`]
-    /// call appends one state. The last entry is the current state.
-    pub states: Vec<DVector<f64>>,
 
-    // ── Private (observation) ────────────────────────────────────────────────
-    /// Cached observation of the current state, y_n = h(x_n) + η_n with
-    /// h the tip position (η ≡ 0 without
-    /// [`with_obs_noise`](Self::with_obs_noise)); refreshed by [`forward`].
-    y_obs: [f64; 2],
-    /// Observation-noise draws, one per step and tip component.
-    noise: [NoiseSampler; 2],
 }
 
 impl PendulumSystem {
@@ -97,55 +86,18 @@ impl PendulumSystem {
     /// Build the system with the paper's physical parameters
     /// ([`PendulumParams::default`]).
     ///
-    /// * `x0`    — initial state (q₁, q₂, p₁, p₂); the paper's target
-    ///   trajectory uses (1.5, 1.4, 0, 0)
+    /// The state is (q₁, q₂, p₁, p₂); the paper's target trajectory starts
+    /// from (1.5, 1.4, 0, 0).
+    ///
     /// * `dt`    — time step (the paper uses 10⁻²)
-    pub fn new(x0: [f64; DIM], dt: f64) -> Self {
-        Self::with_params(PendulumParams::default(), x0, dt)
+    pub fn new(dt: f64) -> Self {
+        Self::with_params(PendulumParams::default(), dt)
     }
 
     /// Build the system from explicit physical parameters (see [`new`](Self::new)
     /// for the other arguments).
-    pub fn with_params(params: PendulumParams, x0: [f64; DIM], dt: f64) -> Self {
-        let x0 = [
-            Self::wrap_angle(x0[0]),
-            Self::wrap_angle(x0[1]),
-            x0[2],
-            x0[3],
-        ];
-        let mut sys = PendulumSystem {
-            dt,
-            params,
-            states: vec![DVector::from_row_slice(&x0)],
-            y_obs: [0.0; 2],
-            noise: [NoiseModel::None.sampler(dt, 0), NoiseModel::None.sampler(dt, 1)],
-        };
-        sys.y_obs = sys.tip_position(x0[0], x0[1]);
-        sys
-    }
-
-    /// Add observation noise: from now on the cached observation is
-    /// y_n = h(x_n) + η_n, with independent draws from `noise` on each tip
-    /// component (seeds `seed`, `seed + 1`; deterministic). Re-caches the
-    /// current observation with the first draws, so call this right after
-    /// construction.
-    pub fn with_obs_noise(mut self, noise: NoiseModel, seed: u64) -> Self {
-        self.noise = [noise.sampler(self.dt, seed), noise.sampler(self.dt, seed + 1)];
-        let x = self.states.last().expect("states holds the initial condition");
-        let h = self.tip_position(x[0], x[1]);
-        self.y_obs = [
-            h[0] + self.noise[0].next_sample(),
-            h[1] + self.noise[1].next_sample(),
-        ];
-        self
-    }
-
-    /// Wrap an angle to [−π, π). The dynamics are 2π-periodic in each angle
-    /// (they enter only through sin/cos), so wrapping the stored state
-    /// changes nothing physically — it only normalizes the representation.
-    fn wrap_angle(q: f64) -> f64 {
-        use std::f64::consts::PI;
-        (q + PI).rem_euclid(2.0 * PI) - PI
+    pub fn with_params(params: PendulumParams, dt: f64) -> Self {
+        PendulumSystem { dt, params }
     }
 
     /// (x, y) position of the tip mass (mass 2) — depends only on the two
@@ -161,39 +113,14 @@ impl PendulumSystem {
         ]
     }
 
-    /// Forward operator: advance the current state one Gauss–Legendre step,
-    /// t^n → t^{n+1}.
-    ///
-    /// The current state is the last entry of [`states`]; the new state is
-    /// appended and becomes the current one.
-    pub fn forward(&mut self) {
-        let x = self
-            .states
-            .last()
-            .expect("states holds the initial condition");
-        let x = std::array::from_fn(|i| x[i]);
-        let mut x_next = self.gl4_step(&x, self.dt);
-        // Store angles wrapped to [−π, π) — exact for the dynamics (2π-
-        // periodic in each angle), and keeps the reference inside the
-        // filter's periodic angle box even when the orbit winds.
-        x_next[0] = Self::wrap_angle(x_next[0]);
-        x_next[1] = Self::wrap_angle(x_next[1]);
-        let h = self.tip_position(x_next[0], x_next[1]);
-        self.y_obs = [
-            h[0] + self.noise[0].next_sample(),
-            h[1] + self.noise[1].next_sample(),
-        ];
-        self.states.push(DVector::from_row_slice(&x_next));
-    }
-
-    /// Squared discrepancy |y_n − h(xi)|² between the current observation
-    /// y_n = h(x_n) (the last entry of [`states`]) and the observation of an
-    /// arbitrary input state, with h(x) = [`tip_position`](Self::tip_position):
-    /// the squared Euclidean distance between the two tip positions.
-    pub fn discrepancy(&self, xi: &[f64]) -> f64 {
+    /// Squared discrepancy |y − h(xi)|² between an observation `y` (a tip
+    /// position) and the observation of an arbitrary input state, with
+    /// h(x) = [`tip_position`](Self::tip_position): the squared Euclidean
+    /// distance between the two tip positions.
+    pub fn discrepancy(&self, y: &[f64], xi: &[f64]) -> f64 {
         let h = self.tip_position(xi[0], xi[1]);
-        let dx = self.y_obs[0] - h[0];
-        let dy = self.y_obs[1] - h[1];
+        let dx = y[0] - h[0];
+        let dy = y[1] - h[1];
         dx * dx + dy * dy
     }
 
@@ -292,7 +219,7 @@ impl PendulumSystem {
     /// kᵢ = f(x + h Σⱼ aᵢⱼ kⱼ) is solved by Newton's method with the analytic
     /// Jacobian [`rhs_jacobian`]; panics if it does not converge.
     fn gl4_step(&self, x: &[f64; DIM], h: f64) -> [f64; DIM] {
-        super::gl4::gl4_step(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, h)
+        crate::gl4::gl4_step(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, h)
     }
 
     /// Discrete flow map φ: one Gauss–Legendre step of size `dt`.
@@ -301,9 +228,9 @@ impl PendulumSystem {
     }
 
     /// φ(x) together with its exact Jacobian ∂φ/∂x (see
-    /// [`super::gl4::gl4_step_with_jacobian`]).
+    /// [`crate::gl4::gl4_step_with_jacobian`]).
     pub fn flow_with_jacobian(&self, x: &[f64; DIM]) -> ([f64; DIM], [[f64; DIM]; DIM]) {
-        super::gl4::gl4_step_with_jacobian(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, self.dt)
+        crate::gl4::gl4_step_with_jacobian(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, self.dt)
     }
 
     /// Inverse discrete flow map φ⁻¹: one Gauss–Legendre step of size `−dt`.
@@ -320,12 +247,8 @@ impl Model<DIM> for PendulumSystem {
         self.dt
     }
 
-    fn forward(&mut self) {
-        PendulumSystem::forward(self);
-    }
-
-    fn discrepancy(&self, xi: &[f64]) -> f64 {
-        PendulumSystem::discrepancy(self, xi)
+    fn discrepancy(&self, y: &[f64], xi: &[f64]) -> f64 {
+        PendulumSystem::discrepancy(self, y, xi)
     }
 
     fn flow_inv(&self, xi: [f64; DIM]) -> [f64; DIM] {
@@ -340,16 +263,19 @@ impl Model<DIM> for PendulumSystem {
         self.flow_with_jacobian(&xi).1
     }
 
-    fn n_obs(&self) -> usize {
+    /// The two angles live on [−π, π) (the dynamics are 2π-periodic in
+    /// each); the momenta are plain.
+    fn periodic(&self) -> [Option<(f64, f64)>; DIM] {
+        use std::f64::consts::PI;
+        [Some((-PI, PI)), Some((-PI, PI)), None, None]
+    }
+
+    fn obs_dim(&self) -> usize {
         2
     }
 
-    fn h(&self, xi: &[f64]) -> DVector<f64> {
+    fn obs(&self, xi: &[f64]) -> DVector<f64> {
         DVector::from_row_slice(&self.tip_position(xi[0], xi[1]))
-    }
-
-    fn y_obs(&self) -> DVector<f64> {
-        DVector::from_row_slice(&self.y_obs)
     }
 
     /// Jacobian of the tip position with respect to (q₁, q₂, p₁, p₂):
@@ -370,10 +296,6 @@ impl Model<DIM> for PendulumSystem {
     /// same at every step: autonomous.
     fn is_autonomous(&self) -> bool {
         true
-    }
-
-    fn states(&self) -> &[DVector<f64>] {
-        &self.states
     }
 
     fn state_labels(&self) -> Vec<String> {
@@ -400,46 +322,29 @@ mod tests {
         g: 3.7,
     };
 
+    /// Symplectic scheme: the energy error oscillates at O(dt⁴) without
+    /// secular drift; 1e-7 relative comfortably bounds it at dt = 0.01
+    /// over 500 steps (t = 5), at the paper's and at asymmetric parameters.
     #[test]
     fn energy_is_conserved() {
-        let mut sys = PendulumSystem::new(X0, 0.01);
-        for _ in 0..500 {
-            sys.forward(); // 500 steps of dt = 0.01 → t = 5
-        }
-        let h0 = sys.hamiltonian(&X0);
-        for x in &sys.states {
-            let x = std::array::from_fn(|i| x[i]);
-            // Symplectic scheme: energy error oscillates at O(dt⁴) without
-            // secular drift; 1e-7 relative comfortably bounds it at dt = 0.01.
-            assert!(
-                (sys.hamiltonian(&x) - h0).abs() < 1e-7 * h0.abs(),
-                "energy drift: H = {} vs H0 = {h0}",
-                sys.hamiltonian(&x)
-            );
-        }
-    }
-
-    #[test]
-    fn energy_is_conserved_with_custom_params() {
-        let mut sys = PendulumSystem::with_params(ODD_PARAMS, X0, 0.01);
-        for _ in 0..500 {
-            sys.forward();
-        }
-        let h0 = sys.hamiltonian(&X0);
-        for x in &sys.states {
-            let x = std::array::from_fn(|i| x[i]);
-            assert!(
-                (sys.hamiltonian(&x) - h0).abs() < 1e-7 * h0.abs(),
-                "energy drift: H = {} vs H0 = {h0}",
-                sys.hamiltonian(&x)
-            );
+        for sys in [PendulumSystem::new(0.01), PendulumSystem::with_params(ODD_PARAMS, 0.01)] {
+            let h0 = sys.hamiltonian(&X0);
+            let mut x = X0;
+            for _ in 0..500 {
+                x = sys.flow(&x);
+                assert!(
+                    (sys.hamiltonian(&x) - h0).abs() < 1e-7 * h0.abs(),
+                    "energy drift: H = {} vs H0 = {h0}",
+                    sys.hamiltonian(&x)
+                );
+            }
         }
     }
 
     #[test]
     fn jacobian_matches_finite_differences() {
         // Run at asymmetric parameters so every parameter enters the check.
-        let sys = PendulumSystem::with_params(ODD_PARAMS, X0, 0.01);
+        let sys = PendulumSystem::with_params(ODD_PARAMS, 0.01);
         let x = [1.3, -0.7, 0.8, -1.9];
         let jac = sys.rhs_jacobian(&x);
         let eps = 1e-6;
@@ -463,7 +368,7 @@ mod tests {
 
     #[test]
     fn flow_inv_inverts_flow() {
-        let sys = PendulumSystem::new(X0, 0.01);
+        let sys = PendulumSystem::new(0.01);
         let y = sys.flow(&X0);
         let z = sys.flow_inv(&y);
         for i in 0..DIM {

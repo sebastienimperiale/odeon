@@ -3,7 +3,7 @@
 //! observation signal below, then run the filter, the box tracker, the
 //! particles or the tracker on it — on a worker thread of this process.
 //! `observers-client` is the same viewer sending its jobs to an
-//! `observers-server`; `models-viewer` the models without estimators.
+//! `observers-server`.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 

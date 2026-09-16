@@ -36,14 +36,14 @@
 //! their gradients get a zero θ-component.
 //!
 //! Time stepping: the shared symplectic Gauss–Legendre 4 scheme
-//! ([`super::gl4`]) at M = 5, so flow_inv = one step with −dt is exact and
+//! ([`crate::gl4`]) at M = 5, so flow_inv = one step with −dt is exact and
 //! the tracker's Φ = ∂φ/∂x (including the ∂φ/∂θ sensitivity column) comes
 //! from the tangent of the stage system.
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use super::kepler::KeplerObservation;
 use crate::model::Model;
-use crate::noise::{NoiseModel, NoiseSampler};
 use nalgebra::{DMatrix, DVector};
 use std::f64::consts::LN_2;
 
@@ -51,7 +51,8 @@ use std::f64::consts::LN_2;
 pub const DIM: usize = 5;
 
 /// Physical parameters. [`Default`]: μ₀ = 1, a = 0.1.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct KeplerMuParams {
     /// Prior gravitational parameter μ₀; the true value is μ₀·2^θ.
     pub mu0: f64,
@@ -91,8 +92,8 @@ pub fn augmented_state(x: [f64; 4], theta: f64) -> [f64; DIM] {
 ///
 /// // Reference orbit at the true parameter μ = 2^0.4·μ₀:
 /// let x0 = augmented_state(perihelion_state(0.5), 0.4);
-/// let mut sys = KeplerMuSystem::new(x0, 0.01, KeplerObservation::Range);
-/// sys.forward(); // one step: t^0 → t^1 (θ stays 0.4 exactly)
+/// let sys = KeplerMuSystem::new(0.01, KeplerObservation::Range);
+/// let x1 = sys.flow(&x0); // one step: t^0 → t^1 (θ stays 0.4 exactly)
 /// ```
 pub struct KeplerMuSystem {
     // ── Public ───────────────────────────────────────────────────────────────
@@ -101,78 +102,32 @@ pub struct KeplerMuSystem {
     pub params: KeplerMuParams,
     /// Which scalar observation h(x) the system reports.
     pub observation: KeplerObservation,
-    /// Trajectory so far: `states[n]` = (q₁, q₂, p₁, p₂, θ) at t^n; the θ
-    /// component is constant (the reference runs at the true parameter).
-    pub states: Vec<DVector<f64>>,
 
-    // ── Private (observation) ────────────────────────────────────────────────
-    /// Cached observation of the current state, y_n = h(x_n) + η_n (η ≡ 0
-    /// without [`with_obs_noise`](Self::with_obs_noise)).
-    y_obs: f64,
-    /// Observation-noise draws, one per step.
-    noise: NoiseSampler,
 }
 
 impl KeplerMuSystem {
     /// Build the system with the default physical parameters
     /// ([`KeplerMuParams::default`]).
     ///
-    /// * `x0`          — initial state (q₁, q₂, p₁, p₂, θ); the θ component
-    ///   is the *true* log-parameter of the reference trajectory
+    /// The state is (q₁, q₂, p₁, p₂, θ); the θ component of a reference
+    /// trajectory is the *true* log-parameter.
+    ///
     /// * `dt`          — time step
     /// * `observation` — the scalar observation h(x)
-    pub fn new(x0: [f64; DIM], dt: f64, observation: KeplerObservation) -> Self {
-        Self::with_params(KeplerMuParams::default(), x0, dt, observation)
+    pub fn new(dt: f64, observation: KeplerObservation) -> Self {
+        Self::with_params(KeplerMuParams::default(), dt, observation)
     }
 
     /// Build the system from explicit physical parameters (see
     /// [`new`](Self::new) for the other arguments).
-    pub fn with_params(
-        params: KeplerMuParams,
-        x0: [f64; DIM],
-        dt: f64,
-        observation: KeplerObservation,
-    ) -> Self {
-        KeplerMuSystem {
-            dt,
-            params,
-            observation,
-            states: vec![DVector::from_row_slice(&x0)],
-            y_obs: observation.h(&x0),
-            noise: NoiseModel::None.sampler(dt, 0),
-        }
+    pub fn with_params(params: KeplerMuParams, dt: f64, observation: KeplerObservation) -> Self {
+        KeplerMuSystem { dt, params, observation }
     }
 
-    /// Add observation noise: from now on the cached observation is
-    /// y_n = h(x_n) + η_n with η drawn from `noise` (deterministic in
-    /// `seed`). Re-caches the current observation with the first draw, so
-    /// call this right after construction.
-    pub fn with_obs_noise(mut self, noise: NoiseModel, seed: u64) -> Self {
-        self.noise = noise.sampler(self.dt, seed);
-        let x = self.states.last().expect("states holds the initial condition");
-        self.y_obs = self.observation.h(x.as_slice()) + self.noise.next_sample();
-        self
-    }
-
-    /// Forward operator: advance the current state one Gauss–Legendre step,
-    /// t^n → t^{n+1} (θ is exactly conserved).
-    pub fn forward(&mut self) {
-        let x = self
-            .states
-            .last()
-            .expect("states holds the initial condition");
-        let x = std::array::from_fn(|i| x[i]);
-        let x_next = self.gl4_step(&x, self.dt);
-        self.y_obs = self.observation.h(&x_next) + self.noise.next_sample();
-        self.states.push(DVector::from_row_slice(&x_next));
-    }
-
-    /// Squared discrepancy |y_n − h(xi)|² (angular difference for the
+    /// Squared discrepancy |y − h(xi)|² (angular difference for the
     /// bearing), as in [`super::kepler`].
-    pub fn discrepancy(&self, xi: &[f64]) -> f64 {
-        let d = self
-            .observation
-            .difference(self.y_obs, self.observation.h(xi));
+    pub fn discrepancy(&self, y: &[f64], xi: &[f64]) -> f64 {
+        let d = self.observation.difference(y[0], self.observation.h(xi));
         d * d
     }
 
@@ -229,9 +184,9 @@ impl KeplerMuSystem {
     }
 
     /// One step of the fourth-order Gauss–Legendre method (shared solver,
-    /// see [`super::gl4`]).
+    /// see [`crate::gl4`]).
     fn gl4_step(&self, x: &[f64; DIM], h: f64) -> [f64; DIM] {
-        super::gl4::gl4_step(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, h)
+        crate::gl4::gl4_step(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, h)
     }
 
     /// Discrete flow map φ: one Gauss–Legendre step of size `dt`.
@@ -241,9 +196,9 @@ impl KeplerMuSystem {
 
     /// φ(x) together with its exact Jacobian ∂φ/∂x, including the
     /// ∂φ/∂θ sensitivity column the tracker needs (see
-    /// [`super::gl4::gl4_step_with_jacobian`]).
+    /// [`crate::gl4::gl4_step_with_jacobian`]).
     pub fn flow_with_jacobian(&self, x: &[f64; DIM]) -> ([f64; DIM], [[f64; DIM]; DIM]) {
-        super::gl4::gl4_step_with_jacobian(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, self.dt)
+        crate::gl4::gl4_step_with_jacobian(|x| self.rhs(x), |x| self.rhs_jacobian(x), x, self.dt)
     }
 
     /// Inverse discrete flow map φ⁻¹: one Gauss–Legendre step of size `−dt`.
@@ -260,12 +215,8 @@ impl Model<DIM> for KeplerMuSystem {
         self.dt
     }
 
-    fn forward(&mut self) {
-        KeplerMuSystem::forward(self);
-    }
-
-    fn discrepancy(&self, xi: &[f64]) -> f64 {
-        KeplerMuSystem::discrepancy(self, xi)
+    fn discrepancy(&self, y: &[f64], xi: &[f64]) -> f64 {
+        KeplerMuSystem::discrepancy(self, y, xi)
     }
 
     fn flow_inv(&self, xi: [f64; DIM]) -> [f64; DIM] {
@@ -280,16 +231,12 @@ impl Model<DIM> for KeplerMuSystem {
         self.flow_with_jacobian(&xi).1
     }
 
-    fn n_obs(&self) -> usize {
+    fn obs_dim(&self) -> usize {
         1
     }
 
-    fn h(&self, xi: &[f64]) -> DVector<f64> {
+    fn obs(&self, xi: &[f64]) -> DVector<f64> {
         DVector::from_element(1, self.observation.h(xi))
-    }
-
-    fn y_obs(&self) -> DVector<f64> {
-        DVector::from_element(1, self.y_obs)
     }
 
     /// ∇h of the base observations with a zero θ-component (h depends on q
@@ -302,21 +249,13 @@ impl Model<DIM> for KeplerMuSystem {
     }
 
     /// The bearing innovation is the shortest angular difference.
-    fn innovation(&self, xi: &[f64]) -> DVector<f64> {
-        DVector::from_element(
-            1,
-            self.observation
-                .difference(self.y_obs, self.observation.h(xi)),
-        )
+    fn innovation(&self, y: &[f64], xi: &[f64]) -> DVector<f64> {
+        DVector::from_element(1, self.observation.difference(y[0], self.observation.h(xi)))
     }
 
     /// Time-independent flow: autonomous (so the transport plan applies).
     fn is_autonomous(&self) -> bool {
         true
-    }
-
-    fn states(&self) -> &[DVector<f64>] {
-        &self.states
     }
 
     fn state_labels(&self) -> Vec<String> {
@@ -340,12 +279,14 @@ mod tests {
     };
     const ODD_THETA: f64 = -0.6;
 
-    fn run(params: KeplerMuParams, x0: [f64; DIM], dt: f64, steps: usize) -> KeplerMuSystem {
-        let mut sys = KeplerMuSystem::with_params(params, x0, dt, KeplerObservation::Q1);
+    /// The trajectory from `x0` (x0 included) and the system.
+    fn run(params: KeplerMuParams, x0: [f64; DIM], dt: f64, steps: usize) -> (KeplerMuSystem, Vec<[f64; DIM]>) {
+        let sys = KeplerMuSystem::with_params(params, dt, KeplerObservation::Q1);
+        let mut states = vec![x0];
         for _ in 0..steps {
-            sys.forward();
+            states.push(sys.flow(states.last().unwrap()));
         }
-        sys
+        (sys, states)
     }
 
     /// Energy conservation at μ(θ) ≠ μ₀, and θ exactly constant along the
@@ -353,11 +294,10 @@ mod tests {
     #[test]
     fn energy_is_conserved_and_theta_is_constant() {
         let x0 = augmented_state(perihelion_state(0.5), ODD_THETA);
-        let sys = run(ODD_PARAMS, x0, 0.005, 1000);
+        let (sys, states) = run(ODD_PARAMS, x0, 0.005, 1000);
         let h0 = sys.hamiltonian(&x0);
         let l0 = sys.angular_momentum(&x0);
-        for x in &sys.states {
-            let x: [f64; DIM] = std::array::from_fn(|i| x[i]);
+        for x in &states {
             assert!(
                 (sys.hamiltonian(&x) - h0).abs() < 1e-7 * h0.abs(),
                 "energy drift: H = {} vs H0 = {h0}",
@@ -375,12 +315,7 @@ mod tests {
     /// factor — against central finite differences of the rhs.
     #[test]
     fn jacobian_matches_finite_differences() {
-        let sys = KeplerMuSystem::with_params(
-            ODD_PARAMS,
-            augmented_state(perihelion_state(0.0), 0.0),
-            0.01,
-            KeplerObservation::Q1,
-        );
+        let sys = KeplerMuSystem::with_params(ODD_PARAMS, 0.01, KeplerObservation::Q1);
         let x = [0.6, -0.35, 0.8, -1.9, 0.45];
         let jac = sys.rhs_jacobian(&x);
         let eps = 1e-6;
@@ -405,7 +340,7 @@ mod tests {
     #[test]
     fn flow_inv_inverts_flow() {
         let x0 = augmented_state(perihelion_state(0.5), 0.3);
-        let sys = KeplerMuSystem::new(x0, 0.01, KeplerObservation::Range);
+        let sys = KeplerMuSystem::new(0.01, KeplerObservation::Range);
         let y = sys.flow(&x0);
         let z = sys.flow_inv(&y);
         for i in 0..DIM {
@@ -421,11 +356,7 @@ mod tests {
     /// origin (softening) and at extreme θ, where μ is far from μ₀.
     #[test]
     fn flow_is_defined_at_the_origin_and_extreme_theta() {
-        let sys = KeplerMuSystem::new(
-            augmented_state(perihelion_state(0.5), 0.0),
-            0.01,
-            KeplerObservation::Q1,
-        );
+        let sys = KeplerMuSystem::new(0.01, KeplerObservation::Q1);
         for x in [
             [0.0; DIM],
             [0.0, 0.0, 3.0, -3.0, 2.0],
