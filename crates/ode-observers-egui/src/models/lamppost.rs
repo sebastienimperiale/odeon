@@ -44,27 +44,8 @@ impl VizModel for LamppostViz {
         "Lamppost"
     }
 
-    fn description(&self) -> String {
-        "Toy model for multimodality (\"the drunk man\"). A man stands in the plane next to a lamppost at the \
-         origin and does not move (d/dt (x, y) = 0); all that is observed is his squared \
-         distance to the lamppost, x² + y². With the reference at (0, 1) the observation is \
-         constantly 1, and every point of the unit circle explains the data equally well: the \
-         value function is flat on the ring x² + y² = 1 and the density is a ring — a \
-         continuum of maxima.\n\n\
-         The grid filter represents the ring as is (from a flat prior it appears within a few \
-         steps). The tracker, a single Gaussian, cannot: it converges to one point at distance 1, \
-         the one its prior points to, with a confident covariance — the smallest illustration of \
-         what the Gaussian closure loses. The drunkness is in the filter's eyes: with model noise \
-         q > 0 the filter believes the man random-walks, and the diffusion keeps the ring from \
-         collapsing to a curve; with q = 0 it sharpens forever.\n\n\
-         Parameters: initial position (x₀, y₀); walk σ — if > 0 the reference itself \
-         random-walks (Brownian increments of standard deviation σ√dt per step), so the ring must \
-         follow a moving radius.\n\n\
-         State (filter order): x, y. Scene: fixed window [−2, 2]², the lamppost at the origin, \
-         the man and the trace of his walk, and the observed circle of radius √(x² + y²) in the \
-         accent.\n\n\
-         Observation: x² + y², the squared distance to the lamppost."
-            .to_string()
+    fn doc_dest(&self) -> Option<&'static str> {
+        Some("lamppost")
     }
 
     fn params_ui(&mut self, ui: &mut egui::Ui) -> bool {

@@ -47,22 +47,8 @@ impl VizModel for PendulumRodViz {
         "Double pendulum (rigid rods)"
     }
 
-    fn description(&self) -> String {
-        "Planar double compound pendulum: two identical uniform rigid rods of mass m and \
-         length ℓ, pinned end to end below a fixed pivot, gravity g downward (the swaptube \
-         model). The mass is distributed along the rods (moment of inertia mℓ²/3), which \
-         changes the dynamics from the point-mass pendulum. Conservative, chaotic at large \
-         amplitudes; released from rest at the 'heart' preset the tip traces a heart-shaped \
-         orbit.\n\n\
-         Parameters: m — mass of each rod; ℓ — length of each rod; g — gravity.\n\n\
-         State (filter order): q₁, q₂ — angles of the rods from the downward vertical \
-         (radians, periodic on (−π, π)); p₁, p₂ — conjugate momenta.\n\n\
-         Scene: pivot, the two rods (drawn thick, as rigid bodies) and the fading trace of \
-         the free end. The first rod wears the observation accent.\n\n\
-         Observation: cos q₁, the vertical elevation of the first rod. It is even in q₁, \
-         so ±q₁ cannot be told apart from the observation alone — expect bimodal densities \
-         until the dynamics break the symmetry."
-            .to_string()
+    fn doc_dest(&self) -> Option<&'static str> {
+        Some("pendulum_rod")
     }
 
     fn params_ui(&mut self, ui: &mut egui::Ui) -> bool {

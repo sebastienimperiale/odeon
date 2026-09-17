@@ -48,21 +48,8 @@ impl VizModel for PendulumViz {
         "Double pendulum (point masses)"
     }
 
-    fn description(&self) -> String {
-        "Planar double pendulum with point masses (pendulum.pdf §5.2): mass m₁ hangs from \
-         a fixed pivot by a massless rigid rod of length ℓ₁, mass m₂ hangs from m₁ by a rod \
-         of length ℓ₂, gravity g acts downward. Conservative Hamiltonian system; chaotic at \
-         large amplitudes.\n\n\
-         Parameters: ℓ₁, ℓ₂ — rod lengths; m₁, m₂ — masses; g — gravity.\n\n\
-         State (filter order): q₁, q₂ — angles of the rods measured from the downward \
-         vertical (radians, periodic on (−π, π)); p₁, p₂ — the conjugate momenta (not the \
-         angular velocities: p = ∂L/∂q̇, they mix both rods' motion).\n\n\
-         Scene: the pivot at the top, the two rods and the two masses, and the fading trace \
-         of the tip (mass m₂). The tip wears the observation accent.\n\n\
-         Observation: the tip position (x, y) — two scalar series, both functions of the \
-         angles only; the momenta are unobserved and must be recovered by the filter \
-         through the dynamics."
-            .to_string()
+    fn doc_dest(&self) -> Option<&'static str> {
+        Some("pendulum")
     }
 
     fn params_ui(&mut self, ui: &mut egui::Ui) -> bool {

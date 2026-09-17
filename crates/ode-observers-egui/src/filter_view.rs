@@ -14,6 +14,78 @@ const RES: usize = 220;
 /// Color of the tracker overlay (red in both themes, as asked: the tracker
 /// estimate is a foreign object on the density plot, not a plot series).
 pub(crate) const TRACKER_RED: egui::Color32 = egui::Color32::from_rgb(220, 40, 40);
+/// Color of the unscented overlay (blue in both themes, next to the red).
+pub(crate) const UNSCENTED_BLUE: egui::Color32 = egui::Color32::from_rgb(30, 90, 230);
+
+/// An estimate trajectory overlaid on a density view: the path up to the
+/// playback step on the plane (a, b) and its last point.
+pub type EstimatePath = (Vec<[f64; 2]>, [f64; 2]);
+
+/// The estimate of a tracker-kind output up to `step` on plane (a, b): the
+/// path and its last point (the run may be shorter than the density's:
+/// clipped to its own history).
+pub(crate) fn estimate_path(out: Option<&TrackerOutput>, step: usize, (a, b): (usize, usize)) -> Option<EstimatePath> {
+    out.map(|t| {
+        let clip = step.min(t.estimates.len().saturating_sub(1));
+        let last = &t.estimates[clip];
+        (t.estimates[..=clip].iter().map(|e| [e[a], e[b]]).collect(), [last[a], last[b]])
+    })
+}
+
+/// Draw an estimate path as a line with a diamond at its last point.
+pub(crate) fn draw_estimate(plot_ui: &mut egui_plot::PlotUi, name: &str, color: egui::Color32, path: Option<EstimatePath>) {
+    if let Some((path, last)) = path {
+        plot_ui.line(egui_plot::Line::new(name, path).color(color).width(1.5));
+        plot_ui.points(
+            egui_plot::Points::new("", vec![last])
+                .radius(4.0)
+                .shape(egui_plot::MarkerShape::Diamond)
+                .color(color),
+        );
+    }
+}
+
+/// The two estimate overlays a density view can draw: the tracker's (red)
+/// and the unscented closure's (blue), each when its run exists and its
+/// checkbox is on.
+#[derive(Clone, Copy, Default)]
+pub struct Overlays<'a> {
+    pub tracker: Option<&'a TrackerOutput>,
+    pub unscented: Option<&'a TrackerOutput>,
+}
+
+impl Overlays<'_> {
+    /// The checkboxes of the two overlays (disabled without a run).
+    pub fn checkboxes(&self, ui: &mut egui::Ui, show_tracker: &mut bool, show_unscented: &mut bool) {
+        ui.add_enabled(self.tracker.is_some(), egui::Checkbox::new(show_tracker, "tracker x̂"))
+            .on_hover_text(if self.tracker.is_some() {
+                "Overlay the tracker's estimate x̂(t) up to the playback time, in red \
+                 (the Gaussian closure's single mode, to compare with the density)"
+            } else {
+                "Run the tracker to overlay its estimate"
+            });
+        ui.add_enabled(self.unscented.is_some(), egui::Checkbox::new(show_unscented, "unscented x̄"))
+            .on_hover_text(if self.unscented.is_some() {
+                "Overlay the unscented closure's centre x̄(t) up to the playback time, in blue"
+            } else {
+                "Run the unscented closure to overlay its centre"
+            });
+    }
+
+    /// The paths to draw at `step` on plane `pair`, given the toggles.
+    pub fn paths(&self, show_tracker: bool, show_unscented: bool, step: usize, pair: (usize, usize)) -> [Option<EstimatePath>; 2] {
+        [
+            estimate_path(self.tracker.filter(|_| show_tracker), step, pair),
+            estimate_path(self.unscented.filter(|_| show_unscented), step, pair),
+        ]
+    }
+
+    /// Draw the paths of [`paths`](Self::paths).
+    pub fn draw(plot_ui: &mut egui_plot::PlotUi, [tracker, unscented]: [Option<EstimatePath>; 2]) {
+        draw_estimate(plot_ui, "tracker x̂", TRACKER_RED, tracker);
+        draw_estimate(plot_ui, "unscented x̄", UNSCENTED_BLUE, unscented);
+    }
+}
 
 /// Persistent state of the filter view: pane count, per-pane plane choice,
 /// the tracker-overlay toggle, and the texture cache (keyed by snapshot ×
@@ -23,16 +95,32 @@ pub struct FilterView {
     /// Draw the tracker's estimate x̂(t) on top of the density when a
     /// tracker run is available.
     pub show_tracker: bool,
+    /// Draw the unscented closure's centre x̄(t) on top of the density when
+    /// an unscented run is available.
+    pub show_unscented: bool,
     /// Show an additional pane with the tracker's Gaussian density on a
     /// plane of its own, when a tracker run is available.
     pub show_tracker_density: bool,
+    /// Show an additional pane with the unscented closure's Gaussian
+    /// density on a plane of its own, when an unscented run is available.
+    pub show_unscented_density: bool,
+    /// Draw the 1σ and 2σ contours of the tracker's Gaussian on every
+    /// pane, when a tracker run is available.
+    pub show_tracker_contours: bool,
+    /// Draw the 1σ and 2σ contours of the unscented closure's Gaussian on
+    /// every pane, when an unscented run is available — the comparison
+    /// of the closure with the filter's density on one plot.
+    pub show_unscented_contours: bool,
     /// Color-scale focus, see [`ColorFocus`].
     pub focus: ColorFocus,
     plane: [usize; 2],
     tracker_plane: usize,
+    unscented_plane: usize,
     cache: HashMap<(usize, usize), egui::TextureHandle>,
     /// Tracker-density textures, keyed by (tracker step, plane).
     tracker_cache: HashMap<(usize, usize), egui::TextureHandle>,
+    /// Unscented-density textures, keyed by (step, plane).
+    unscented_cache: HashMap<(usize, usize), egui::TextureHandle>,
     /// The color floor the cached textures were built with.
     cached_floor: f64,
 }
@@ -42,12 +130,18 @@ impl Default for FilterView {
         FilterView {
             n_panes: 2,
             show_tracker: true,
+            show_unscented: true,
             show_tracker_density: true,
+            show_unscented_density: true,
+            show_tracker_contours: false,
+            show_unscented_contours: true,
             focus: ColorFocus::default(),
             plane: [0, 1],
             tracker_plane: 0,
+            unscented_plane: 0,
             cache: HashMap::new(),
             tracker_cache: HashMap::new(),
+            unscented_cache: HashMap::new(),
             cached_floor: 0.0,
         }
     }
@@ -92,6 +186,7 @@ impl FilterView {
     pub fn clear_cache(&mut self) {
         self.cache.clear();
         self.tracker_cache.clear();
+        self.unscented_cache.clear();
     }
 
     /// Drop the cached textures if the color floor changed since they were
@@ -109,22 +204,34 @@ impl FilterView {
         self.tracker_cache.clear();
     }
 
+    /// Drop the cached unscented-density textures (a new run arrived).
+    pub fn clear_unscented_cache(&mut self) {
+        self.unscented_cache.clear();
+    }
+
     /// Forget cached textures and reset the pane planes for a fresh output.
     pub fn reset(&mut self, out: &FilterOutput) {
         self.clear_cache();
         self.plane = [0, 1.min(out.pairs.len().saturating_sub(1))];
         self.tracker_plane = 0;
+        self.unscented_plane = 0;
         self.n_panes = self.n_panes.clamp(1, 2);
     }
 
     /// Render the view; `step` is the current playback step (used to pick
     /// the nearest stored snapshot and to clip the overlay trajectories).
-    /// `tracker`, when a tracker run exists, is overlaid as the estimate
+    /// The tracker's run, when it exists, is overlaid as the estimate
     /// trajectory x̂(t) in red if `show_tracker` is on, and shown as an
     /// additional pane — the Gaussian density of the closure on a chosen
-    /// plane — if `show_tracker_density` is on. The plots are locked to
-    /// the filter's domain box.
-    pub fn ui(&mut self, ui: &mut egui::Ui, out: &FilterOutput, tracker: Option<&TrackerOutput>, step: usize) {
+    /// plane — if `show_tracker_density` is on; the unscented closure's
+    /// centre is overlaid in blue if `show_unscented` is on, its Gaussian
+    /// density shown as a pane of its own if `show_unscented_density` is
+    /// on, and the 1σ / 2σ contours of either Gaussian drawn on every pane
+    /// if the `*_contours` toggles are on — the filter's density and the
+    /// closure's on one plot. The plots are locked to the filter's domain
+    /// box.
+    pub fn ui(&mut self, ui: &mut egui::Ui, out: &FilterOutput, overlays: Overlays, step: usize) {
+        let (tracker, unscented) = (overlays.tracker, overlays.unscented);
         if out.pairs.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label("No 2D plane was stored by this filter run.");
@@ -147,13 +254,7 @@ impl FilterView {
                 out.saved_steps.len(),
             ));
             ui.separator();
-            ui.add_enabled(tracker.is_some(), egui::Checkbox::new(&mut self.show_tracker, "tracker x̂"))
-                .on_hover_text(if tracker.is_some() {
-                    "Overlay the tracker's estimate x̂(t) up to the playback time, in red \
-                     (the Gaussian closure's single mode, to compare with the density)"
-                } else {
-                    "Run the tracker to overlay its estimate on the density"
-                });
+            overlays.checkboxes(ui, &mut self.show_tracker, &mut self.show_unscented);
             ui.add_enabled(
                 tracker.is_some(),
                 egui::Checkbox::new(&mut self.show_tracker_density, "tracker density"),
@@ -166,21 +267,46 @@ impl FilterView {
             } else {
                 "Run the tracker to show its Gaussian density next to the filter's"
             });
+            ui.add_enabled(
+                unscented.is_some(),
+                egui::Checkbox::new(&mut self.show_unscented_density, "unscented density"),
+            )
+            .on_hover_text(if unscented.is_some() {
+                "Additional pane: the Gaussian of the unscented closure at the playback time, \
+                 p ∝ exp(−½ (x−x̄)ᵀ Σ⁻¹ (x−x̄)) with Σ = εP its width, max-marginalized on the \
+                 selected plane and normalized by its max, like the filter's snapshots"
+            } else {
+                "Run the unscented closure to show its Gaussian density next to the filter's"
+            });
+            ui.separator();
+            ui.add_enabled(tracker.is_some(), egui::Checkbox::new(&mut self.show_tracker_contours, "tracker σ"))
+                .on_hover_text("Draw the 1σ (dashed) and 2σ contours of the tracker's Gaussian on every pane, in red");
+            ui.add_enabled(unscented.is_some(), egui::Checkbox::new(&mut self.show_unscented_contours, "unscented σ"))
+                .on_hover_text(
+                    "Draw the 1σ (dashed) and 2σ contours of the unscented closure's Gaussian on every \
+                     pane, in blue — to compare the closure with the filter's density on one plot",
+                );
             ui.separator();
             self.focus.ui(ui);
         });
         self.sync_floor();
-        let overlay = if self.show_tracker { tracker } else { None };
-        let density = if self.show_tracker_density { tracker } else { None };
+        let gaussians: Vec<(Gaussian, &TrackerOutput)> = [
+            (Gaussian::Tracker, tracker.filter(|_| self.show_tracker_density)),
+            (Gaussian::Unscented, unscented.filter(|_| self.show_unscented_density)),
+        ]
+        .into_iter()
+        .filter_map(|(k, o)| o.map(|o| (k, o)))
+        .collect();
 
         let n = self.n_panes.clamp(1, 2).min(out.pairs.len());
-        let n_cols = n + usize::from(density.is_some());
+        let n_cols = n + gaussians.len();
         ui.columns(n_cols, |cols| {
             for (i, col) in cols.iter_mut().enumerate() {
                 if i < n {
-                    self.pane(col, out, overlay, i, snap, step);
-                } else if let Some(t) = density {
-                    self.tracker_pane(col, out, t, overlay, step);
+                    self.pane(col, out, overlays, i, snap, step);
+                } else {
+                    let (kind, gauss) = gaussians[i - n];
+                    self.gaussian_pane(col, out, kind, gauss, overlays, step);
                 }
             }
         });
@@ -206,18 +332,20 @@ impl FilterView {
         *sel
     }
 
-    /// Tracker estimate up to the playback step, on plane (a, b): the path
-    /// and its last point (the tracker run may have a different length than
-    /// the filter's: clip to its own history).
-    fn tracker_path(tracker: Option<&TrackerOutput>, step: usize, (a, b): (usize, usize)) -> Option<(egui_plot::PlotPoints<'static>, [f64; 2])> {
-        tracker.map(|t| {
-            let clip_t = step.min(t.estimates.len().saturating_sub(1));
-            let last = &t.estimates[clip_t];
-            (
-                t.estimates[..=clip_t].iter().map(|e| [e[a], e[b]]).collect(),
-                [last[a], last[b]],
-            )
-        })
+    /// The overlay paths at `step` on `pair`, per the view's toggles.
+    fn paths(&self, overlays: Overlays, step: usize, pair: (usize, usize)) -> [Option<EstimatePath>; 2] {
+        overlays.paths(self.show_tracker, self.show_unscented, step, pair)
+    }
+
+    /// The σ-contours to draw at `step` on `plane`, per the view's toggles.
+    fn contours(&self, out: &FilterOutput, overlays: Overlays, step: usize, plane: usize) -> Vec<Contour> {
+        [
+            (Gaussian::Tracker, overlays.tracker.filter(|_| self.show_tracker_contours)),
+            (Gaussian::Unscented, overlays.unscented.filter(|_| self.show_unscented_contours)),
+        ]
+        .into_iter()
+        .filter_map(|(kind, g)| g.and_then(|g| gaussian_contours(out, g, step, plane).map(|rings| Contour { kind, rings })))
+        .collect()
     }
 
     /// A filter pane: the max-marginal snapshot of the selected plane.
@@ -225,7 +353,7 @@ impl FilterView {
         &mut self,
         ui: &mut egui::Ui,
         out: &FilterOutput,
-        tracker: Option<&TrackerOutput>,
+        overlays: Overlays,
         pane: usize,
         snap: usize,
         step: usize,
@@ -239,47 +367,137 @@ impl FilterView {
                 ui.ctx().load_texture(format!("p2d_{snap}_{plane}"), image, egui::TextureOptions::LINEAR)
             })
             .clone();
-        let path = Self::tracker_path(tracker, step, out.pairs[plane]);
-        draw_plane(ui, out, plane, &tex, path, step, ("filter_plot", pane));
+        let paths = self.paths(overlays, step, out.pairs[plane]);
+        let contours = self.contours(out, overlays, step, plane);
+        draw_plane(ui, out, plane, &tex, paths, &contours, step, ("filter_plot", pane));
     }
 
-    /// The tracker pane: the Gaussian density of the closure at the
-    /// playback step, on its own selected plane.
-    fn tracker_pane(
+    /// A Gaussian pane: the density of a closure (the tracker's or the
+    /// unscented one's) at the playback step, on its own selected plane.
+    fn gaussian_pane(
         &mut self,
         ui: &mut egui::Ui,
         out: &FilterOutput,
-        tracker: &TrackerOutput,
-        overlay: Option<&TrackerOutput>,
+        kind: Gaussian,
+        gauss: &TrackerOutput,
+        overlays: Overlays,
         step: usize,
     ) {
+        let (label, id) = match kind {
+            Gaussian::Tracker => ("tracker density", "tracker"),
+            Gaussian::Unscented => ("unscented density", "unscented"),
+        };
+        let plane_sel = match kind {
+            Gaussian::Tracker => &mut self.tracker_plane,
+            Gaussian::Unscented => &mut self.unscented_plane,
+        };
         ui.horizontal(|ui| {
-            Self::plane_selector(ui, out, &mut self.tracker_plane, "tracker_density_plane");
-            ui.small("tracker density");
+            Self::plane_selector(ui, out, plane_sel, (id, "density_plane"));
+            ui.small(label);
         });
-        let plane = self.tracker_plane;
-        let step_t = step.min(tracker.estimates.len().saturating_sub(1));
-        let tex = self
-            .tracker_cache
-            .entry((step_t, plane))
+        let plane = *plane_sel;
+        let step_g = step.min(gauss.estimates.len().saturating_sub(1));
+        let floor = self.focus.floor();
+        let cache = match kind {
+            Gaussian::Tracker => &mut self.tracker_cache,
+            Gaussian::Unscented => &mut self.unscented_cache,
+        };
+        let tex = cache
+            .entry((step_g, plane))
             .or_insert_with(|| {
-                let image = tracker_image(out, tracker, step_t, plane, self.focus.floor());
-                ui.ctx().load_texture(format!("tracker2d_{step_t}_{plane}"), image, egui::TextureOptions::LINEAR)
+                let image = tracker_image(out, gauss, step_g, plane, floor);
+                ui.ctx().load_texture(format!("{id}2d_{step_g}_{plane}"), image, egui::TextureOptions::LINEAR)
             })
             .clone();
-        let path = Self::tracker_path(overlay, step, out.pairs[plane]);
-        draw_plane(ui, out, plane, &tex, path, step, "tracker_density_plot");
+        let paths = self.paths(overlays, step, out.pairs[plane]);
+        let contours = self.contours(out, overlays, step, plane);
+        draw_plane(ui, out, plane, &tex, paths, &contours, step, (id, "density_plot"));
     }
 }
 
+/// Which Gaussian closure a pane or a contour belongs to.
+#[derive(Clone, Copy, PartialEq)]
+enum Gaussian {
+    Tracker,
+    Unscented,
+}
+
+impl Gaussian {
+    fn color(self) -> egui::Color32 {
+        match self {
+            Gaussian::Tracker => TRACKER_RED,
+            Gaussian::Unscented => UNSCENTED_BLUE,
+        }
+    }
+    fn contour_name(self) -> &'static str {
+        match self {
+            Gaussian::Tracker => "tracker 2σ",
+            Gaussian::Unscented => "unscented 2σ",
+        }
+    }
+}
+
+/// The 1σ and 2σ contours of one Gaussian on a plane, as closed rings.
+struct Contour {
+    kind: Gaussian,
+    rings: [Vec<[f64; 2]>; 2],
+}
+
+/// The 1σ and 2σ ellipses of a closure's Gaussian on plane (a, b) at
+/// `step`: x̄ + k·L (cos θ, sin θ) with L Lᵀ = εP_ab the plane's block of
+/// the density's covariance (the same block the pane's image uses), k = 1,
+/// 2; on a periodic direction the centre is taken to its image inside the
+/// domain. `None` while the covariance is undefined or the block
+/// degenerate.
+fn gaussian_contours(out: &FilterOutput, gauss: &TrackerOutput, step: usize, plane: usize) -> Option<[Vec<[f64; 2]>; 2]> {
+    let (a, b) = out.pairs[plane];
+    let m = out.labels.len();
+    let step = step.min(gauss.estimates.len().saturating_sub(1));
+    let p = gauss.covariances[step].as_ref()?;
+    let eps = gauss.eps;
+    let (caa, cab, cbb) = (eps * p[a * m + a], eps * p[a * m + b], eps * p[b * m + b]);
+    if !(caa > 0.0) || caa * cbb - cab * cab <= 0.0 {
+        return None;
+    }
+    // Cholesky of the 2×2 block.
+    let l11 = caa.sqrt();
+    let l21 = cab / l11;
+    let l22 = (cbb - l21 * l21).sqrt();
+    let e = &gauss.estimates[step];
+    let centre = |d: usize, u: f64| {
+        if out.periodic[d] {
+            let (lo, hi) = out.domain[d];
+            lo + (u - lo).rem_euclid(hi - lo)
+        } else {
+            u
+        }
+    };
+    let (ca, cb) = (centre(a, e[a]), centre(b, e[b]));
+    const N: usize = 72;
+    let ring = |k: f64| -> Vec<[f64; 2]> {
+        let mut pts: Vec<[f64; 2]> = (0..N)
+            .map(|i| {
+                let th = i as f64 * std::f64::consts::TAU / N as f64;
+                let (c, s) = (th.cos(), th.sin());
+                [ca + k * l11 * c, cb + k * (l21 * c + l22 * s)]
+            })
+            .collect();
+        pts.push(pts[0]); // closed exactly
+        pts
+    };
+    Some([ring(1.0), ring(2.0)])
+}
+
 /// Draw one plane: the heatmap `tex` over the filter's domain box, the
-/// filter's mesh, the reference up to `step`, and the optional tracker path.
+/// filter's mesh, the reference up to `step`, the estimate overlays and
+/// the σ-contours of the closures.
 fn draw_plane(
     ui: &mut egui::Ui,
     out: &FilterOutput,
     plane: usize,
     tex: &egui::TextureHandle,
-    tracker_path: Option<(egui_plot::PlotPoints<'static>, [f64; 2])>,
+    paths: [Option<EstimatePath>; 2],
+    contours: &[Contour],
     step: usize,
     id: impl std::hash::Hash + std::fmt::Debug,
 ) {
@@ -332,15 +550,17 @@ fn draw_plane(
             plot_ui.line(egui_plot::Line::new("reference", reference).color(neutral).width(1.5));
             let s = &out.reference[clip];
             plot_ui.points(egui_plot::Points::new("", vec![[s[a], s[b]]]).radius(4.0).color(neutral));
-            if let Some((path, last)) = tracker_path {
-                plot_ui.line(egui_plot::Line::new("tracker x̂", path).color(TRACKER_RED).width(1.5));
-                plot_ui.points(
-                    egui_plot::Points::new("", vec![last])
-                        .radius(4.0)
-                        .shape(egui_plot::MarkerShape::Diamond)
-                        .color(TRACKER_RED),
+            for c in contours {
+                let [one, two] = &c.rings;
+                plot_ui.line(
+                    egui_plot::Line::new("", one.clone())
+                        .color(c.kind.color())
+                        .width(1.0)
+                        .style(egui_plot::LineStyle::dashed_dense()),
                 );
+                plot_ui.line(egui_plot::Line::new(c.kind.contour_name(), two.clone()).color(c.kind.color()).width(1.5));
             }
+            Overlays::draw(plot_ui, paths);
         });
 }
 
@@ -608,6 +828,41 @@ mod tests {
         let flat = TrackerOutput { covariances: vec![None], ..tracker };
         let img = tracker_image(&out, &flat, 0, 0, 0.0);
         assert!(img.pixels.iter().all(|&px| close(px, colormap(1.0))));
+    }
+
+    /// The σ-contours of a closure's Gaussian on the plane are the level
+    /// sets ξᵀ (εP_ab)⁻¹ ξ = k² of the same quadratic form the pane's image
+    /// uses, k = 1, 2, closed rings around the centre; on a periodic
+    /// direction the centre is taken inside the domain; undefined
+    /// covariance ⇒ no contour.
+    #[test]
+    fn gaussian_contours_are_the_sigma_level_sets() {
+        let out = make_out([4, 4], [3, 3], [false, true], [(-2.0, 2.0), (-2.0, 2.0)]);
+        let eps = 0.5;
+        let p = vec![0.5, 0.1, 0.1, 2.0];
+        let gauss = TrackerOutput {
+            dt: 0.1,
+            eps,
+            labels: vec!["a".into(), "b".into()],
+            estimates: vec![vec![0.25, 2.5]], // b periodic on (−2, 2): image at −1.5
+            covariances: vec![Some(p.clone())],
+            reference: vec![vec![0.0, 0.0]],
+        };
+        let rings = gaussian_contours(&out, &gauss, 0, 0).expect("defined covariance");
+        let (caa, cab, cbb) = (eps * p[0], eps * p[1], eps * p[3]);
+        let det = caa * cbb - cab * cab;
+        for (k, ring) in rings.iter().enumerate() {
+            let k = (k + 1) as f64;
+            assert_eq!(ring.len(), 73);
+            assert_eq!(ring[0], ring[72], "the ring is closed");
+            for pt in ring {
+                let (u, w) = (pt[0] - 0.25, pt[1] + 1.5);
+                let q = (cbb * u * u - 2.0 * cab * u * w + caa * w * w) / det;
+                assert!((q - k * k).abs() < 1e-9, "point {pt:?} at q = {q}, expected {}", k * k);
+            }
+        }
+        let flat = TrackerOutput { covariances: vec![None], ..gauss };
+        assert!(gaussian_contours(&out, &flat, 0, 0).is_none());
     }
 
     /// A spectral-element axis with the run's global numbering (shared

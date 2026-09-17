@@ -16,7 +16,7 @@
 //! eframe boilerplate.
 
 use crate::box_view::BoxView;
-use crate::filter_view::FilterView;
+use crate::filter_view::{FilterView, Overlays};
 use crate::panels;
 use crate::particles_view::ParticlesView;
 use crate::tracker_view;
@@ -32,8 +32,8 @@ use ode_observers::jobs::{
 };
 
 /// What the central panel shows: the animated model scene, the filter's
-/// density heatmaps, the translating window's density, the particles, or
-/// the tracker's component plots.
+/// density heatmaps, the translating window's density, the particles, the
+/// tracker's component plots, or the unscented closure's.
 #[derive(Clone, Copy, PartialEq)]
 enum CentralView {
     Scene,
@@ -41,6 +41,7 @@ enum CentralView {
     Window,
     Particles,
     Tracker,
+    Unscented,
 }
 
 /// The typed runner of `ode_observers::jobs` a backend may execute locally
@@ -143,6 +144,9 @@ struct Slot {
     tracker_run: Option<Box<dyn EstimatorRun<TrackerOutput>>>,
     /// Outputs of the last completed tracker run.
     tracker_out: Option<TrackerOutput>,
+    unscented_run: Option<Box<dyn EstimatorRun<TrackerOutput>>>,
+    /// Outputs of the last completed unscented run (the tracker's kind).
+    unscented_out: Option<TrackerOutput>,
     box_run: Option<Box<dyn EstimatorRun<BoxOutput>>>,
     /// Outputs of the last completed translating-window run.
     box_out: Option<BoxOutput>,
@@ -166,6 +170,8 @@ impl Slot {
             filter_out: None,
             tracker_run: None,
             tracker_out: None,
+            unscented_run: None,
+            unscented_out: None,
             box_run: None,
             box_out: None,
             particle_run: None,
@@ -181,6 +187,7 @@ impl Slot {
     fn estimating(&self) -> bool {
         self.filter_run.is_some()
             || self.tracker_run.is_some()
+            || self.unscented_run.is_some()
             || self.box_run.is_some()
             || self.particle_run.is_some()
     }
@@ -188,6 +195,7 @@ impl Slot {
     fn cancel_estimators(&mut self) {
         self.filter_run = None;
         self.tracker_run = None;
+        self.unscented_run = None;
         self.box_run = None;
         self.particle_run = None;
     }
@@ -201,6 +209,7 @@ impl Slot {
         self.cancel_estimators();
         self.filter_out = None;
         self.tracker_out = None;
+        self.unscented_out = None;
         self.box_out = None;
         self.particle_out = None;
         self.filter_view.clear_cache();
@@ -269,6 +278,12 @@ impl<C: Compute> App<C> {
                 slot.tracker_out = Some(out);
                 slot.base.playback.restart();
             }
+            if let Some(out) = collect(&mut slot.unscented_run, &mut slot.run_error) {
+                slot.view = CentralView::Unscented;
+                slot.filter_view.clear_unscented_cache();
+                slot.unscented_out = Some(out);
+                slot.base.playback.restart();
+            }
             if let Some(out) = collect(&mut slot.box_run, &mut slot.run_error) {
                 slot.box_view.reset(&out);
                 slot.view = CentralView::Window;
@@ -330,7 +345,7 @@ impl<C: Compute> App<C> {
                             slot.filter_cfg = None;
                         }
                         panels::estimator_selector(ui, &mut slot.estimator);
-                        let is_tracker = slot.estimator == Estimator::Tracker;
+                        let is_tracker = matches!(slot.estimator, Estimator::Tracker | Estimator::Unscented);
                         let is_window = slot.estimator == Estimator::Window;
                         let obs_ok = slot.base.model.obs_selected().iter().any(|&s| s);
                         let steps = slot.base.steps();
@@ -370,7 +385,7 @@ impl<C: Compute> App<C> {
                             } else if !domains_ok {
                                 "Each domain needs min < max"
                             } else if !prior_ok {
-                                "The window needs σ > 0 in every direction (a mode to follow)"
+                                "This estimator needs σ > 0 in every direction (a Gaussian to follow)"
                             } else {
                                 "Run a simulation first"
                             })
@@ -407,6 +422,10 @@ impl<C: Compute> App<C> {
                                     slot.tracker_run =
                                         Some(compute.spawn(job, twin, jobs::run_tracker_spec));
                                 }
+                                Estimator::Unscented => {
+                                    slot.unscented_run =
+                                        Some(compute.spawn(job, twin, jobs::run_unscented_spec));
+                                }
                             }
                         }
                         if let Some(out) = &slot.filter_out {
@@ -422,22 +441,19 @@ impl<C: Compute> App<C> {
                 // Progress of a running estimator — outside the frozen
                 // region, so it renders at full strength.
                 let sel = &self.slots[self.selected];
-                let running: Option<(f32, f64, &str)> =
-                    match (&sel.filter_run, &sel.tracker_run, &sel.box_run, &sel.particle_run) {
-                        (Some(f), _, _, _) => {
-                            Some((f.progress(), f.elapsed(), panels::running_text(Estimator::Filter)))
-                        }
-                        (_, Some(t), _, _) => {
-                            Some((t.progress(), t.elapsed(), panels::running_text(Estimator::Tracker)))
-                        }
-                        (_, _, Some(b), _) => {
-                            Some((b.progress(), b.elapsed(), panels::running_text(Estimator::Window)))
-                        }
-                        (_, _, _, Some(p)) => {
-                            Some((p.progress(), p.elapsed(), panels::running_text(Estimator::Particles)))
-                        }
-                        _ => None,
-                    };
+                let running: Option<(f32, f64, &str)> = if let Some(f) = &sel.filter_run {
+                    Some((f.progress(), f.elapsed(), panels::running_text(Estimator::Filter)))
+                } else if let Some(t) = &sel.tracker_run {
+                    Some((t.progress(), t.elapsed(), panels::running_text(Estimator::Tracker)))
+                } else if let Some(u) = &sel.unscented_run {
+                    Some((u.progress(), u.elapsed(), panels::running_text(Estimator::Unscented)))
+                } else if let Some(b) = &sel.box_run {
+                    Some((b.progress(), b.elapsed(), panels::running_text(Estimator::Window)))
+                } else {
+                    sel.particle_run
+                        .as_ref()
+                        .map(|p| (p.progress(), p.elapsed(), panels::running_text(Estimator::Particles)))
+                };
                 if let Some((progress, elapsed, text)) = running {
                     ui.add_space(4.0);
                     if panels::progress_ui(ui, progress, elapsed, text) {
@@ -474,6 +490,7 @@ impl<C: Compute> App<C> {
             // View tabs, shown once an estimator output exists.
             if slot.filter_out.is_some()
                 || slot.tracker_out.is_some()
+                || slot.unscented_out.is_some()
                 || slot.box_out.is_some()
                 || slot.particle_out.is_some()
             {
@@ -492,6 +509,9 @@ impl<C: Compute> App<C> {
                     if slot.tracker_out.is_some() {
                         ui.selectable_value(&mut slot.view, CentralView::Tracker, "Tracker");
                     }
+                    if slot.unscented_out.is_some() {
+                        ui.selectable_value(&mut slot.view, CentralView::Unscented, "Unscented");
+                    }
                     if slot.view == CentralView::Filter && n_pairs > 1 {
                         ui.separator();
                         ui.selectable_value(&mut slot.filter_view.n_panes, 1, "1 panel");
@@ -506,27 +526,36 @@ impl<C: Compute> App<C> {
                 && let Some(out) = &slot.filter_out
             {
                 let step = (t / out.dt).round().max(0.0) as usize;
-                slot.filter_view.ui(ui, out, slot.tracker_out.as_ref(), step);
+                let overlays = Overlays { tracker: slot.tracker_out.as_ref(), unscented: slot.unscented_out.as_ref() };
+                slot.filter_view.ui(ui, out, overlays, step);
                 return;
             }
             if slot.view == CentralView::Window
                 && let Some(out) = &slot.box_out
             {
                 let step = (t / out.window.dt).round().max(0.0) as usize;
-                slot.box_view.ui(ui, out, slot.tracker_out.as_ref(), step);
+                let overlays = Overlays { tracker: slot.tracker_out.as_ref(), unscented: slot.unscented_out.as_ref() };
+                slot.box_view.ui(ui, out, overlays, step);
                 return;
             }
             if slot.view == CentralView::Particles
                 && let Some(out) = &slot.particle_out
             {
                 let step = (t / out.dt).round().max(0.0) as usize;
-                slot.particles_view.ui(ui, out, slot.tracker_out.as_ref(), step);
+                let overlays = Overlays { tracker: slot.tracker_out.as_ref(), unscented: slot.unscented_out.as_ref() };
+                slot.particles_view.ui(ui, out, overlays, step);
                 return;
             }
             if slot.view == CentralView::Tracker
                 && let Some(out) = &slot.tracker_out
             {
                 tracker_view::ui(ui, out, t);
+                return;
+            }
+            if slot.view == CentralView::Unscented
+                && let Some(out) = &slot.unscented_out
+            {
+                tracker_view::ui_as(ui, out, t, "unscented x̄", 1);
                 return;
             }
 

@@ -1,4 +1,4 @@
-//! The estimation methods — four observers of one density p = exp(−V/ε),
+//! The estimation methods — five observers of one density p = exp(−V/ε),
 //! sharing the same cycle (observation → transport → diffusion) and the
 //! same [`Model`](ode_models::model::Model) contract:
 //!
@@ -9,6 +9,9 @@
 //! * [`kalman`]           — the second-order (Gaussian) closure: one state
 //!   and its curvature, the minimum-energy estimator, i.e. the extended
 //!   Kalman filter in information form.
+//! * [`unscented_kalman`] — the unscented closure: the same Gaussian
+//!   matched by its integrals, computed by a quadrature rule at a few
+//!   points of the exact flow — no Jacobian.
 //! * [`fleming_viot`]     — the Fleming–Viot-type particle approximation.
 //!
 //! Each takes the observation of the step as an argument of its `forward`
@@ -23,11 +26,12 @@ pub mod fleming_viot;
 pub mod kalman;
 pub mod mortensen;
 pub mod mortensen_window;
+pub mod unscented_kalman;
 
 use ode_models_spec::progress::Progress;
 use ode_models_spec::reference::Reference;
 
-/// The common surface of the four estimators. Every method keeps its own
+/// The common surface of the five estimators. Every method keeps its own
 /// richer interface (the filter's density, the tracker's curvature, the
 /// window's shifts, the particles' cloud); this is the part a driver can
 /// use without knowing which method it holds.
@@ -71,6 +75,7 @@ mod tests {
     use crate::methods::kalman::{MortensenTracker, TrackerParams};
     use crate::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
     use crate::methods::mortensen_window::{BoxTracker, BoxTrackerParams};
+    use crate::methods::unscented_kalman::{Quadrature, UnscentedParams, UnscentedTracker};
     use ode_models::models::SpringSystem;
     use ode_models_spec::noise::NoiseModel;
 
@@ -78,7 +83,7 @@ mod tests {
         SpringSystem::new(1, 1.0, 1.0, dt, |x: &[f64]| x[0])
     }
 
-    /// The four methods behind one trait: started off the reference with
+    /// The five methods behind one trait: started off the reference with
     /// the same Gaussian prior and driven along the same noisy
     /// observations (observation weight γ = 20, so that the particles'
     /// killing selects within the run) by the provided `run`, each one's
@@ -121,6 +126,10 @@ mod tests {
             },
         );
         let tracker = MortensenTracker::<2, _>::new(spring(dt), TrackerParams { q_diag: q, gamma: 20.0 });
+        let unscented = UnscentedTracker::<2, _>::new(
+            spring(dt),
+            UnscentedParams { q_diag: q, gamma: 20.0, eps: 0.05, rule: Quadrature::DEFAULT },
+        );
         let particles = ParticleSystem::<2, _>::new(
             spring(dt),
             ParticleParams {
@@ -140,6 +149,7 @@ mod tests {
             ("filter", Box::new(filter)),
             ("window", Box::new(window)),
             ("tracker", Box::new(tracker)),
+            ("unscented", Box::new(unscented)),
             ("particles", Box::new(particles)),
         ];
         for (name, mut o) in observers {
@@ -153,7 +163,7 @@ mod tests {
             let e1 = (estimates[steps][0] - r.states[steps][0]).abs();
             // Measured at γ = 20: filter 0.40 → 0.021, window 0.35 → 0.079
             // (node accuracy of its coarser box), tracker 0.35 → 0.027,
-            // particles 0.35 → 0.14 (the mean of a cloud selected by
+            // unscented = tracker on this linear model, particles 0.35 → 0.14 (the mean of a cloud selected by
             // killing, the weakest of the four here).
             assert!(e1 < 0.5 * e0, "{name}: error {e0} → {e1}");
         }

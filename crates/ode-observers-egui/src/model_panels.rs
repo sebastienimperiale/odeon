@@ -1,8 +1,11 @@
 //! The model side of a viewer's panels: the model selector, the parameter
 //! form with the Observation and Simulation sections, the Run-simulation
 //! button, the bottom observation panel (playback controls + y(t) plot with
-//! a time cursor) and the central scene with its "About this model"
-//! header. The application adds its estimator sections beside them.
+//! a time cursor) and the central scene with its "About this model…"
+//! button, which opens the models note (`crates/ode-models/docs/models.pdf`,
+//! built locally with `latexmk -pdf models.tex`) in the browser at the
+//! model's section. The application adds its estimator sections beside
+//! them.
 
 use crate::palette;
 use crate::slot::ModelSlot;
@@ -243,20 +246,37 @@ pub fn observation_panel(ui: &mut egui::Ui, slot: &mut ModelSlot) {
     ui.take_available_height();
 }
 
-/// The central scene: the collapsed-by-default "About this model" header
-/// and the model's drawing of the frame at the playback time (`id` salts
-/// the header per slot). The caller advances the playback clock
-/// ([`ModelSlot::advance`]) before.
+/// The central scene: the "About this model…" button (with the outcome of
+/// the last click beside it, kept in egui's temporary memory under `id`)
+/// and the model's drawing of the frame at the playback time. The caller
+/// advances the playback clock ([`ModelSlot::advance`]) before.
 pub fn scene_ui(ui: &mut egui::Ui, slot: &ModelSlot, id: usize) {
-    egui::CollapsingHeader::new("About this model")
-        .id_salt(("about_model", id))
-        .default_open(false)
-        .show(ui, |ui| {
-            for paragraph in slot.model.description().split("\n\n") {
-                ui.label(paragraph);
-                ui.add_space(4.0);
-            }
-        });
+    let status_id = egui::Id::new(("about_model_status", id));
+    ui.horizontal(|ui| {
+        if ui
+            .button("About this model…")
+            .on_hover_text(
+                "Open the models note (crates/ode-models/docs/models.pdf of this checkout, \
+                 built with `latexmk -pdf models.tex` there) in the browser at this model's \
+                 page; ODEON_BROWSER selects the browser — Safari's PDF viewer ignores the \
+                 page, Firefox's and Chrome's honour it. On the web page: models.pdf next to \
+                 the page, at the section's named destination.",
+            )
+            .clicked()
+        {
+            let status = match slot.model.doc_dest() {
+                Some(dest) => match open_models_pdf(dest) {
+                    Ok(url) => format!("opened {url}"),
+                    Err(e) => format!("could not open the models note: {e}"),
+                },
+                None => "no section for this model in models.pdf".to_string(),
+            };
+            ui.ctx().data_mut(|d| d.insert_temp(status_id, status));
+        }
+        if let Some(s) = ui.ctx().data(|d| d.get_temp::<String>(status_id)) {
+            ui.small(s);
+        }
+    });
     ui.add_space(4.0);
 
     let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
@@ -273,6 +293,164 @@ pub fn scene_ui(ui: &mut egui::Ui, slot: &ModelSlot, id: usize) {
                 egui::FontId::proportional(16.0),
                 ui.visuals().weak_text_color(),
             );
+        }
+    }
+}
+
+/// Open the browser on the models note at the section of the model `dest`
+/// (`\modelsection{<dest>}{…}` of `crates/ode-models/docs/models.tex`).
+///
+/// Native: the PDF is the local `models.pdf` of this checkout — the path of
+/// the source tree at compile time (`CARGO_MANIFEST_DIR/../ode-models/docs`),
+/// by decision: the link is local to this installation. The page of the
+/// section is read from `models.aux`, written beside the PDF by the same
+/// build ([`models_page`]), so the link follows the document as it grows;
+/// without it the named destination `#nameddest=<dest>` is used. The
+/// browser: `$ODEON_BROWSER` when set (an application name or the path of
+/// an executable), otherwise on macOS the first installed of Firefox,
+/// Google Chrome, Chromium, Microsoft Edge, Brave Browser, Safari — Safari
+/// last because its PDF viewer ignores the page fragment. On macOS the
+/// browser's executable is launched directly: Launch Services (`open`,
+/// even `open -u`) resolves a `file://` URL to the file and drops its
+/// fragment. On Linux `$ODEON_BROWSER` or `xdg-open`, on Windows `start`.
+/// Returns the URL opened.
+///
+/// Web: opens `models.pdf#nameddest=<dest>` relative to the page in a new
+/// tab (the PDF must be published next to the page).
+pub fn open_models_pdf(dest: &str) -> std::io::Result<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let url = format!("models.pdf#nameddest={dest}");
+        web_sys::window()
+            .and_then(|w| w.open_with_url_and_target(&url, "_blank").ok().flatten())
+            .ok_or_else(|| std::io::Error::other("the browser refused to open a new tab (pop-up blocked?)"))?;
+        return Ok(url);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let docs = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../ode-models/docs"));
+        let path = docs.join("models.pdf");
+        let path = std::fs::canonicalize(&path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("{} ({e}); build it with `latexmk -pdf models.tex` in crates/ode-models/docs", path.display()),
+            )
+        })?;
+        let fragment = match std::fs::read_to_string(docs.join("models.aux")).ok().and_then(|aux| models_page(&aux, dest)) {
+            Some(page) => format!("page={page}"),
+            None => format!("nameddest={dest}"),
+        };
+        let url = format!("file://{}#{fragment}", path.to_string_lossy().replace(' ', "%20"));
+        let browser = std::env::var("ODEON_BROWSER").ok();
+        #[cfg(target_os = "macos")]
+        macos_launch(&browser.unwrap_or_else(macos_browser), &url)?;
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::process::Command::new(browser.as_deref().unwrap_or("xdg-open")).arg(&url).status()?;
+            if !status.success() {
+                return Err(std::io::Error::other(format!("browser exited with {status}")));
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "start", "", browser.as_deref().unwrap_or(""), &url])
+                .status()?;
+            if !status.success() {
+                return Err(std::io::Error::other(format!("browser exited with {status}")));
+            }
+        }
+        Ok(url)
+    }
+}
+
+/// The page of the model `dest` in `models.pdf`, from the `.aux` file of
+/// its build: `\modelsection` labels every section `model:<dest>`, and
+/// LaTeX records `\newlabel{model:<dest>}{{<section>}{<page>}…}`.
+#[cfg(not(target_arch = "wasm32"))]
+fn models_page(aux: &str, dest: &str) -> Option<u32> {
+    let key = format!("\\newlabel{{model:{dest}}}{{{{");
+    let rest = &aux[aux.find(&key)? + key.len()..];
+    let rest = &rest[rest.find('}')? + 1..];
+    let rest = rest.strip_prefix('{')?;
+    rest[..rest.find('}')?].trim().parse().ok()
+}
+
+/// The first installed browser of the preference list, by bundle.
+#[cfg(target_os = "macos")]
+fn macos_browser() -> String {
+    const CANDIDATES: [&str; 6] = ["Firefox", "Google Chrome", "Chromium", "Microsoft Edge", "Brave Browser", "Safari"];
+    CANDIDATES.iter().find(|app| macos_bundle(app).is_some()).unwrap_or(&"Safari").to_string()
+}
+
+/// The `.app` bundle of `app` in /Applications or ~/Applications.
+#[cfg(target_os = "macos")]
+fn macos_bundle(app: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    [format!("/Applications/{app}.app"), format!("{home}/Applications/{app}.app")]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_dir())
+}
+
+/// Launch the browser `app` (a name in /Applications, or an executable
+/// path) directly on `url`, so that the URL's fragment survives; Safari
+/// through `open -u` (its viewer ignores the fragment anyway).
+#[cfg(target_os = "macos")]
+fn macos_launch(app: &str, url: &str) -> std::io::Result<()> {
+    let exe = if std::path::Path::new(app).is_file() {
+        Some(std::path::PathBuf::from(app))
+    } else if app == "Safari" {
+        None
+    } else {
+        let bundle = macos_bundle(app)
+            .ok_or_else(|| std::io::Error::other(format!("browser {app} not found in /Applications")))?;
+        let name = std::process::Command::new("defaults")
+            .args(["read", &bundle.join("Contents/Info").to_string_lossy(), "CFBundleExecutable"])
+            .output()?;
+        let name = String::from_utf8_lossy(&name.stdout).trim().to_string();
+        Some(bundle.join("Contents/MacOS").join(name)).filter(|p| p.is_file())
+    };
+    match exe {
+        Some(exe) => {
+            std::process::Command::new(exe).arg(url).spawn()?;
+        }
+        None => {
+            let status = std::process::Command::new("open").args(["-a", app, "-u", url]).status()?;
+            if !status.success() {
+                return Err(std::io::Error::other(format!("open exited with {status}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::models_page;
+
+    /// The section's page is read from the `.aux` of the note's build.
+    #[test]
+    fn page_of_a_model_is_read_from_the_aux_file() {
+        let aux = "\\newlabel{model:spring}{{1}{2}{Linear spring chain}{section.1}{}}\n\
+                   \\newlabel{model:kepler_mu}{{6}{7}{Kepler problem with an unknown gravitational parameter}{section.6}{}}\n";
+        assert_eq!(models_page(aux, "spring"), Some(2));
+        assert_eq!(models_page(aux, "kepler_mu"), Some(7));
+        assert_eq!(models_page(aux, "kepler"), None);
+        assert_eq!(models_page("", "spring"), None);
+    }
+
+    /// Every viewer entry points at a section of the note, and the note
+    /// of this checkout has that section (its label in the source).
+    #[test]
+    fn every_entry_has_a_section_in_the_models_note() {
+        let tex = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../ode-models/docs/models.tex")).unwrap();
+        for viz in crate::models::all() {
+            let dest = viz.doc_dest().unwrap_or_else(|| panic!("{} has no section", viz.name()));
+            assert!(tex.contains(&format!("\\modelsection{{{dest}}}")), "{}: no \\modelsection{{{dest}}}", viz.name());
+        }
+        for dest in ["spring_mass", "kepler_mu"] {
+            assert!(tex.contains(&format!("\\modelsection{{{dest}}}")), "augmented model {dest} has no section");
         }
     }
 }

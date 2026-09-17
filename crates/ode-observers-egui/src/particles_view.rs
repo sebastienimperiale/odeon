@@ -9,8 +9,8 @@
 //! the tracker's estimate in red on request. The plot is locked to the box
 //! of the initial draw.
 
-use crate::filter_view::{ColorFocus, TRACKER_RED, shade};
-use ode_observers::jobs::{ParticleOutput, TrackerOutput};
+use crate::filter_view::{ColorFocus, Overlays, shade};
+use ode_observers::jobs::ParticleOutput;
 use std::collections::HashMap;
 
 /// Pixel resolution (per side) of the smoothed-cloud textures.
@@ -28,6 +28,8 @@ pub struct ParticlesView {
     pub show_dots: bool,
     /// Overlay the tracker's estimate in red when a tracker run exists.
     pub show_tracker: bool,
+    /// Overlay the unscented closure's centre in blue when its run exists.
+    pub show_unscented: bool,
     /// Width h of a newborn particle's Gaussian, in state units.
     pub width: f64,
     /// Colour-scale floor, see [`ColorFocus`].
@@ -44,6 +46,7 @@ impl Default for ParticlesView {
             show_density: true,
             show_dots: true,
             show_tracker: true,
+            show_unscented: true,
             width: 0.1,
             focus: ColorFocus::default(),
             plane: 0,
@@ -77,7 +80,7 @@ impl ParticlesView {
     }
 
     /// Render the view at playback `step`.
-    pub fn ui(&mut self, ui: &mut egui::Ui, out: &ParticleOutput, tracker: Option<&TrackerOutput>, step: usize) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, out: &ParticleOutput, overlays: Overlays, step: usize) {
         let pairs = Self::pairs(out);
         if pairs.is_empty() || out.positions.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -119,7 +122,7 @@ impl ParticlesView {
             let (lo, hi) = ((e_min / RES as f64).max(1e-9), e_max.max(1e-6));
             self.width = self.width.clamp(lo, hi);
             ui.add(egui::Slider::new(&mut self.width, lo..=hi).logarithmic(true).show_value(true));
-            ui.add_enabled(tracker.is_some(), egui::Checkbox::new(&mut self.show_tracker, "tracker x̂"));
+            overlays.checkboxes(ui, &mut self.show_tracker, &mut self.show_unscented);
             ui.separator();
             self.focus.ui(ui);
         });
@@ -157,12 +160,7 @@ impl ParticlesView {
         };
         let clip = step.min(out.reference.len() - 1);
         let reference: Vec<[f64; 2]> = out.reference[..=clip].iter().map(|s| [s[a], s[b]]).collect();
-        let tracker_path = tracker.filter(|_| self.show_tracker).map(|t| {
-            let clip_t = step.min(t.estimates.len().saturating_sub(1));
-            let pts: Vec<[f64; 2]> = t.estimates[..=clip_t].iter().map(|e| [e[a], e[b]]).collect();
-            let last = &t.estimates[clip_t];
-            (pts, [last[a], last[b]])
-        });
+        let paths = overlays.paths(self.show_tracker, self.show_unscented, step, (a, b));
         let neutral = ui.visuals().text_color();
 
         egui_plot::Plot::new("particles_plot")
@@ -190,15 +188,7 @@ impl ParticlesView {
                 plot_ui.line(egui_plot::Line::new("reference", reference).color(neutral).width(1.5));
                 let s = &out.reference[clip];
                 plot_ui.points(egui_plot::Points::new("", vec![[s[a], s[b]]]).radius(4.0).color(neutral));
-                if let Some((path, last)) = tracker_path {
-                    plot_ui.line(egui_plot::Line::new("tracker x̂", path).color(TRACKER_RED).width(1.5));
-                    plot_ui.points(
-                        egui_plot::Points::new("", vec![last])
-                            .radius(4.0)
-                            .shape(egui_plot::MarkerShape::Diamond)
-                            .color(TRACKER_RED),
-                    );
-                }
+                Overlays::draw(plot_ui, paths);
             });
     }
 }

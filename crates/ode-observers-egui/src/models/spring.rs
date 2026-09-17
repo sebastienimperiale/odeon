@@ -175,42 +175,8 @@ impl VizModel for SpringViz {
         self.name
     }
 
-    fn description(&self) -> String {
-        let n = self.params.n;
-        format!(
-            "Linear chain of {n} equal masses connected by {n} identical springs to a \
-             fixed wall at x = 0 (the N-harmonic oscillator of Chapelle & Moireau): a \
-             1D elastic bar discretized with N = {n} nodes of spacing ℓ = 1/N. Motion is \
-             along the axis only; there is no damping, so the total energy is conserved \
-             and every mass oscillates forever.\n\n\
-             Parameters: ρ — mass density (each mass is ρℓ); a — elastic modulus (each \
-             spring has stiffness a/ℓ). The natural frequencies scale as √(a/ρ).\n\n\
-             State (filter order): y_1..y_{n} — displacements of the masses from their \
-             rest positions iℓ along the axis (equilibrium y = 0), then v_1..v_{n} — their \
-             velocities.\n\n\
-             Scene: the wall at the left, the masses as discs at iℓ + y_i, the springs as \
-             zigzag coils; the default initial condition displaces the last mass from \
-             rest by 0.15. An observed position colors that mass with its series color; \
-             an observed velocity draws a diamond on it.\n\n\
-             Observation: one scalar — a position y_i or a velocity v_i (exactly one is \
-             selected; the filter consumes a single scalar observation). The plot below \
-             the scene shows the observed series against time, noisy if a noise model is \
-             on.\n\n\
-             Unknown free-end mass (option of the estimator viewer): the same chain with \
-             the mass of body {n} unknown, m_{n} = m₀·2^θ with m₀ = ρℓ the mass of the \
-             others and θ an extra state variable obeying dθ/dt = 0 (positive mass for \
-             every θ; Gaussian prior in θ = log-normal in m_{n}). The reference runs at \
-             θ_true and the estimators, started at θ = 0 (all masses equal), must recover \
-             it — the mass is identifiable from one position, since it sets the \
-             normal-mode frequencies. Given θ the dynamics are linear in (y, v): the \
-             textbook conditionally linear model. The run then uses the augmented model \
-             (the same state y_1..y_{n}, v_1..v_{n} plus θ; the same equations, integrated \
-             by Gauss–Legendre 4; positions only as observations) with a {}D grid whose θ \
-             direction is cheap by \
-             default (fixed domain (−1, 1), few DOFs, q_θ = 0); watch the (y_1, θ) plane \
-             sharpen around θ_true.",
-            2 * n + 1
-        )
+    fn doc_dest(&self) -> Option<&'static str> {
+        Some(if self.params.unknown_mass { "spring_mass" } else { "spring" })
     }
 
     fn params_ui(&mut self, ui: &mut egui::Ui) -> bool {

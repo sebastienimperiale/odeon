@@ -92,31 +92,8 @@ impl VizModel for LorenzViz {
         "Lorenz-63"
     }
 
-    fn description(&self) -> String {
-        "Lorenz-63: ẋ = σ(y − x), ẏ = x(ρ − z) − y, ż = xy − βz — the three-mode \
-         truncation of Rayleigh–Bénard convection (Lorenz 1963), the classic dissipative \
-         chaotic system. Phase-space volume contracts at the constant rate −(σ + 1 + β), \
-         and for the default parameters every trajectory settles on the butterfly-shaped \
-         strange attractor, switching irregularly between its two wings. Not Hamiltonian: \
-         nothing is conserved, and nearby trajectories separate exponentially, so any \
-         estimate loses track without observations.\n\n\
-         Parameters: σ — Prandtl number (default 10); ρ — Rayleigh number (default 28; \
-         for ρ < 1 the origin attracts everything, the attractor exists for ρ ≳ 24.7); \
-         β — geometric factor (default 8/3). The two wings are centered on the fixed \
-         points C± = (±√(β(ρ−1)), ±√(β(ρ−1)), ρ−1).\n\n\
-         State (filter order): x — convective intensity; y — temperature difference between \
-         rising and sinking currents; z — deviation of the vertical temperature profile from \
-         linear. Typical ranges |x| ≲ 20, |y| ≲ 28, 0 < z ≲ 50. The default initial \
-         condition is a state on the attractor (t = 11.4 of the (1, 1, 1) start), so \
-         the default run has no transient.\n\n\
-         Scene: the trajectory as a 3D curve (z up), seen through an orbit camera — drag to \
-         rotate, scroll to zoom. Wireframe box of the trajectory's extent, axis triad at its \
-         corner, the history shaded by depth (nearer is darker) with the recent tail strong, \
-         the current state as the accent dot with a projection line onto the observed axis \
-         (drawn in the accent).\n\n\
-         Observation (one of): the coordinate x, y or z. Observing x alone is the standard \
-         hard case: y and z must be inferred through the dynamics."
-            .to_string()
+    fn doc_dest(&self) -> Option<&'static str> {
+        Some("lorenz")
     }
 
     fn params_ui(&mut self, ui: &mut egui::Ui) -> bool {

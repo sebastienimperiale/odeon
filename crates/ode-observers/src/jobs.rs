@@ -2,7 +2,8 @@
 //! user interface ([`FilterConfig`]), the plain-data outputs kept for
 //! display ([`FilterOutput`], [`TrackerOutput`], [`BoxOutput`],
 //! [`ParticleOutput`]), the generic runners ([`run_filter`],
-//! [`run_tracker`], [`run_box`], [`run_particles`]) driving each observer
+//! [`run_tracker`], [`run_unscented`], [`run_box`], [`run_particles`])
+//! driving each observer
 //! along a [`Reference`] (a trajectory with its observations) at the
 //! model's compile-time dimension, and the **job description**
 //! ([`JobSpec`]: a [`ModelSpec`] + the `Reference` + an [`Estimator`] + the
@@ -18,6 +19,7 @@ use crate::methods::mortensen::{DiffusionScheme, FilterParams, MortensenFilter};
 use crate::methods::fleming_viot::{ParticleParams, ParticleSystem};
 use ode_models_spec::progress::Progress;
 use crate::methods::kalman::{MortensenTracker, TrackerParams};
+use crate::methods::unscented_kalman::{Quadrature, UnscentedParams, UnscentedTracker};
 use ode_models::model::Model;
 use ode_models_spec::reference::Reference;
 use ode_models_spec::spec::{ModelSpec, ModelVisitor, TwinSpec};
@@ -79,6 +81,25 @@ pub struct FilterConfig {
     pub pairs: Vec<((usize, usize), bool)>,
     /// Settings of the particle solver (`crate::methods::fleming_viot`).
     pub particles: ParticleConfig,
+    /// Settings of the unscented closure (`crate::methods::unscented_kalman`);
+    /// absent in older descriptions, hence the default.
+    #[serde(default)]
+    pub unscented: UnscentedConfig,
+}
+
+/// Settings of the unscented closure, edited in the viewer's Quadrature
+/// panel: the rule alone — ε, γ, q and the initial data come from the
+/// shared configuration.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct UnscentedConfig {
+    pub rule: Quadrature,
+}
+
+impl Default for UnscentedConfig {
+    /// The symmetric rule at h = √3.
+    fn default() -> Self {
+        UnscentedConfig { rule: Quadrature::DEFAULT }
+    }
 }
 
 /// Settings of the particle solver, edited in the viewer's Particles panel;
@@ -154,6 +175,7 @@ impl FilterConfig {
             vars,
             pairs,
             particles: ParticleConfig { n_particles: 500, seed: None },
+            unscented: UnscentedConfig::default(),
         }
     }
 
@@ -263,6 +285,57 @@ pub fn run_tracker<const M: usize, Mod: Model<M>>(
         estimates.push(wrap(tracker.estimate()));
         // nalgebra is column-major: transpose to store row-major.
         covariances.push(tracker.covariance().map(|p| p.transpose().as_slice().to_vec()));
+        progress.step();
+    }
+    TrackerOutput {
+        dt,
+        eps: cfg.eps,
+        labels,
+        reference: reference.states[..estimates.len()].to_vec(),
+        estimates,
+        covariances,
+    }
+}
+
+/// Run the unscented closure along `reference` (the configuration's initial
+/// data, model-noise q, γ, ε and quadrature rule), producing the tracker's
+/// kind of output — centre x̄ as the estimate, P = Σ/ε as the covariance —
+/// so the Tracker view serves it unchanged. The initial stiffness must be
+/// positive in every direction. Bumps `progress` once per iteration; stops
+/// early (partial output) if cancelled.
+pub fn run_unscented<const M: usize, Mod: Model<M>>(
+    model: Mod,
+    reference: &Reference,
+    cfg: &FilterConfig,
+    progress: &Progress,
+) -> TrackerOutput {
+    check_dimensions::<M, _>(&model, reference, cfg);
+    let labels = model.state_labels();
+    let dt = model.dt();
+    let mut ukf = UnscentedTracker::<M, _>::new(
+        model,
+        UnscentedParams {
+            q_diag: std::array::from_fn(|d| cfg.vars[d].q),
+            gamma: cfg.gamma,
+            eps: cfg.eps,
+            rule: cfg.unscented.rule,
+        },
+    );
+    ukf.init(
+        std::array::from_fn(|d| cfg.vars[d].x0),
+        std::array::from_fn(|d| cfg.vars[d].sigma),
+    );
+    // Unwrapped angles inside, wrapped for display (see `run_tracker`).
+    let wrap = wrapper::<M>(cfg);
+    let mut estimates = vec![wrap(ukf.estimate())];
+    let mut covariances = vec![ukf.covariance().map(|p| p.transpose().as_slice().to_vec())];
+    for y in &reference.observations[..reference.steps()] {
+        if progress.cancelled() {
+            break;
+        }
+        ukf.forward(y);
+        estimates.push(wrap(ukf.estimate()));
+        covariances.push(ukf.covariance().map(|p| p.transpose().as_slice().to_vec()));
         progress.step();
     }
     TrackerOutput {
@@ -594,9 +667,11 @@ pub fn run_box<const M: usize, Mod: Model<M> + Sync>(
 
 /// Which observer a job runs: the grid filter (density p on the spectral
 /// grid), the translating window (the same density on a small box following
-/// the mode — `box_tracker`), the particle approximation, or the tracker
-/// (the Gaussian closure: one state and its curvature). All share the
-/// configuration's initial data and model noise.
+/// the mode — `box_tracker`), the particle approximation, the tracker (the
+/// Gaussian closure at the maximum: one state and its curvature), or the
+/// unscented closure (the same Gaussian matched by its integrals through a
+/// quadrature rule). All share the configuration's initial data and model
+/// noise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Estimator {
@@ -604,12 +679,13 @@ pub enum Estimator {
     Window,
     Particles,
     Tracker,
+    Unscented,
 }
 
 impl Estimator {
     /// All variants, in the order a selector shows them.
-    pub const ALL: [Estimator; 4] =
-        [Estimator::Filter, Estimator::Window, Estimator::Particles, Estimator::Tracker];
+    pub const ALL: [Estimator; 5] =
+        [Estimator::Filter, Estimator::Window, Estimator::Particles, Estimator::Tracker, Estimator::Unscented];
 }
 
 /// A complete, self-contained description of one observer run: the model
@@ -626,7 +702,8 @@ pub struct JobSpec {
     pub config: FilterConfig,
 }
 
-/// The output of a [`JobSpec`], one variant per [`Estimator`].
+/// The output of a [`JobSpec`], one variant per [`Estimator`] (the
+/// unscented closure produces the tracker's kind of output).
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "estimator", content = "output", rename_all = "snake_case")]
 pub enum JobOutput {
@@ -634,6 +711,7 @@ pub enum JobOutput {
     Window(BoxOutput),
     Particles(ParticleOutput),
     Tracker(TrackerOutput),
+    Unscented(TrackerOutput),
 }
 
 impl JobOutput {
@@ -644,6 +722,7 @@ impl JobOutput {
             JobOutput::Window(_) => Estimator::Window,
             JobOutput::Particles(_) => Estimator::Particles,
             JobOutput::Tracker(_) => Estimator::Tracker,
+            JobOutput::Unscented(_) => Estimator::Unscented,
         }
     }
 }
@@ -666,7 +745,17 @@ macro_rules! output_from_job {
 output_from_job!(FilterOutput, Filter, "filter");
 output_from_job!(BoxOutput, Window, "window");
 output_from_job!(ParticleOutput, Particles, "particles");
-output_from_job!(TrackerOutput, Tracker, "tracker");
+
+/// The tracker's output type serves the tracker and the unscented closure.
+impl TryFrom<JobOutput> for TrackerOutput {
+    type Error = String;
+    fn try_from(out: JobOutput) -> Result<Self, String> {
+        match out {
+            JobOutput::Tracker(x) | JobOutput::Unscented(x) => Ok(x),
+            other => Err(format!("expected the tracker output, got the {:?} one", other.estimator())),
+        }
+    }
+}
 
 impl JobSpec {
     /// The job of a twin experiment: the reference generated from `twin`
@@ -695,6 +784,7 @@ impl JobSpec {
             Estimator::Window => JobOutput::Window(run_box_spec(m, r, cfg, progress)),
             Estimator::Particles => JobOutput::Particles(run_particles_spec(m, r, cfg, progress)),
             Estimator::Tracker => JobOutput::Tracker(run_tracker_spec(m, r, cfg, progress)),
+            Estimator::Unscented => JobOutput::Unscented(run_unscented_spec(m, r, cfg, progress)),
         }
     }
 }
@@ -753,6 +843,10 @@ spec_runner!(
 spec_runner!(
     /// [`run_tracker`] on the model a [`ModelSpec`] describes.
     run_tracker_spec, TrackerVisitor, run_tracker, TrackerOutput
+);
+spec_runner!(
+    /// [`run_unscented`] on the model a [`ModelSpec`] describes.
+    run_unscented_spec, UnscentedVisitor, run_unscented, TrackerOutput
 );
 spec_runner!(
     /// [`run_box`] on the model a [`ModelSpec`] describes.
@@ -999,11 +1093,59 @@ mod tests {
                 JobOutput::Filter(o) => (o.dt, &o.reference),
                 JobOutput::Window(o) => (o.window.dt, &o.window.reference),
                 JobOutput::Particles(o) => (o.dt, &o.reference),
-                JobOutput::Tracker(o) => (o.dt, &o.reference),
+                JobOutput::Tracker(o) | JobOutput::Unscented(o) => (o.dt, &o.reference),
             };
             assert_eq!(dt_out, 0.02);
             assert_eq!(reference, &r.states);
         }
+    }
+
+    /// The unscented path of the viewer equals the tracker path on the
+    /// linear spring, for every rule of the selector — same estimates and
+    /// covariances to round-off — and produces the tracker's kind of output
+    /// (the Tracker view's data), with the periodic wrap applied alike.
+    #[test]
+    fn spring_unscented_job_equals_the_tracker_job() {
+        let r = spring_reference(0.01, 100);
+        let mut cfg = spring_cfg(&r);
+        for v in &mut cfg.vars {
+            v.sigma = 1.0;
+            v.x0 += 0.3;
+        }
+        cfg.eps = 0.02;
+        let tracker = run_tracker::<2, _>(spring(0.01), &r, &cfg, &Progress::default());
+        for rule in [
+            Quadrature::DEFAULT,
+            Quadrature::Cubature,
+            Quadrature::DegreeFive,
+            Quadrature::GaussHermite { points: 3 },
+        ] {
+            cfg.unscented.rule = rule;
+            let progress = Progress::default();
+            let out = run_unscented::<2, _>(spring(0.01), &r, &cfg, &progress);
+            assert_eq!(progress.done(), 100);
+            assert_eq!(out.estimates.len(), 101);
+            for n in 0..101 {
+                for d in 0..2 {
+                    assert!((out.estimates[n][d] - tracker.estimates[n][d]).abs() < 1e-9, "{rule:?}, step {n}");
+                }
+                let (a, b) = (out.covariances[n].as_ref().unwrap(), tracker.covariances[n].as_ref().unwrap());
+                for i in 0..4 {
+                    assert!((a[i] - b[i]).abs() < 1e-9, "{rule:?}, step {n}: P differs");
+                }
+            }
+        }
+        // Through the job description and its JSON form (the rule travels).
+        let twin = spring_twin(0.01, 20);
+        cfg.unscented.rule = Quadrature::GaussHermite { points: 3 };
+        let job = JobSpec::from_twin(&twin, Estimator::Unscented, cfg.clone(), &Progress::default());
+        let json = serde_json::to_string(&job).unwrap();
+        assert!(json.contains("\"estimator\":\"unscented\"") && json.contains("\"gauss_hermite\":{\"points\":3}"), "{json}");
+        let back: JobSpec = serde_json::from_str(&json).unwrap();
+        assert!(back == job);
+        let out = back.run(&Progress::default());
+        assert_eq!(out.estimator(), Estimator::Unscented);
+        assert!(TrackerOutput::try_from(out).is_ok());
     }
 
     /// A seeded particle configuration is reproducible; an unseeded one is

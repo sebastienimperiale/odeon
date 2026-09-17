@@ -1,0 +1,1610 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.6cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\setlength{\emergencystretch}{2em} % absorb the rare unbreakable inline formula
+
+% ---------------------------------------------------------------------------
+% Macros
+% ---------------------------------------------------------------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\argmin}{\operatorname{arg\,min}}
+\newcommand{\argmax}{\operatorname{arg\,max}}
+\newcommand{\T}{^{\mathsf T}}
+\newcommand{\xh}{\hat{x}}
+\newcommand{\zh}{\hat{z}}
+\newcommand{\zr}{\hat{z}_{\rho}}   % weighted mean  rho*zhat
+\newcommand{\Sr}{S_{\rho}}          % weighted information rho*S
+\newcommand{\Mr}{M_{\rho}}          % second moment (Appendix on Zakai)
+\newcommand{\eps}{\varepsilon}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\grad}{\nabla}
+\newcommand{\gy}{\nabla_{\!y}}
+\newcommand{\gz}{\nabla_{\!z}}
+\newcommand{\Hy}{\nabla_{\!y}^2}
+\newcommand{\dt}{\,\delta t}
+
+\theoremstyle{plain}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{example}{Example}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\title{A hybrid grid--Gaussian Mortensen filter\\
+\large From the estimation problem to the Hamilton--Jacobi--Bellman equation,\\
+the Gaussian closure (tracker), and the partial closure in a subset of directions}
+\author{Design note for the \texttt{mortensen} library}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The \texttt{mortensen} library evolves the density $p=e^{-V/\eps}$ of the Mortensen filter on a full tensor-product grid, and, separately, its Gaussian closure (the \emph{tracker}: one state $\xh$ and one curvature matrix $S$). This note first derives, from the estimation problem, the Hamilton--Jacobi--Bellman equation of the filter and its linear form for $p$, which is what the four-step cycle of the library discretises (\S\ref{sec:setting}). It then presents the \emph{hybrid} grid--Gaussian closure in the case that matters first (\S\ref{sec:main}): the state splits into grid directions $y$ with autonomous dynamics $\dot y=f_y(y)$, possibly noisy, and Gaussian directions $z$ whose mean $\zh(y)$ and information $S(y)$ are fields on the $y$-grid. The closed equations are obtained directly in the density representation; along the characteristics of $\dot y = f_y(y)$ they reduce to a bank of second-order (extended-Kalman-type) trackers weighted by the max-marginal $\rho$ (exactly so when the grid directions carry no model noise), they are exact for conditionally linear models --- the deterministic counterpart of Rao--Blackwellization --- and they contain the tracker as the degenerate case $k=0$. For a parameter such as the gravitational constant of the unknown-$\mu$ Kepler problem this resolves, at the cost of a one-dimensional grid, the multimodality that defeats a single tracker. The general closure (coupling between the two groups of directions, model noise in $y$), its stability properties and the discrete cycle are kept in the appendices for the record.
+\end{abstract}
+
+\tableofcontents
+
+% ===========================================================================
+\section{The estimation problem and its value function}
+\label{sec:setting}
+% ===========================================================================
+
+\subsection{Setting}
+
+We observe a dynamical system with state $x(t)\in\R^n$,
+\begin{equation}
+  \dot x(t) = f\big(x(t)\big) + w(t), \qquad t\in[0,T],
+  \label{eq:dyn}
+\end{equation}
+where $f$ is the known drift and $w(t)\in\R^n$ an unknown \emph{model error} (the "model noise"). We record observations
+\begin{equation}
+  y(t) = h\big(x(t)\big) + v(t),
+  \label{eq:obs}
+\end{equation}
+where $h$ is the known observation operator and $v$ an unknown observation error. Neither $w$ nor $v$ is modelled as random here: the Mortensen approach is \emph{deterministic}. Instead we say that a candidate history $(x(\cdot), w(\cdot))$ on $[0,t]$ is \emph{expensive} if it requires large errors, and we measure that expense by the \emph{energy}
+\begin{equation}
+  J_t\big[x(\cdot), w(\cdot)\big]
+  \;=\; V_0\big(x(0)\big)
+  \;+\; \frac12\int_0^t \Big( w(s)\T Q^{-1} w(s) \;+\; \gamma\, d\big(y(s), h(x(s))\big)^2 \Big)\dd s .
+  \label{eq:energy}
+\end{equation}
+Here
+\begin{itemize}[nosep]
+  \item $V_0(x_0)\ge 0$ is the cost of \emph{starting} at $x_0$: it encodes the prior knowledge on the initial state (in the code, $V_0=\sum_d \sigma_d (x_d-x_{c,d})^2/2$, i.e.\ a Gaussian prior of centre $x_c$; $\sigma_d=0$ means no prior in direction $d$);
+  \item $Q=\operatorname{diag}(q_1,\dots,q_n)\succeq 0$ weights the model error: a large $q_d$ makes it cheap to push the trajectory in direction $d$ (in the code, \texttt{q\_diag});
+  \item $d(y,h)$ is the distance in observation space (Euclidean, or the angular distance for a bearing), and $\gamma\ge0$ is the observation weight (\texttt{gamma}): the cost of disagreeing with the data.
+\end{itemize}
+Formally, the energy is $-\log$ of the likelihood of a Gaussian model with covariances $Q$ and $I/\gamma$, but we never use probabilities; only the optimisation structure matters.
+
+\subsection{The value function}
+
+\begin{definition}[value function]
+The \emph{value function} $V(x,t)$ is the smallest energy needed to explain the observations on $[0,t]$ with a trajectory that ends at $x$ at time $t$:
+\begin{equation}
+  V(x,t) \;=\; \min\Big\{\, J_t[x(\cdot),w(\cdot)] \;:\; \dot x = f(x)+w \text{ on }[0,t],\; x(t)=x \,\Big\}.
+  \label{eq:value}
+\end{equation}
+\end{definition}
+The state estimate at time $t$ is the cheapest end point,
+\begin{equation}
+  \xh(t) = \argmin_x V(x,t),
+  \label{eq:estimate}
+\end{equation}
+the \emph{minimum-energy estimate} of Mortensen~\cite{Mortensen1968} (also Hijab~\cite{Hijab1980}, Krener~\cite{Krener2003}). The whole function $V(\cdot,t)$ is much more than an estimate: its level sets describe how plausible every other state is, and its curvature at the minimum measures the confidence.
+
+\subsection{Dynamic programming: the HJB equation}
+
+The key property of $V$ is that it can be updated \emph{recursively} in time, without re-solving the minimisation over the whole past. Consider a small time increment $\delta$ and a trajectory ending at $x$ at time $t+\delta$. Over the last interval $[t,t+\delta]$ it moved with some model error $w$ (constant over the short interval, to first order), so at time $t$ it was at
+\[
+  x(t) \;=\; x - \delta\,\big(f(x)+w\big) + O(\delta^2),
+\]
+and paid, during that interval, the running cost $\delta\,\ell(x,w,t)$ with
+\[
+  \ell(x,w,t) = \tfrac12 w\T Q^{-1}w + \tfrac12\gamma\, d\big(y(t),h(x)\big)^2 .
+\]
+The cheapest way to reach $x$ at $t+\delta$ is therefore to choose the last error $w$ optimally, having reached $x(t)$ as cheaply as possible before --- and "as cheaply as possible before" is, by definition, $V(x(t),t)$. This is Bellman's principle of optimality:
+\begin{equation}
+  V(x,t+\delta) \;=\; \min_{w}\Big\{\, V\big(x-\delta(f(x)+w),\,t\big) \;+\; \delta\,\ell(x,w,t) \Big\} + O(\delta^2).
+  \label{eq:bellman}
+\end{equation}
+Now expand to first order in $\delta$, writing $\grad V=\grad_x V(x,t)$:
+\[
+  V\big(x-\delta(f+w),t\big) = V(x,t) - \delta\,(f+w)\cdot\grad V + O(\delta^2).
+\]
+Inserting into \eqref{eq:bellman} and dividing by $\delta$,
+\begin{equation}
+  \partial_t V \;=\; \min_{w}\Big\{ -(f+w)\cdot\grad V + \tfrac12 w\T Q^{-1} w \Big\} + \tfrac12\gamma\, d\big(y,h(x)\big)^2 .
+  \label{eq:min_w}
+\end{equation}
+The minimisation over $w$ is a quadratic problem; its stationarity condition is $-\grad V + Q^{-1}w = 0$, i.e.
+\begin{equation}
+  w^\star = Q\,\grad V ,
+  \label{eq:wstar}
+\end{equation}
+and the minimal value is
+\[
+  -f\cdot\grad V - \grad V\T Q\grad V + \tfrac12 \grad V\T Q \grad V = -f\cdot\grad V - \tfrac12\grad V\T Q\grad V .
+\]
+We have obtained the \textbf{Hamilton--Jacobi--Bellman (HJB) equation} of the Mortensen filter:
+\begin{equation}
+  \boxed{\;
+  \partial_t V + f\cdot\grad V + \tfrac12\,\grad V\T Q\,\grad V \;=\; \tfrac12\gamma\, d\big(y(t),h(x)\big)^2,
+  \qquad V(\cdot,0)=V_0 .\;}
+  \label{eq:hjb}
+\end{equation}
+Each term has a clear meaning:
+\begin{itemize}[nosep]
+  \item $f\cdot\grad V$: the value function is \emph{transported} along the model flow --- a state that is cheap now makes its image under the flow cheap a moment later;
+  \item $\tfrac12\grad V\T Q\grad V$: the cost can be \emph{lowered} by spending model error; the optimal error \eqref{eq:wstar} points down the gradient of $V$ with strength $Q$. Note that the optimal trajectories (the \emph{characteristics} of \eqref{eq:hjb}) move with velocity $f + Q\grad V$, not $f$;
+  \item the right-hand side is the price of being at $x$ when the current observation is $y(t)$: it \emph{adds} energy where $h(x)$ disagrees with the data.
+\end{itemize}
+
+\subsection{The viscous regularisation and the density \texorpdfstring{$p=e^{-V/\eps}$}{p = exp(-V/eps)}}
+
+Equation \eqref{eq:hjb} is a first-order nonlinear PDE; its solutions develop kinks (the minimum over several competing trajectories is not differentiable where they tie), and it must be understood in the viscosity sense~\cite{FlemingSoner2006}. The standard way to obtain a smooth, well-posed problem is to add a small \emph{viscosity} $\eps>0$:
+\begin{equation}
+  \partial_t V + f\cdot\grad V + \tfrac12\,\grad V\T Q\,\grad V - \frac{\eps}{2}\tr\big(Q\,\grad^2 V\big) \;=\; \tfrac12\gamma\, d\big(y,h(x)\big)^2 .
+  \label{eq:hjb_eps}
+\end{equation}
+This is the equation the library solves. The value of the regularisation goes far beyond numerics: the \emph{Hopf--Cole transformation}
+\begin{equation}
+  p(x,t) \;=\; \exp\!\big(-V(x,t)/\eps\big), \qquad V = -\eps\log p,
+  \label{eq:hopfcole}
+\end{equation}
+turns \eqref{eq:hjb_eps} into a \emph{linear} equation. Indeed, with $\grad V=-\eps\grad p/p$ and $\grad^2 V = -\eps\big(\grad^2 p/p - \grad p\grad p\T/p^2\big)$, the two terms in $\grad p\T Q\grad p/p^2$ (one from $\tfrac12\grad V\T Q\grad V$, one from the viscous term) cancel exactly, and multiplying by $-p/\eps$ leaves
+\begin{equation}
+  \boxed{\;
+  \partial_t p \;=\; -\,f\cdot\grad p \;+\; \frac{\eps}{2}\sum_{d=1}^n q_d\,\partial_d^2 p \;-\; \frac{\gamma}{2\eps}\, d\big(y,h(x)\big)^2\, p .\;}
+  \label{eq:linear_p}
+\end{equation}
+This is the equation discretised by the four-step cycle of \texttt{src/filter.rs}: it is an \emph{operator splitting} (Lie splitting, first order in $\dt$) in which each step solves one term of \eqref{eq:linear_p} exactly over one time step:
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+step & term of \eqref{eq:linear_p} & exact solution over $\dt$ \\
+\midrule
+1. observation & $-\frac{\gamma}{2\eps} d^2\, p$ & $p \leftarrow p\cdot\exp\!\big(-\eps^{-1}\dt\,\gamma\, d^2/2\big)$ \\
+2--3. transport & $-f\cdot\grad p$ & $p(\xi) \leftarrow p\big(\varphi^{-1}(\xi)\big)$, $\varphi$ the flow of $\dot x=f(x)$ over $\dt$ \\
+4. diffusion & $\frac{\eps}{2}\sum_d q_d\partial_d^2 p$ & one implicit-Euler step of the anisotropic heat equation \\
+\bottomrule
+\end{tabular}
+\end{center}
+Step 2 (advancing the reference trajectory) only refreshes the observation $y$. Note that the transport is $p(\xi)\leftarrow p(\varphi^{-1}(\xi))$ and \emph{not} the conservative transport of a probability density (there is no $-(\grad\!\cdot\! f)\,p$ term): $p$ is the exponential of a value function, transported like $V$, and its overall mass has no meaning --- only its shape, its maximiser $\xh=\argmax p=\argmin V$ and its curvature there matter.
+
+\begin{remark}[link with stochastic filtering]
+Replacing the transport term $-f\cdot\grad p$ of \eqref{eq:linear_p} by its conservative form $-\grad\cdot(fp)$ turns it into the Zakai equation of the stochastic filtering problem with model noise $\eps Q$ and observation noise $\eps/\gamma$; the two coincide up to normalisation for every model of the library. Appendix~\ref{sec:zakai} records this, and what the density reading changes for the hybrid closure (moments instead of a Taylor expansion, marginal likelihood instead of max-marginal). As $\eps\to0$ the viscous HJB \eqref{eq:hjb_eps} tends to the deterministic \eqref{eq:hjb}: the Mortensen filter is the \emph{small-noise limit} of the stochastic filter, which is why $\eps$ is called the temperature.
+\end{remark}
+
+\subsection{Refinements (may be skipped on first reading)}
+\label{sec:refinements}
+
+\emph{The two paragraphs below answer questions a careful reader will ask --- where the viscous term of \eqref{eq:hjb_eps} comes from, and what the boundary conditions of the discretisation mean --- but nothing in the rest of the note depends on them.}
+
+\subsubsection{Where the viscous term comes from: noise, and the soft minimum}
+\label{sec:softmin}
+
+Can \eqref{eq:hjb_eps} be obtained, like \eqref{eq:hjb}, as the dynamic-programming equation of some energy? Not of a \emph{deterministic} one: in the derivation of \S1.3 the state moves by $O(\delta)$ over a time $\delta$, so the expansion of $V(x-\delta(f+w),t)$ stops at first order in $\grad V$ whatever the running cost, and one always obtains a first-order equation $\partial_tV + \mathcal H(x,\grad V)=\text{source}$. A term in $\grad^2V$ requires increments of size $O(\sqrt\delta)$, i.e.\ diffusion. Equation \eqref{eq:hjb_eps} is the dynamic-programming equation of the \emph{same} energy \eqref{eq:energy}, for the reversed-time dynamics \emph{perturbed by Brownian noise of intensity $\eps$}, minimising the \emph{expected} energy:
+\begin{equation}
+\begin{aligned}
+  V(x,t) &= \min_{u}\ \mathbb E\Big[\, V_0(X_t) + \frac12\int_0^t\big( u_s\T Q^{-1}u_s + \gamma\, d\big(y(t-s),h(X_s)\big)^2\big)\dd s \Big],\\
+  X_0 &= x,\qquad \dd X_s = \big(-f(X_s)+u_s\big)\dd s + \sqrt{\eps}\,Q^{1/2}\dd B_s .
+\end{aligned}
+\label{eq:stoch_control}
+\end{equation}
+Here $s$ runs backward from $t$ (so the drift is $-f$ and the observation is read at time $t-s$), $u$ is the deterministic part of the model error, and $B$ a Brownian motion. Repeat the argument of \S1.3 with It\^o's formula: $\mathbb E\,V(X_\delta,t-\delta) = V - \delta\,\partial_tV + \delta\,(-f+u)\cdot\grad V + \tfrac{\eps}{2}\delta\tr(Q\grad^2V) + o(\delta)$, the last term being the It\^o correction; minimising over $u$ gives $u=-Q\grad V$ (the reversed-time version of \eqref{eq:wstar}) and the minimal value $-\tfrac12\grad V\T Q\grad V$, whence exactly \eqref{eq:hjb_eps}.
+
+There is nevertheless a sense in which \eqref{eq:hjb_eps} comes from a modified \emph{functional} of paths. Apply the Feynman--Kac formula to the linear equation \eqref{eq:linear_p}: with $X$ the \emph{uncontrolled} noisy reversed-time path ($u=0$),
+\begin{gather*}
+  p(x,t) = \mathbb E_x\Big[ e^{-V_0(X_t)/\eps}\, \exp\Big(-\frac{\gamma}{2\eps}\int_0^t d\big(y(t-s),h(X_s)\big)^2\dd s\Big)\Big],\\
+  \text{i.e.}\qquad V(x,t) = -\eps\log\,\mathbb E_x\big[\, e^{-J_t/\eps}\,\big],
+\end{gather*}
+where $J_t$ is the \emph{original} energy evaluated along the noisy path, the noise now playing the role of the model error. So
+\begin{center}
+  deterministic Mortensen: $V=\displaystyle\min_{\text{paths}} J_t$, \qquad
+  viscous Mortensen: $V = -\eps\log\displaystyle\int_{\text{paths}} e^{-J_t/\eps}$,
+\end{center}
+a \emph{soft minimum} (log-sum-exp) of temperature $\eps$, which tends to the minimum as $\eps\to0$ by Laplace's method. The equivalence of the soft-min form with the control problem \eqref{eq:stoch_control} is the Gibbs variational principle $-\eps\log\mathbb E\,e^{-J/\eps} = \min_u\{\mathbb E_u J + \eps\,\mathrm{KL}(\mathbb P_u\,\|\,\mathbb P)\}$, where by Girsanov the relative entropy of the controlled path law is $\frac{1}{2\eps}\mathbb E\!\int u\T Q^{-1}u$ (Fleming's logarithmic transformation~\cite{FlemingMitter1982}; see~\cite{BoueDupuis1998} for the variational representation).
+
+The same fact is visible on one step of the discrete cycle. One deterministic step is an \emph{inf-convolution} (Hopf--Lax formula): $V^+(x) = \min_w\{V(x-\delta f-\delta w) + \delta\,\tfrac12 w\T Q^{-1}w\}$. Replacing the minimum by the soft minimum,
+\[
+  e^{-V^+(x)/\eps} = \int e^{-V(x-\delta f-\delta w)/\eps}\, e^{-\delta\, w\T Q^{-1}w/(2\eps)}\dd w
+  \;\propto\; \big(p\circ\text{shift by }\delta f\big) * \mathcal N\big(0,\eps\,\delta\,Q\big),
+\]
+a Gaussian convolution of variance $\eps\delta Q$ --- precisely the heat flow $\tfrac{\eps}{2}\sum_d q_d\partial_d^2$ over time $\delta$. The transport and diffusion steps of the library are thus the soft-min version of "transport, then optimise the model error"; the diffusion step is where the minimum over $w$ became an integral.
+
+\subsubsection{Boundary conditions as state constraints}
+\label{sec:bc}
+
+The grid filter works on a box $\Omega$ and needs boundary conditions on $\partial\Omega$: Neumann $\partial_n p=0$ by default, periodic for angles, and optionally homogeneous Dirichlet $p=0$, i.e.\ $V=+\infty$ on the wall (\texttt{FilterParams::dirichlet}). The Dirichlet condition has an exact justification in the framework of \S\ref{sec:softmin}: it is the value function of the \emph{state-constrained} problem "the trajectory must stay in $\Omega$", the constraint being enforced as an infinite cost. Modify the energy by an indicator penalty,
+\[
+  J_t^{\Omega} = J_t + \int_0^t \chi_\Omega\big(x(s)\big)\dd s, \qquad \chi_\Omega = 0 \text{ in }\Omega,\ +\infty\text{ outside},
+\]
+so that every path leaving the box costs $+\infty$ --- this is the semantics implemented in the code, \emph{$p\equiv0$ outside the box}. In the soft-min form, $e^{-\int\chi_\Omega/\eps}$ is the indicator that the noisy path stayed in $\Omega$, hence
+\[
+  p(x,t) = \mathbb E_x\Big[ e^{-V_0(X_t)/\eps}\, e^{-\frac{\gamma}{2\eps}\int_0^t d^2}\; \mathbf 1_{\{\tau>t\}}\Big], \qquad \tau = \text{exit time of }X\text{ from }\Omega,
+\]
+the Feynman--Kac representation for the diffusion \emph{killed} at $\partial\Omega$. This $p$ solves \eqref{eq:linear_p} in $\Omega$ with $p=0$ on $\partial\Omega$~\cite{Freidlin1985}, for one reason: a diffusion started \emph{on} the boundary of a box (a regular domain) exits immediately, so $\mathbb P(\tau>t)=0$ there. In one line: \emph{Dirichlet $=$ killed paths $=$ infinite cost outside.} By contrast, Neumann is the Feynman--Kac formula for the \emph{reflected} diffusion: paths that hit the wall are pushed back inside at no cost, a frictionless barrier the state may slide along. Both are state constraints; they differ in whether touching the wall is allowed.
+
+\paragraph{The deterministic limit.}
+At $\eps=0$ the constrained problem has a value function that is finite up to the boundary (one may end on the wall while staying inside), and the correct boundary condition is Soner's constrained viscosity-solution condition~\cite{Soner1986}, not $V=+\infty$. The two pictures are reconciled by a boundary layer: near the wall the survival probability of the killed diffusion behaves like $\operatorname{dist}(x,\partial\Omega)/\sqrt{\eps q t}$, so
+\[
+  V_\eps(x) \approx V_{\eps=0}(x) - \eps\log\frac{\operatorname{dist}(x,\partial\Omega)}{\sqrt{\eps q t}},
+\]
+(with $V_{\eps=0}$ the constrained deterministic value function, not the prior $V_0$) --- a logarithmic layer of width $\sim\sqrt{\eps q t}$ that disappears as $\eps\to0$ at every interior point. Dirichlet is therefore the consistent $\eps$-regularisation of the state-constrained Mortensen problem; numerically, the layer is the sag of $p$ near the wall over a decay length $\sqrt{\dt\,\eps q/2}$ per step (test \texttt{dirichlet\_diffusion\_absorbs\_at\_the\_boundary}).
+
+\paragraph{Two consequences for the discretisation.}
+The killed heat kernel on a half-space is, by the method of images, $G(x-y)-G(x-\bar y)$ with $\bar y$ the mirror point: the \emph{odd extension}. The sine basis of the Dirichlet diffusion solver is therefore exactly the killed-diffusion propagator. But the odd extension is a device for the \emph{diffusion} kernel only: in the transport step, the drift part of a killed path that exits the box is dead, so a grid point whose preimage $\varphi^{-1}(\xi)$ lies outside must receive $p=0$, not the odd extension's $-p(\text{mirror})$. This is what the code does (test \texttt{dirichlet\_transport\_zeroes\_outside\_preimages}).
+
+\paragraph{Modelling content, and a soft wall.}
+Dirichlet asserts prior knowledge: the state cannot leave $\Omega$, and cannot even approach the wall closer than the layer width without penalty. Neumann asserts nothing about the state and is the pragmatic choice when the box is a mere computational truncation, since it creates no layer; if the box is large enough for $p$ to be negligible at the wall, the two agree. A smooth intermediate is the penalised constraint $\chi_\Omega \to \tfrac12\kappa\operatorname{dist}(x,\Omega)^2$ on an enlarged box: in the code this is one extra multiplicative factor $\exp(-\dt\,\kappa\operatorname{dist}^2/(2\eps))$ in the observation step, converging to Dirichlet as $\kappa\to\infty$ --- a tunable confinement without unstored boundary nodes, possibly a useful third option.
+
+% ===========================================================================
+\section{The hybrid grid--Gaussian closure: the triangular case}
+% ===========================================================================
+\label{sec:main}
+
+Solving \eqref{eq:linear_p} on a grid costs $N^n$ degrees of freedom. The classical way out is to assume a \emph{shape} for $p$ --- a single Gaussian, whose mean and curvature obey the extended-Kalman-type equations of the \emph{tracker} (Appendix~\ref{sec:tracker}) --- at the price of unimodality: a Gaussian cannot represent two competing hypotheses. The hybrid closure keeps the grid in the directions where $p$ may be multimodal and assumes a Gaussian in the others. This section presents it in the case that matters first, and in which it is simplest and exact under mild conditions.
+
+\subsection{Setting and assumptions}
+
+Split the state into $x=(y,z)$, $y\in\R^k$ the \emph{grid directions}, $z\in\R^m$ the \emph{Gaussian directions}, $k+m=n$, and assume the \emph{triangular structure}
+\begin{equation}
+  \dot y = f_y(y) \quad(\text{independent of }z), \qquad Q = \operatorname{diag}(Q_y, Q_z),\quad Q_y = \operatorname{diag}(q_1,\dots,q_k)\succeq0,\ Q_z\succeq0 .
+  \label{eq:T_assumption}
+\end{equation}
+The grid directions evolve autonomously; the Gaussian directions obey $\dot z = f_z(y,z)+w_z$, with an arbitrary dependence on $y$; and \emph{both} blocks may carry model error. The observation $h(y,z)$ is arbitrary. The prototype is a \emph{parameter}: $y=\theta$, $f_y=0$, as in \texttt{kepler\_mu} where $\mu=\mu_0 2^\theta$ and $z=(q,p)$ is the orbital state --- with $q_\theta=0$ for a constant parameter, or $q_\theta>0$ for a slowly drifting one (the usual "artificial parameter noise", which lets the estimator forget). The general case, $f_y$ depending on $z$, brings coupling terms that are derived in Appendices~\ref{sec:hybrid}--\ref{sec:density}; nothing below depends on them.
+
+\subsection{The ansatz}
+
+We look for the solution of \eqref{eq:linear_p} in the form
+\begin{equation}
+\begin{gathered}
+  p(y,z,t) \;=\; \rho(y,t)\,G(y,z,t), \qquad G := \exp\Big(-\frac{1}{\eps}\,\Psi\Big), \\
+  \Psi(y,z,t) := \tfrac12\,\zeta\T S(y,t)\,\zeta, \qquad \zeta := z-\zh(y,t),
+\end{gathered}
+  \label{eq:T_ansatz}
+\end{equation}
+i.e.\ conditionally on $y$, $p$ is a Gaussian in $z$ with mean $\zh(y,t)$ and covariance $\eps\,S(y,t)^{-1}$, multiplied by the $y$-profile $\rho(y,t)$. Since $G\le1$ with equality at $z=\zh$, $\rho=\max_zp$ is the \emph{max-marginal} of $p$ in $y$ --- the quantity the grid filter displays --- and
+\begin{equation}
+  W(y,t) := -\eps\log\rho(y,t) = \min_zV(y,z,t)
+  \label{eq:T_W}
+\end{equation}
+is the corresponding value function, whose gradient will appear below as the velocity of the optimal model error in the grid directions. The unknowns are three fields on the $y$-grid: the scalar $\rho$, the vector $\zh\in\R^m$ and the symmetric matrix $S\in\R^{m\times m}$, that is $1+m+m(m+1)/2$ numbers per $y$-node instead of $N^m$. Matching the orders $0$, $1$, $2$ in $\zeta$ below yields exactly $1$, $m$ and $m(m+1)/2$ equations: the system is square, and this is why the closure matches these three orders and no more.
+
+\subsection{Notation}
+
+Linearise $f_z$ and $h$ \emph{in $z$ only}, around the local mean, keeping their $y$-dependence exact:
+\begin{align*}
+  f_z(y,z) &\approx f_z^0(y) + F_{zz}(y)\,\zeta, & f_z^0 &:= f_z\big(y,\zh(y)\big), & F_{zz} &:= \partial_zf_z\big(y,\zh(y)\big)\in\R^{m\times m},\\
+  d\big(y_{\rm obs},h(y,z)\big)^2 &\approx \abs{r(y)-H_z(y)\,\zeta}^2, & r(y) &:= y_{\rm obs}\ominus h\big(y,\zh(y)\big), & H_z &:= \partial_zh\big(y,\zh(y)\big),
+\end{align*}
+where $r$ is the \emph{innovation} (the signed difference in the observation's own geometry --- plain, or the shortest angle for a bearing) and $y_{\rm obs}$ the observation, not to be confused with the grid coordinate $y$. Let $A := \gy\zh\in\R^{m\times k}$ ($A_{ai}=\partial\zh_a/\partial y_i$) be the slope of the mean field, so that $\partial_{y_i}\zeta = -A_{\cdot i}$, and write $\Delta_Q := \sum_iq_i\,\partial_{y_i}^2$ for the $Q_y$-weighted Laplacian in $y$ and $\grad = (\gy,\gz)$ for the full gradient. The quadratic $\Psi$ has a \emph{finite} expansion in $\zeta$, whose coefficients are the fields and their $y$-derivatives:
+\begin{align}
+  \partial_t\Psi &= -(\partial_t\zh)\T S\zeta + \tfrac12\,\zeta\T(\partial_tS)\zeta, \qquad
+  \gz\Psi = S\zeta, \qquad \gz^2\Psi = S, \label{eq:T_dPsi}\\
+  \partial_{y_i}\Psi &= -A_{\cdot i}\T S\zeta + \tfrac12\,\zeta\T(\partial_iS)\zeta, \qquad
+  \partial_{y_i}\gz\Psi = -SA_{\cdot i} + (\partial_iS)\zeta, \nonumber\\
+  \partial_{y_i}\partial_{y_j}\Psi &= A_{\cdot i}\T SA_{\cdot j}
+   \;\underbrace{-\,(\partial_{ij}\zh)\T S\zeta - A_{\cdot i}\T(\partial_jS)\zeta - A_{\cdot j}\T(\partial_iS)\zeta}_{\text{order 1}}
+   \;+\;\tfrac12\,\zeta\T(\partial_{ij}S)\zeta . \nonumber
+\end{align}
+Note the order-0 term $A_{\cdot i}\T SA_{\cdot j}$ of the $y$-Hessian: a $y$-dependent mean has curvature in $y$ even where $S$ and $\rho$ are flat.
+
+\subsection{Inserting the ansatz into the linear equation}
+
+Under \eqref{eq:T_assumption} the linear equation \eqref{eq:linear_p} reads
+\[
+  \partial_tp = -f_y(y)\cdot\gy p - f_z\cdot\gz p + \frac\eps2\,\Delta_Qp + \frac\eps2\sum_aq_a\,\partial_{z_a}^2p - \frac{\gamma}{2\eps}\,d^2\,p .
+\]
+Insert $p=\rho G$ and divide by $G$. Since $\grad G = -\eps^{-1}\grad\Psi\,G$ and $\grad^2G = \big(\eps^{-2}\grad\Psi\otimes\grad\Psi - \eps^{-1}\grad^2\Psi\big)G$, and since $\rho$ depends on $y$ only, one obtains the exact identity
+\begin{equation}
+\begin{aligned}
+  \partial_t\rho - \frac\rho\eps\,\partial_t\Psi
+  \;={}& -\,f_y\cdot\gy\rho \;+\; \frac\eps2\,\Delta_Q\rho
+  \;+\; \frac\rho\eps\big(f_y\cdot\gy\Psi + f_z\cdot\gz\Psi\big)
+  \;-\; \gy\rho\T Q_y\gy\Psi \\
+  &-\; \frac\rho2\Big[\tr\big(Q_y\Hy\Psi\big) + \tr\big(Q_z\gz^2\Psi\big)\Big]
+  \;+\; \frac{\rho}{2\eps}\Big[\gy\Psi\T Q_y\gy\Psi + \gz\Psi\T Q_z\gz\Psi\Big] \\
+  &-\; \frac{\gamma\rho}{2\eps}\,\abs{r-H_z\zeta}^2 ,
+\end{aligned}
+\label{eq:T_inserted}
+\end{equation}
+with $f_z = f_z^0 + F_{zz}\zeta$. Two remarks before matching orders. The transport of $\rho$ and its $y$-diffusion, $-f_y\cdot\gy\rho + \tfrac\eps2\Delta_Q\rho$, are $\zeta$-free and go to the order-0 equation only. But the $y$-diffusion also produces the mixed term $-\gy\rho\T Q_y\gy\Psi$, which is of order $1$ and $2$ in $\zeta$: through it the \emph{gradient of the profile} enters the equations of the Gaussian parameters --- this is the one place where $Q_y\ne0$ makes a difference, and it is what turns the drift $f_y$ into the characteristic velocity below. When the orders $1$ and $2$ are divided by $\rho$ this term becomes $\gy\rho/\rho = -\gy W/\eps$, a derivative of the value function \eqref{eq:T_W}: bounded and smooth where $W$ is, which is why the equations are written with $W$ rather than with $\log\rho$.
+
+\subsection{Order matching}
+
+Sort \eqref{eq:T_inserted} by powers of $\zeta$; each order must hold identically in $\zeta$. Two combinations organise the result: the \emph{characteristic velocity} of the grid directions and the \emph{deviation noise},
+\begin{equation}
+  c \;:=\; f_y + Q_y\,\gy W, \qquad
+  \tilde Q \;:=\; Q_z + A\,Q_y\,A\T .
+  \label{eq:T_effective}
+\end{equation}
+The first is the velocity $f+Q\grad V$ of the optimal trajectories of \S1.3 (cf.\ \eqref{eq:wstar}) restricted to the grid directions; the second is the covariance of the model error seen by the deviation $\zeta = z-\zh(y)$: a perturbation $w_y$ of $y$ moves the mean by $Aw_y$, so $\zeta$ is perturbed by $w_z - Aw_y$.
+
+\begin{proposition}[hybrid closure, triangular case]
+Under \eqref{eq:T_assumption} and the ansatz \eqref{eq:T_ansatz}, the fields $\rho$, $\zh$, $S$ satisfy
+\begin{align}
+  \text{order 0:}\quad & \partial_t\rho + f_y\cdot\gy\rho - \frac\eps2\,\Delta_Q\rho \;=\; -\Big[\frac{\gamma}{2\eps}\,\abs{r}^2 + \frac12\tr\big(\tilde QS\big)\Big]\rho , \label{eq:T_rho}\\
+  \text{order 1:}\quad & \partial_t\zh + (c\cdot\gy)\,\zh \;=\; f_z\big(y,\zh\big) + \gamma\,S^{-1}H_z\T r
+    + \frac\eps2\Big[\Delta_Q\zh + 2\,S^{-1}\!\sum_iq_i\,(\partial_iS)(\partial_i\zh)\Big], \label{eq:T_zhat}\\
+  \text{order 2:}\quad & \partial_tS + (c\cdot\gy)\,S \;=\; \gamma\,H_z\T H_z - F_{zz}\T S - SF_{zz} - S\tilde QS + \frac\eps2\,\Delta_QS . \label{eq:T_S}
+\end{align}
+\end{proposition}
+\begin{proof}
+\emph{Order 0.} $\grad\Psi$ has no $\zeta$-free part, so only $\partial_t\rho$, the transport and diffusion of $\rho$, the misfit $-\tfrac{\gamma\rho}{2\eps}\abs r^2$ and $-\tfrac\rho2\tr(Q\grad^2\Psi)|_{\zeta=0}$ survive; by \eqref{eq:T_dPsi} the latter is $-\tfrac\rho2[\tr(Q_yA\T SA) + \tr(Q_zS)] = -\tfrac\rho2\tr(\tilde QS)$.
+\emph{Order 1.} The coefficient of $\zeta$: $\tfrac\rho\eps S\partial_t\zh$ on the left; on the right $\tfrac\rho\eps[Sf_z^0 - SAf_y]$ from the drift terms, $+SAQ_y\gy\rho$ from the mixed term (using $\gy\Psi|_1 = -A\T S\zeta$), $\tfrac\rho2[S\Delta_Q\zh + 2\sum_iq_i(\partial_iS)(\partial_i\zh)]$ from $-\tfrac\rho2\tr(Q_y\Hy\Psi)|_1$, and $\tfrac{\gamma\rho}\eps H_z\T r$ from the misfit. Multiply by $\eps S^{-1}/\rho$ and use $\gy\rho/\rho = -\gy W/\eps$: the term $AQ_y\gy\rho/\rho\cdot\eps = -AQ_y\gy W$ joins $Af_y = (f_y\cdot\gy)\zh$ to form $(c\cdot\gy)\zh$.
+\emph{Order 2.} The symmetric matrices of the quadratic terms: $-\tfrac{\rho}{2\eps}\partial_tS$ on the left; on the right $\tfrac{\rho}{2\eps}f_y\cdot\gy S + \tfrac\rho\eps\operatorname{sym}(F_{zz}\T S)$ from the drifts, $-\tfrac12(Q_y\gy\rho)\cdot\gy S$ from the mixed term (using $\gy\Psi|_2 = \tfrac12[\zeta\T\partial_iS\zeta]_i$), $-\tfrac\rho4\Delta_QS$ from the Hessian term, $\tfrac{\rho}{2\eps}S\tilde QS$ from $\grad\Psi\T Q\grad\Psi$ (using $\gy\Psi|_1 = -A\T S\zeta$, $\gz\Psi = S\zeta$), and $-\tfrac{\gamma\rho}{2\eps}H_z\T H_z$ from the misfit. Multiply by $-2\eps/\rho$; the mixed term becomes $-(Q_y\gy W)\cdot\gy S$ and joins $f_y\cdot\gy S$ to form $c\cdot\gy S$.
+\end{proof}
+
+\subsection{The weighted variables}
+
+Equations \eqref{eq:T_zhat}--\eqref{eq:T_S} contain $\gy W = -\eps\gy\rho/\rho$, obtained by dividing the orders $1$ and $2$ by $\rho$. The division is not needed: multiply back by $\rho$ and combine with \eqref{eq:T_rho} into evolution equations for the \emph{weighted} fields
+\begin{equation}
+  \zr := \rho\,\zh\in\R^m, \qquad \Sr := \rho\,S\in\R^{m\times m}
+  \label{eq:T_weighted}
+\end{equation}
+(the weighted mean and the weighted information). Write $\mathcal L$ for the transport--diffusion operator of \eqref{eq:T_rho} and $R$ for its decay rate,
+\[
+  \mathcal LX := \partial_tX + f_y\cdot\gy X - \tfrac\eps2\,\Delta_QX, \qquad
+  R := \frac{\gamma}{2\eps}\abs r^2 + \frac12\tr\big(\tilde QS\big).
+\]
+Since $\rho\,\gy W = -\eps\gy\rho$, the control terms of \eqref{eq:T_zhat}--\eqref{eq:T_S} multiplied by $\rho$ are $-\eps\sum_iq_i\,\partial_i\rho\,\partial_i\zh$ and $-\eps\sum_iq_i\,\partial_i\rho\,\partial_iS$, which are exactly the cross terms of $\Delta_Q(\rho\,\cdot) = \rho\,\Delta_Q(\cdot) + 2\sum_iq_i\,\partial_i\rho\,\partial_i(\cdot) + (\cdot)\,\Delta_Q\rho$; the transport terms recombine by the product rule, and one obtains
+\begin{align}
+  \mathcal L\rho &= -R\,\rho, \label{eq:T_w_rho}\\
+  \mathcal L\zr &= -R\,\zr + \rho\Big[ f_z\big(y,\zh\big) + \gamma\,S^{-1}H_z\T r + \eps\,S^{-1}\!\sum_iq_i\,(\partial_iS)(\partial_i\zh)\Big], \label{eq:T_w_z}\\
+  \mathcal L\Sr &= -R\,\Sr + \rho\Big[ \gamma\,H_z\T H_z - F_{zz}\T S - SF_{zz} - S\tilde QS\Big]. \label{eq:T_w_S}
+\end{align}
+All three fields are transported and diffused by the \emph{same} linear operator $\mathcal L$ as $p$ itself, with the common decay $-R$ and sources equal to $\rho$ times the tracker's right-hand sides. This is no accident: the $y$-part of the linear equation \eqref{eq:linear_p} commutes with taking "moments" in $z$, and $(\rho,\zr,\Sr)$ are the closure's moments. No gradient of $W$ or of $\rho$ remains --- the characteristic velocity $c$ has been absorbed into the diffusion of the weighted fields --- and the Gaussian parameters $\zh = \zr/\rho$, $S = \Sr/\rho$ are only needed pointwise, to evaluate the sources, at nodes where $\rho$ is not negligible: where $\rho\approx0$ the node carries no weight and its parameters are immaterial. Appendix~\ref{sec:density} derives the same equations for a $y$-drift depending on $z$ and shows how the $y$-diffusion step is computed in log-space, without ever forming $\rho$; when $Q_y=0$, $\mathcal L$ is a derivation and \eqref{eq:T_w_rho}--\eqref{eq:T_w_S} are simply \eqref{eq:T_rho}--\eqref{eq:T_S} multiplied by $\rho$.
+
+\subsection{Reading the equations}
+
+All three equations have the same structure: a material derivative along the characteristic velocity $c$ (for $\rho$, along $f_y$ --- the control correction $Q_y\gy W$ is already inside the diffusion of $\rho$), a diffusion in $y$, and a source. Along a characteristic $\dot Y = c(Y,t)$, the pair $(\zh,S)$ obeys the tracker equations of Appendix~\ref{sec:tracker} for the $z$-subsystem $\dot z = f_z(Y(t),z)+w_z$ --- Mortensen's second-order estimator, the extended Kalman filter in information form --- with two modifications due to the grid-direction noise: the noise seen by the deviation is $\tilde Q$ rather than $Q_z$, and the fields are smoothed in $y$ by the viscous terms in $\Delta_Q$. The profile $\rho$ records the \emph{cost} of each characteristic, the accumulated observation misfit of its tracker plus a volume term, and it is the only place where $\eps$ appears explicitly (through $W=-\eps\log\rho$ in $c$, and through the viscous terms).
+
+The estimate is read off in two steps: the most plausible characteristic, $y^\star(t) = \argmax_y\rho(y,t) = \argmin_yW(y,t)$, and its state $\zh(y^\star,t)$ --- the whole profile $\rho(\cdot,t)$ being available to detect competing hypotheses.
+
+\paragraph{The volume term.}
+The rate $\tfrac12\tr(\tilde QS) = \tfrac12\tr(Q_zS) + \tfrac12\tr(Q_yA\T SA)$ in \eqref{eq:T_rho} has no counterpart in the tracker and deserves a word. Under the $z$-diffusion a Gaussian widens, $S$ decreases at the rate $-SQ_zS$, and since the diffusion conserves its integral its \emph{peak} must drop: $\tfrac{d}{dt}\log\det S = -\tr(Q_zS)$, so the peak, proportional to $\det S^{1/2}$, decays at the rate $\tfrac12\tr(Q_zS)$. The second part is the same effect for the $y$-diffusion of a mean field with slope $A$: mixing neighbouring Gaussians whose means differ by $A\,\delta y$ widens the conditional Gaussian by $AQ_yA\T$. This is the correct evolution of the max-marginal $\rho=\max_zp$; the integrated marginal $\int p\,\dd z = (2\pi\eps)^{m/2}\rho\,\det S^{-1/2}$ does not carry it. At fixed $\eps$ it competes with the observation misfit $\tfrac{\gamma}{2\eps}\abs r^2$ --- a characteristic whose Gaussian is broader loses less peak height --- but the misfit is $O(1/\eps)$ and the volume term $O(1)$, so the misfit decides as soon as $\eps$ is small relative to the output discrepancy between characteristics.
+
+\paragraph{The $y$-diffusion of the parameters.}
+The viscous terms $\tfrac\eps2\Delta_Q\zh$, $\tfrac\eps2\Delta_QS$ and the advection by $Q_y\gy W$ are the first-order description of one phenomenon: the $y$-diffusion of $p$ mixes the Gaussians of neighbouring characteristics, and the closure re-summarises the mixture by a single Gaussian whose mean is a $\rho$-weighted average of the neighbouring means (weights pulled toward lower $W$) and whose information is the corresponding average of the informations. This is the only step of the cycle where the closure is genuinely approximate outside the exact case; Appendix~\ref{sec:density} shows how to compute it without ever dividing by $\rho$, and Appendix~\ref{sec:stability} that it preserves $\rho\ge0$ and $S\succeq0$.
+
+\begin{remark}[the degenerate case $k=0$: the tracker]
+With no grid direction there is no $y$: $\rho(t)$ is a scalar, $\zh(t)$ and $S(t)$ are global, $A$, $c$ and $\Delta_Q$ disappear, and \eqref{eq:T_rho}--\eqref{eq:T_S} become
+\[
+  \dot{\zh} = f(\zh) + \gamma\,S^{-1}H\T r, \qquad
+  \dot S = \gamma\,H\T H - F\T S - SF - SQS, \qquad
+  \frac{d}{dt}\log\rho = -\frac{\gamma}{2\eps}\abs r^2 - \frac12\tr(QS),
+\]
+i.e.\ exactly the tracker of \texttt{src/tracker.rs} (Appendix~\ref{sec:tracker}, equations \eqref{eq:tracker_x}--\eqref{eq:tracker_S}), plus the evolution of the peak value $\rho = \max p$, which the tracker discards because it is irrelevant to $\zh$ and $S$: this is where $\eps$ hides, and why the tracker is $\eps$-free. In terms of $P=S^{-1}$ the second equation is the Riccati equation $\dot P = FP+PF\T+Q-\gamma PH\T HP$ of the Kalman--Bucy filter with observation covariance $I/\gamma$; when $f$ and $h$ are affine the ansatz is exact and the tracker \emph{is} the Kalman filter (the test \texttt{matches\_kalman\_filter\_on\_linear\_model}). The other degenerate case, $m=0$, is the full grid filter: \eqref{eq:T_rho} with $\rho=p$ is \eqref{eq:linear_p} restricted to the grid directions.
+\end{remark}
+
+\begin{remark}[exactness]
+The closure drops the terms of order $\ge3$ in $\zeta$. It is exact whenever none arises, i.e.\ whenever $p$ is genuinely Gaussian in $z$ for every $y$ at all times: $f_z$ affine in $z$ ($f_z(y,z) = a(y)+B(y)z$, arbitrary in $y$), $h$ affine in $z$ with the Euclidean distance, $Q_z$ constant, and a prior Gaussian in $z$. These are the \emph{conditionally linear-Gaussian} models for which, in the stochastic setting, the Rao--Blackwellized (marginalized) particle filter is exact~\cite{Doucet2000,Schon2005}: the hybrid is its deterministic counterpart, with the $y$-grid in the role of the particles and the max-marginal in the role of the marginal likelihood (Appendix~\ref{sec:exact}). Note that exactness requires $f_z$ affine in $z$ but not in $y$, and puts no condition on $Q_y$: the $y$-diffusion of a field of Gaussians whose means are affine in $y$ is again such a field. Outside this class the error is that of the extended Kalman filter along each characteristic --- a local, well-understood error --- while the multimodality in $y$ is represented exactly on the grid.
+\end{remark}
+
+\begin{remark}[the case $Q_y=0$: a bank of trackers]
+Without model noise in the grid directions, $c=f_y$, $\tilde Q = Q_z$, $\Delta_Q\equiv0$, and the three equations share the left-hand side $\partial_t + f_y\cdot\gy$:
+\begin{align*}
+  \partial_t\rho + f_y\cdot\gy\rho &= -\Big[\frac{\gamma}{2\eps}\abs r^2 + \frac12\tr(Q_zS)\Big]\rho, \\
+  \partial_t\zh + (f_y\cdot\gy)\zh &= f_z(y,\zh) + \gamma S^{-1}H_z\T r, \\
+  \partial_tS + (f_y\cdot\gy)S &= \gamma H_z\T H_z - F_{zz}\T S - SF_{zz} - SQ_zS .
+\end{align*}
+They are solved by the method of characteristics: along $\dot Y = f_y(Y)$, with $\zh(t)=\zh(Y(t),t)$ etc.,
+\begin{gather*}
+  \dot{\zh} = f_z(Y,\zh) + \gamma S^{-1}H_z\T r, \qquad
+  \dot S = \gamma H_z\T H_z - F_{zz}\T S - SF_{zz} - SQ_zS, \\
+  \rho(t) = \rho(0)\exp\Big(-\!\int_0^t\Big[\frac{\gamma}{2\eps}\abs r^2 + \frac12\tr(Q_zS)\Big]\dd s\Big):
+\end{gather*}
+a \emph{bank of trackers indexed by the characteristics of $\dot y=f_y(y)$, weighted by their accumulated cost}, with no coupling between characteristics and no approximation beyond the tracker's own. In the parameter case $f_y=0$ the characteristics are the grid nodes themselves: one independent tracker per node, the classical multiple-model estimator with a minimum-energy weighting. Nothing is ever divided by $\rho$: the profile is best carried as $W=-\eps\log\rho$, which simply accumulates the cost. The price of $Q_y=0$ is that $\rho$ can only sharpen: a wrong early verdict is never revised, and a drifting parameter cannot be followed --- which is what $q_\theta>0$ buys, at the cost of the $y$-diffusion step above.
+\end{remark}
+
+\subsection{The discrete cycle}
+\label{sec:cycle_main}
+
+The weighted system \eqref{eq:T_w_rho}--\eqref{eq:T_w_S} is the form to discretise in time, and $\rho$ is kept as a variable throughout. Write $X := (\rho,\zr,\Sr)$ and split the right-hand sides into five generators,
+\begin{equation}
+  \partial_tX \;=\; \mathcal A_yX + \mathcal OX + \mathcal T_zX + \mathcal QX + \mathcal D_yX ,
+  \label{eq:T_split}
+\end{equation}
+\begin{align*}
+  \mathcal A_yX &:= -\,f_y\cdot\gy X \qquad\text{(transport in $y$, all three fields)},\\
+  \mathcal OX &:= -\frac{\gamma}{2\eps}\abs r^2\,X + \rho\,\big(0,\ \gamma S^{-1}H_z\T r,\ \gamma H_z\T H_z\big) \qquad\text{(observation)},\\
+  \mathcal T_zX &:= \rho\,\big(0,\ f_z(y,\zh),\ -F_{zz}\T S - SF_{zz}\big) \qquad\text{(transport in $z$)},\\
+  \mathcal QX &:= -\frac12\tr(\tilde QS)\,X + \rho\,\big(0,\ 0,\ -S\tilde QS\big) \qquad\text{(diffusion of the deviation, $\tilde Q = Q_z + AQ_yA\T$)},\\
+  \mathcal D_yX &:= \frac\eps2\,\Delta_QX + \rho\,\Big(0,\ \eps S^{-1}\!\sum_iq_i(\partial_iS)(\partial_i\zh),\ 0\Big) \qquad\text{(diffusion in $y$)},
+\end{align*}
+whose sum is \eqref{eq:T_w_rho}--\eqref{eq:T_w_S} (the decay $R$ is split between $\mathcal O$ and $\mathcal Q$). Two facts make the splitting easy. First, the decay is a \emph{scalar factor common to the three fields}: it reweights a node and never moves its parameters. Second, every generator except $\mathcal D_y$ acts node by node and has a \emph{closed-form flow} in which $\rho$ appears only as a multiplier --- the tracker's steps written for the weighted variables. In particular the quadratic (Riccati) piece of $\mathcal Q$, $\partial_t\Sr = -\rho^{-1}\Sr\tilde Q\Sr$ at frozen $\rho$, is the M\"obius map $\Sr\leftarrow\Sr(I+\tfrac{\dt}\rho\tilde Q\Sr)^{-1}$, and the division can be pushed inside the resolvent:
+\begin{equation}
+  \Sr\Big(I+\frac{\dt}{\rho}\,\tilde Q\Sr\Big)^{-1} \;=\; \rho\,\Sr\,\big(\rho I + \dt\,\tilde Q\Sr\big)^{-1},
+  \label{eq:T_moebius}
+\end{equation}
+which is $\rho$ times the tracker's step $S(I+\dt\tilde QS)^{-1}$, exact for the quadratic term and positivity preserving. The exact flows over one step $\dt$ are, in the order of the library's cycle (observation, transport in $y$ then $z$, diffusion in $z$ then $y$):
+
+\begin{center}\small
+\begin{tabular}{@{}l p{11.6cm}@{}}
+\toprule
+$\mathcal O$ & $S_\rho^+ := \Sr + \dt\gamma\rho\,H_z\T H_z$, \quad
+  $\vartheta_{\mathcal O} := \exp\!\Big(-\frac{\dt\gamma}{2\eps}\Big[\abs r^2 - \dt\gamma\rho\; r\T H_z(S_\rho^+)^{-1}H_z\T r\Big]\Big)$; \newline
+  $\rho\leftarrow\vartheta_{\mathcal O}\,\rho$, \quad
+  $\zr\leftarrow\vartheta_{\mathcal O}\big(\zr + \dt\gamma\rho^2\,(S_\rho^+)^{-1}H_z\T r\big)$, \quad
+  $\Sr\leftarrow\vartheta_{\mathcal O}\,S_\rho^+$ \\[3pt]
+$\mathcal A_y$ & $X(y)\leftarrow X\big(\varphi_y^{-1}(y)\big)$: the grid transport, component-wise, with the precomputed plan (identity if $f_y=0$) \\[3pt]
+$\mathcal T_z$ & $\zr\leftarrow\rho\,\varphi_z\big(y,\zr/\rho\big)$, \quad $\Sr\leftarrow\Phi_{zz}^{-\mathsf T}\Sr\Phi_{zz}^{-1}$, \quad $\Phi_{zz}=\partial_z\varphi_z$ at $\zr/\rho$ (\texttt{gl4\_step\_with\_jacobian}) \\[3pt]
+$\mathcal Q$ & $\vartheta_{\mathcal Q} := \rho^{m/2}\det\big(\rho I+\dt\,\tilde Q\Sr\big)^{-1/2}$ \ ($=\det(I+\dt\tilde QS)^{-1/2}$); \newline
+  $\rho\leftarrow\vartheta_{\mathcal Q}\,\rho$, \quad $\zr\leftarrow\vartheta_{\mathcal Q}\,\zr$, \quad
+  $\Sr\leftarrow\vartheta_{\mathcal Q}\;\rho\,\Sr\big(\rho I+\dt\,\tilde Q\Sr\big)^{-1}$ \ (pre-update $\rho$) \\[3pt]
+$\mathcal D_y$ & split implicit-Euler step of $\tfrac\eps2\Delta_Q$ on each of the $1+m+m(m+1)/2$ fields (the library's step, absent if $Q_y=0$); optionally $\zr\leftarrow\zr + \dt\,\eps\rho\,S^{-1}\sum_iq_i(\partial_iS)(\partial_i\zh)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each line is the exact solution of its generator: $\mathcal O$ is the multiplication of a Gaussian by the quadratic misfit, completed into a square ($\vartheta_{\mathcal O}$ carries the misfit at the old mean and the gain in peak height from the shift of the mean); $\mathcal T_z$ is the tracker's transport with the exact discrete tangent; $\mathcal Q$ is the Riccati flow \eqref{eq:T_moebius} together with the loss of peak height of the widening Gaussian, $\vartheta_{\mathcal Q}$, which is the exact integral of the decay $-\tfrac12\tr(\tilde QS)$ --- both volume terms of \eqref{eq:T_rho} at once, since $\tilde Q$ contains $AQ_yA\T$; $\mathcal D_y$ is the same split step as for $p$, applied entry-wise, i.e.\ the $\rho$-weighted average of the neighbouring parameters (the $\gy W$-advection is inside it, cf.\ \S2.6), with the $O(\eps)$ Laplace correction of \eqref{eq:T_w_z} as an optional explicit sub-step (dropping it re-closes the mean by moment matching rather than at the mode, a difference of the order of the closure error itself).
+
+\paragraph{Where the parameters are needed.}
+The coefficients $r$, $H_z$, $F_{zz}$, $\varphi_z$, $\Phi_{zz}$ and $\tilde Q$ (through $A=\gy\zh$, by finite differences on the grid) are evaluated at the local parameters $\zh=\zr/\rho$, $S=\Sr/\rho$. These are the only divisions by $\rho$, and they are harmless: where $\rho$ is negligible the node carries no weight and its coefficients are immaterial, so nodes below a threshold are frozen. Since $p$ is unnormalised, $X$ is renormalised by $\max_y\rho$ at every step, which keeps $\rho\in(0,1]$ and costs nothing. (Appendix~\ref{sec:density} gives the alternative that never forms $\rho$ at all, carrying $W=-\eps\log\rho$ and computing $\mathcal D_y$ as a softmax.)
+
+\paragraph{Order and accuracy.}
+The composition $\Phi^{\dt}_{\mathcal D_y}\circ\Phi^{\dt}_{\mathcal Q}\circ\Phi^{\dt}_{\mathcal T_z}\circ\Phi^{\dt}_{\mathcal A_y}\circ\Phi^{\dt}_{\mathcal O}$ is a Lie splitting, first order in $\dt$ like the grid filter's cycle it mirrors; the symmetric composition (half steps of $\mathcal O$ at both ends, $\mathcal A_y$, $\mathcal T_z$, $\mathcal Q$, $\mathcal D_y$, $\mathcal Q$, $\mathcal T_z$, $\mathcal A_y$) is Strang, second order, with the same sub-flows. Every node-wise flow keeps $\Sr\succeq0$ (a sum with a PSD matrix, a congruence, a M\"obius map with $\tilde Q\succeq0$) and multiplies $\rho$ by a positive factor; the two grid steps keep $\rho\ge0$ and $\Sr\succeq0$ under the library's nodal-positivity condition for the split diffusion and nonnegative interpolation weights for the transport (Appendix~\ref{sec:stability}). With $Q_y=0$, $\mathcal D_y$ is absent, $\tilde Q=Q_z$, and the cycle is a bank of independent trackers with weights.
+
+\paragraph{Cost, on \texttt{kepler\_mu}.}
+With $y=\theta$ ($k=1$) and $z=(q,p)$ ($m=4$): $N_\theta$ nodes, each carrying $1+4+10 = 15$ numbers --- $75$ numbers at the viewer's default $N_\theta=5$, below $10^3$ even for a fine parameter grid of $60$ nodes, against $21^4N_\theta\approx10^6$ grid values for the full filter; with $q_\theta>0$ the $y$-diffusion adds one one-dimensional split step per field per time step. And the estimator gains what the single tracker lacks: at $\theta_{\rm true}=0.4$ the $q_1$-likelihood is phase-aliased over a few orbital periods, so the value function has several local minima in $\theta$ and the tracker collapses into a wrong one (the test \texttt{tracker\_estimates\_theta\_from\_q1\_observations} documents the failure). Here the $\theta$-direction is on the grid: the tracker at the true node stays phase-locked and accumulates almost no cost, the others pay, and $\rho(\theta)$ develops its global maximum at the truth whatever the number of local ones on the way.
+
+\paragraph{What is left out, and where to find it.}
+A $y$-drift depending on $z$ ($F_{yz}\ne0$) adds coupling terms --- the sensitivity of the grid directions to $z$ against the slope of $W$, and its counterpart in the effective Jacobian $F_{zz}-AF_{yz}$. They are derived in the value-function representation in Appendix~\ref{sec:hybrid}, and in the density representation --- where they, and the $\gy W$-terms above, are best handled through the weighted fields $\rho\zh$, $\rho S$ --- in Appendix~\ref{sec:density}, together with the stability properties (Appendix~\ref{sec:stability}). The choice of a shared curvature and of adapted coordinates are in Appendices~\ref{sec:sharedS} and \ref{sec:coords}.
+
+\appendix
+\section*{About the appendices}
+The following sections are kept for the record. They contain the Gaussian closure in all directions (the tracker, Appendix~\ref{sec:tracker}); the hybrid closure \emph{without} the triangular assumption of \S\ref{sec:main} --- arbitrary coupling $f_y(y,z)$ --- in the value-function representation (Appendix~\ref{sec:hybrid}) and in the density representation, where the coupling is best handled through the weighted fields $\zr=\rho\zh$, $\Sr=\rho S$ (Appendix~\ref{sec:density}, with the stability properties in \S\ref{sec:stability}); the intermediate closure with a single curvature matrix shared by all nodes (Appendix~\ref{sec:sharedS}); the closure after a change of coordinates in the Gaussian block making the $z$-dynamics conditionally affine (Appendix~\ref{sec:coords}); the Zakai equation --- the stochastic counterpart of the linear equation --- and the derivation of the hybrid closure by moments (Appendix~\ref{sec:zakai}); its exactness (Appendix~\ref{sec:exact}); the earlier presentation of the triangular case (Appendix~\ref{sec:triangular}); the discrete cycle of the general case (Appendix~\ref{sec:cycle}); the \emph{moving frame} $p=\rho(R(x-\xh))$ --- a grid that follows the mode, with the small-$\xi$ analysis that fixes the frame (the tracker equations corrected by the third and fourth derivatives of $V$) and shows that the grid then carries a standard Gaussian plus an expansion in $\sqrt\eps$ on an $\eps$-independent box (Appendix~\ref{sec:frame}); caveats and the validation plan.
+
+% ===========================================================================
+\section{The Gaussian closure: the tracker}
+% ===========================================================================
+\label{sec:tracker}
+
+Solving \eqref{eq:hjb_eps} on a grid costs $N^n$ degrees of freedom. The oldest way to make it tractable is to \emph{assume a shape} for $V$ and keep only the parameters of that shape. The tracker of \texttt{src/tracker.rs} assumes that $V$ is quadratic:
+\begin{equation}
+  V(x,t) \;\approx\; V_0(t) + \tfrac12\,\big(x-\xh(t)\big)\T S(t)\,\big(x-\xh(t)\big),
+  \label{eq:ansatz_tracker}
+\end{equation}
+i.e.\ $p$ is a Gaussian of mean $\xh$ and covariance $\eps S^{-1}$. The unknowns are $\xh(t)\in\R^n$ and the symmetric matrix $S(t)$ (the \emph{information} or curvature). To obtain their evolution, insert the ansatz into \eqref{eq:hjb_eps} and expand everything in powers of the deviation $\xi = x-\xh$; since the ansatz has only three parameters (a scalar, a vector, a matrix), only the orders $0,1,2$ in $\xi$ can be matched, and all higher orders are dropped. This is the \emph{second-order closure}.
+
+We need $f$ and $h$ near $\xh$: linearise, $f(x)\approx f(\xh)+F\xi$ with $F=\partial f/\partial x(\xh)$, and $h(x)\approx h(\xh)+H\xi$ with $H=\partial h/\partial x(\xh)$, so that
+\[
+  d\big(y,h(x)\big)^2 \approx \abs{r - H\xi}^2, \qquad r := y \ominus h(\xh)
+\]
+is the \emph{innovation} (signed difference in the observation's own geometry --- plain difference, or shortest angle for a bearing). The derivatives of the ansatz are
+\[
+  \grad V = S\xi,\qquad \grad^2 V = S,\qquad
+  \partial_t V = \dot V_0 - \dot{\xh}\T S\xi + \tfrac12\,\xi\T\dot S\,\xi .
+\]
+Insert into \eqref{eq:hjb_eps} and sort by order in $\xi$:
+\begin{align*}
+  \text{order }0:&\quad \dot V_0 - \tfrac{\eps}{2}\tr(QS) = \tfrac12\gamma\abs{r}^2,\\
+  \text{order }1:&\quad -\dot{\xh}\T S\xi + f(\xh)\T S\xi = -\gamma\, r\T H\xi ,\\
+  \text{order }2:&\quad \tfrac12\xi\T\dot S\xi + \xi\T F\T S\xi + \tfrac12\xi\T S Q S\xi = \tfrac12\gamma\,\xi\T H\T H\xi .
+\end{align*}
+The order-1 identity must hold for every $\xi$, hence (using $S=S\T$)
+\begin{equation}
+  \dot{\xh} \;=\; f(\xh) + \gamma\, S^{-1}H\T r ,
+  \label{eq:tracker_x}
+\end{equation}
+and the order-2 identity, after symmetrising $\xi\T F\T S\xi = \tfrac12\xi\T(F\T S+SF)\xi$,
+\begin{equation}
+  \dot S \;=\; \gamma\,H\T H - F\T S - S F - S Q S .
+  \label{eq:tracker_S}
+\end{equation}
+Two observations:
+\begin{itemize}[nosep]
+  \item $\eps$ has disappeared from \eqref{eq:tracker_x}--\eqref{eq:tracker_S}: it only enters the order-0 equation, i.e.\ the normalisation $V_0$, which is irrelevant to the estimate and its curvature. The tracker is the $\eps\to0$ limit of the closure, Mortensen's second-order minimum-energy estimator.
+  \item In terms of $P=S^{-1}$, \eqref{eq:tracker_S} reads $\dot P = FP + PF\T + Q - \gamma\,PH\T HP$: the Riccati equation of the (extended) Kalman--Bucy filter with observation covariance $I/\gamma$. When $f$ and $h$ are affine and $V_0$ quadratic, the ansatz \eqref{eq:ansatz_tracker} is \emph{exact} (a quadratic function stays quadratic under \eqref{eq:hjb_eps}) and the tracker \emph{is} the Kalman filter --- this is the test \texttt{matches\_kalman\_filter\_on\_linear\_model}.
+\end{itemize}
+The closure is unimodal by construction: it cannot represent a value function with two competing minima, and when the true $V$ has them (e.g.\ a phase-aliased likelihood, see \S\ref{sec:kepler}) the tracker follows one of them, not necessarily the right one.
+
+% ===========================================================================
+\section{The hybrid: Gaussian closure in a subset of directions}
+% ===========================================================================
+\label{sec:hybrid}
+
+\subsection{The ansatz}
+
+Split the state into two groups of coordinates,
+\[
+  x = (y, z), \qquad y\in\R^k \ \text{(grid directions)}, \qquad z\in\R^m \ \text{(Gaussian directions)},\qquad k+m=n,
+\]
+and assume that $V$ is quadratic in $z$ \emph{for every fixed} $y$, with $y$-dependent coefficients:
+\begin{equation}
+  \boxed{\;
+  V(y,z,t) \;=\; W(y,t) \;+\; \tfrac12\,\zeta\T S(y,t)\,\zeta, \qquad \zeta := z - \zh(y,t).\;}
+  \label{eq:ansatz_hybrid}
+\end{equation}
+Equivalently, $p=e^{-V/\eps}$ is, conditionally on $y$, a Gaussian in $z$ with mean $\zh(y)$ and covariance $\eps S(y)^{-1}$, multiplied by the $y$-profile $e^{-W(y)/\eps}$. The unknowns are three \emph{fields on the $y$-grid}: the scalar $W$, the vector $\zh\in\R^m$ and the symmetric matrix $S\in\R^{m\times m}$, i.e.\ $1+m+m(m+1)/2$ numbers per $y$-grid point instead of $N^m$ --- in total $N^k\big(1+m+m(m+1)/2\big)$ against $N^{k+m}$. Matching the orders $0$, $1$ and $2$ in $\zeta$ below yields exactly $1$, $m$ and $m(m+1)/2$ coefficient equations (a scalar, a vector, a symmetric matrix): the system is square, which is why the closure matches precisely these three orders and no more. The same balance, $1+n+n(n+1)/2$, holds for the tracker of \S\ref{sec:tracker}. The counts, with $N$ grid points per direction and $N_\theta$ points on a parameter grid:
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+representation & unknowns & \texttt{kepler\_mu} ($k=1$, $m=4$, $n=5$) \\
+\midrule
+full grid & $N^n$ & $21^4 N_\theta \approx 9.7\cdot10^5$ at $N_\theta=5$ \\
+tracker ($k=0$) & $1+n+n(n+1)/2$ & $21$ \\
+hybrid, per $y$-node & $1+m+m(m+1)/2$ & $15$ \\
+hybrid, total & $N^k\big(1+m+m(m+1)/2\big)$ & $15\,N_\theta = 75$ at $N_\theta=5$; $<10^3$ up to $N_\theta\approx60$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The two limits are immediate. With $m=0$ there is no $z$: $V=W(y)$ and we are back to the full grid filter. With $k=0$ there is no $y$: $W$ is a constant, $\zh$ and $S$ are global, and \eqref{eq:ansatz_hybrid} is exactly the tracker ansatz \eqref{eq:ansatz_tracker}. The hybrid is therefore a genuine interpolating family, and the derivation below is literally the tracker derivation with $y$ carried along untouched.
+
+\begin{remark}[which quantity lives on the grid]
+The grid filter's 2D pictures are \emph{max}-marginals: $\max$ of $p$ over the other directions. Under \eqref{eq:ansatz_hybrid}, $\max_z p(y,z) = e^{-W(y)/\eps}$ and $\min_z V(y,z)=W(y)$: the field $W$ is exactly the max-marginal value function in $y$, the natural object of the minimum-energy viewpoint. The \emph{integrated} marginal $\int p\dd z = (2\pi\eps)^{m/2} e^{-W/\eps}\det S(y)^{-1/2}$ differs by a volume factor; the term $\frac{\eps}{2}\tr(Q_zS)$ that appears below in the $W$ equation is precisely what keeps track of it.
+\end{remark}
+
+\subsection{Notation}
+
+Write $f=(f_y,f_z)$ with $f_y\in\R^k$, $f_z\in\R^m$, and assume $Q=\operatorname{diag}(Q_y,Q_z)$ (diagonal model noise, as in the code). Linearise $f$ and $h$ \emph{in $z$ only}, around $\zh(y)$, keeping their $y$-dependence exact:
+\begin{align*}
+  f_y(y,z) &\approx f_y^0(y) + F_{yz}(y)\,\zeta, & f_y^0 &:= f_y\big(y,\zh(y)\big), & F_{yz} &:= \partial_z f_y\big(y,\zh(y)\big),\\
+  f_z(y,z) &\approx f_z^0(y) + F_{zz}(y)\,\zeta, & f_z^0 &:= f_z\big(y,\zh(y)\big), & F_{zz} &:= \partial_z f_z\big(y,\zh(y)\big),\\
+  d\big(y_{\rm obs},h(y,z)\big)^2 &\approx \abs{r(y) - H_z(y)\,\zeta}^2, & r(y) &:= y_{\rm obs}\ominus h\big(y,\zh(y)\big), & H_z &:= \partial_z h\big(y,\zh(y)\big),
+\end{align*}
+with $F_{yz}\in\R^{k\times m}$, $F_{zz}\in\R^{m\times m}$ and $H_z\in\R^{n_{\rm obs}\times m}$. (Here $y_{\rm obs}$ is the observation, not to be confused with the grid coordinate $y$.) Finally let
+\[
+  A(y) := \gy\zh \in\R^{m\times k}\quad (A_{ai}=\partial\zh_a/\partial y_i), \qquad
+  \Delta_Q := \sum_{i,j} (Q_y)_{ij}\,\partial_{y_i}\partial_{y_j},
+\]
+the Jacobian of the mean field and the $Q_y$-weighted Laplacian in $y$, and write $u\cdot\gy S := \sum_i u_i\,\partial_{y_i}S$ for a vector field $u$ on $\R^k$.
+
+\subsection{Derivatives of the ansatz}
+
+Because $\zeta$ depends on $y$ through $\zh(y)$ (namely $\partial_{y_i}\zeta = -A_{\cdot i}$, the $i$-th column of $A$), the $y$-derivatives of \eqref{eq:ansatz_hybrid} contain coupling terms:
+\begin{align}
+  \gz V &= S\zeta, \qquad \gz^2 V = S, \label{eq:dz}\\
+  \partial_{y_i} V &= \partial_i W \;-\; A_{\cdot i}\T S\zeta \;+\; \tfrac12\,\zeta\T(\partial_i S)\zeta, \label{eq:dy}\\
+  \partial_{y_i}\partial_{y_j} V &= \partial_{ij}W + A_{\cdot i}\T S A_{\cdot j}
+     \;\underbrace{-\,(\partial_j A_{\cdot i})\T S\zeta - A_{\cdot i}\T(\partial_j S)\zeta - A_{\cdot j}\T(\partial_i S)\zeta}_{\text{order 1}}
+     \;+\;\underbrace{\tfrac12\,\zeta\T(\partial_{ij}S)\zeta}_{\text{order 2}}, \label{eq:dyy}\\
+  \partial_t V &= \partial_t W \;-\; (\partial_t\zh)\T S\zeta \;+\; \tfrac12\,\zeta\T(\partial_t S)\zeta . \label{eq:dtV}
+\end{align}
+(Equation \eqref{eq:dyy} is obtained by differentiating \eqref{eq:dy} once more, remembering that both $\zeta$ and $S$ depend on $y$.) The orders in $\zeta$ are marked; note the order-0 piece $A_{\cdot i}\T S A_{\cdot j}$ of the $y$-Hessian: a $y$-dependent Gaussian mean has curvature in $y$ even where $W$ is flat.
+
+\subsection{Order matching}
+
+Insert \eqref{eq:dz}--\eqref{eq:dtV} and the linearisations into the viscous HJB \eqref{eq:hjb_eps}, written as
+\begin{multline*}
+  \partial_t V + f_y\cdot\gy V + f_z\cdot\gz V + \tfrac12\,\gy V\T Q_y\gy V + \tfrac12\,\gz V\T Q_z\gz V \\
+  - \tfrac{\eps}{2}\tr\big(Q_y\Hy V\big) - \tfrac{\eps}{2}\tr\big(Q_z\gz^2 V\big) = \tfrac12\gamma\, d^2 ,
+\end{multline*}
+and collect the terms of order $0$, $1$ and $2$ in $\zeta$. The bookkeeping is elementary but long; we list the contributions of each term of the equation.
+\begin{itemize}[leftmargin=1.5em]
+  \item $\partial_t V$: order 0: $\partial_tW$; order 1: $-(\partial_t\zh)\T S\zeta$; order 2: $\tfrac12\zeta\T(\partial_tS)\zeta$.
+  \item $f_y\cdot\gy V = (f_y^0+F_{yz}\zeta)\cdot\big(\gy W - A\T S\zeta + \tfrac12[\zeta\T\partial_iS\zeta]_i\big)$:\\
+    order 0: $f_y^0\cdot\gy W$;\quad
+    order 1: $-\big(SAf_y^0\big)\T\zeta + \big(F_{yz}\T\gy W\big)\T\zeta$;\quad
+    order 2: $\tfrac12\zeta\T\big(f_y^0\cdot\gy S\big)\zeta - \tfrac12\zeta\T\big(F_{yz}\T A\T S + SAF_{yz}\big)\zeta$.
+  \item $f_z\cdot\gz V = (f_z^0+F_{zz}\zeta)\cdot S\zeta$:\quad order 1: $\big(Sf_z^0\big)\T\zeta$;\quad order 2: $\tfrac12\zeta\T\big(F_{zz}\T S+SF_{zz}\big)\zeta$.
+  \item $\tfrac12\gy V\T Q_y\gy V$:\quad order 0: $\tfrac12\gy W\T Q_y\gy W$;\quad order 1: $-\big(SAQ_y\gy W\big)\T\zeta$;\\
+    order 2: $\tfrac12\zeta\T\big((Q_y\gy W)\cdot\gy S + SAQ_yA\T S\big)\zeta$.
+  \item $\tfrac12\gz V\T Q_z\gz V$:\quad order 2: $\tfrac12\zeta\T SQ_zS\zeta$.
+  \item $-\tfrac{\eps}{2}\tr(Q_y\Hy V) - \tfrac{\eps}{2}\tr(Q_z S)$, from \eqref{eq:dyy}:\\
+    order 0: $-\tfrac{\eps}{2}\big[\tr(Q_y\Hy W) + \tr(Q_yA\T SA) + \tr(Q_zS)\big]$;\\
+    order 1: $+\tfrac{\eps}{2}\big[S\,\Delta_Q\zh + 2\sum_{ij}(Q_y)_{ij}(\partial_iS)A_{\cdot j}\big]\T\zeta$;\quad
+    order 2: $-\tfrac{\eps}{4}\zeta\T(\Delta_QS)\zeta$.
+  \item Right-hand side $\tfrac12\gamma\abs{r-H_z\zeta}^2$:\\
+    order 0: $\tfrac12\gamma\abs r^2$;\quad order 1: $-\gamma\big(H_z\T r\big)\T\zeta$;\quad order 2: $\tfrac12\gamma\,\zeta\T H_z\T H_z\zeta$.
+\end{itemize}
+
+\subsection{The hybrid equations}
+
+Equating the coefficients of each order gives the three evolution equations. Introduce the \emph{characteristic velocity} of the $y$-problem,
+\begin{equation}
+  c(y) := f_y^0(y) + Q_y\,\gy W(y),
+  \label{eq:characteristic}
+\end{equation}
+which is the velocity $f+Q\grad V$ of the optimal trajectories (cf.\ \eqref{eq:wstar}) restricted to the grid directions.
+
+\begin{proposition}[hybrid closure of the viscous HJB]
+Under the ansatz \eqref{eq:ansatz_hybrid} and the linearisation in $z$, the fields $W$, $\zh$, $S$ on $\R^k$ satisfy, at order $0$,
+\begin{equation}
+\begin{aligned}
+  \partial_t W + f_y^0\cdot\gy W + \tfrac12\,\gy W\T Q_y\gy W - \tfrac{\eps}{2}\tr\big(Q_y\Hy W\big) \\
+  \;=\; \tfrac12\gamma\,\abs{r}^2 + \tfrac{\eps}{2}\Big[\tr(Q_zS) + \tr\big(Q_yA\T SA\big)\Big],
+\end{aligned}
+\label{eq:hyb_W}
+\end{equation}
+at order $1$,
+\begin{equation}
+\begin{aligned}
+  \partial_t\zh + A\,c \;={}& f_z^0 + \gamma\,S^{-1}H_z\T r + S^{-1}F_{yz}\T\gy W \\
+  &+ \tfrac{\eps}{2}\Big[\Delta_Q\zh + 2\,S^{-1}\!\sum_{ij}(Q_y)_{ij}(\partial_iS)(\partial_j\zh)\Big],
+\end{aligned}
+\label{eq:hyb_z}
+\end{equation}
+and at order $2$,
+\begin{equation}
+\begin{aligned}
+  \partial_t S + c\cdot\gy S \;={}& \gamma\,H_z\T H_z - F_{zz}\T S - SF_{zz} - SQ_zS \\
+  &- SAQ_yA\T S + F_{yz}\T A\T S + SAF_{yz} + \tfrac{\eps}{2}\,\Delta_Q S .
+\end{aligned}
+\label{eq:hyb_S}
+\end{equation}
+\end{proposition}
+\begin{proof}
+Order 0 is the sum of the order-0 contributions; order 1 holds for all $\zeta$, so the coefficient vectors must agree, and one multiplies by $S^{-1}$ after noting $A c = A f_y^0 + AQ_y\gy W$; order 2 holds for all $\zeta$ with symmetric matrices on both sides, so the matrices agree.
+\end{proof}
+
+Read the three equations as follows.
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{$W$ obeys the $k$-dimensional viscous HJB} \eqref{eq:hjb_eps} on the grid, with the drift $f_y(y,\zh(y))$ evaluated at the local Gaussian mean, the observation source $\tfrac12\gamma\abs{r(y)}^2$ evaluated at the local mean, and two new $y$-dependent sources: $\tfrac{\eps}{2}\tr(Q_zS)$ --- the term the tracker discards as a constant, which here penalises regions where the conditional Gaussian is narrow (the volume factor of the remark above) --- and $\tfrac{\eps}{2}\tr(Q_yA\T SA)$, the curvature cost of a $y$-dependent mean. Both vanish as $\eps\to0$.
+  \item \textbf{$\zh$ is advected along the characteristics}: the left-hand side of \eqref{eq:hyb_z} is the material derivative $\partial_t\zh + (c\cdot\gy)\zh$. The sources are the tracker's ($f_z$ and the observation correction $\gamma S^{-1}H_z\T r$), a coupling $S^{-1}F_{yz}\T\gy W$ (if moving $z$ changes where $y$ goes, and $W$ has a slope, the optimal $z$ shifts), and an $O(\eps)$ diffusion of the mean field in $y$.
+  \item \textbf{$S$ obeys the tracker's Riccati equation along the characteristics}, plus $-SAQ_yA\T S$ (model noise in $y$ leaks into $z$-uncertainty through the slope of $\zh(y)$), coupling terms in $F_{yz}$, and an $O(\eps)$ diffusion of the information field in $y$.
+\end{itemize}
+Setting $k=0$ (no $y$, hence $A=0$, $F_{yz}=0$, no $y$-derivatives) recovers \eqref{eq:tracker_x}--\eqref{eq:tracker_S} exactly; setting $m=0$ recovers \eqref{eq:hjb_eps} in $y$.
+
+\begin{remark}[Gauss--Newton]
+As in the tracker, $f$ and $h$ were linearised: the second derivatives $\partial_z^2 f$, $\partial_z^2 h$ are dropped. One order-2 term of this kind is not multiplied by a small quantity: $\tfrac12\zeta\T\big(\gy W\cdot\partial_z^2 f_y\big)\zeta$, from the $z$-curvature of the $y$-drift against the slope of $W$. It vanishes whenever $f_y$ does not depend on $z$ (the triangular case of \S\ref{sec:triangular}); otherwise it may be added to the right-hand side of \eqref{eq:hyb_S}.
+\end{remark}
+
+% ===========================================================================
+\section{The same closure in the density representation}
+% ===========================================================================
+\label{sec:density}
+
+The library evolves $p$, not $V$, and \S\ref{sec:hybrid} left a blemish: the closed equations \eqref{eq:hyb_z}--\eqref{eq:hyb_S} contain $\gy W = -\eps\,\gy\log\rho$, a logarithmic derivative of the $y$-profile, which is not a grid-friendly quantity where $\rho$ is tiny. This section redoes the closure in the other order --- Hopf--Cole transformation \emph{first}, ansatz \emph{second} --- and shows that the logarithm then never appears: the equations come out multiplied by $\rho$, and the natural unknowns are the weighted fields $\rho$, $\rho\zh$, $\rho S$, all of which are transported and diffused by the same linear operator as $p$ itself. To keep the formulas readable we take $Q_y=\operatorname{diag}(q_1,\dots,q_k)$ as in the code, so that $\Delta_Q = \sum_i q_i\partial_{y_i}^2$; the general case only replaces $\sum_i q_i\,\partial_i(\cdot)\,\partial_i(\cdot)$ by $\sum_{ij}(Q_y)_{ij}\,\partial_i(\cdot)\,\partial_j(\cdot)$.
+
+\subsection{The ansatz in the linear equation}
+
+Under the ansatz \eqref{eq:ansatz_hybrid}, with $\rho := e^{-W/\eps}$,
+\begin{equation}
+  p(y,z,t) \;=\; \rho(y,t)\,G(y,z,t), \qquad
+  G := \exp\Big(-\frac{1}{2\eps}\,\zeta\T S(y,t)\,\zeta\Big), \qquad \zeta = z-\zh(y,t),
+  \label{eq:p_ansatz}
+\end{equation}
+so that $\rho=\max_z p$ is the max-marginal. The Gaussian factor is the only place where $z$ enters, and its logarithmic derivatives are polynomials in $\zeta$ (recall $\partial_{y_i}\zeta = -A_{\cdot i}$):
+\begin{align*}
+  \partial_t G &= \frac{1}{\eps}\Big[(\partial_t\zh)\T S\zeta - \tfrac12\zeta\T(\partial_tS)\zeta\Big]G, \\
+  \gz G &= -\frac{1}{\eps}\,S\zeta\,G, \qquad
+  \sum_a q_a\,\partial_{z_a}^2 G = \Big[\frac{1}{\eps^2}\,\zeta\T SQ_zS\zeta - \frac1\eps\tr(Q_zS)\Big]G, \\
+  \partial_{y_i}G &= g_i\,G, \qquad g_i := \frac{1}{\eps}\Big[A_{\cdot i}\T S\zeta - \tfrac12\,\zeta\T(\partial_iS)\zeta\Big], \\
+  \partial_{y_i}^2 G &= \big(g_i^2 + \partial_ig_i\big)G, \qquad
+  \partial_i g_i = \frac{1}{\eps}\Big[(\partial_i^2\zh)\T S\zeta + 2A_{\cdot i}\T(\partial_iS)\zeta - A_{\cdot i}\T SA_{\cdot i} - \tfrac12\,\zeta\T(\partial_i^2S)\zeta\Big].
+\end{align*}
+Insert $p=\rho G$ into the linear equation \eqref{eq:linear_p}, with $f$ and $h$ linearised in $z$ as in \S3.2, and divide by $G$ --- \emph{not} by $p$:
+\begin{equation}
+\begin{aligned}
+  \partial_t\rho + \frac{\rho}{\eps}\Big[(\partial_t\zh)\T S\zeta - \tfrac12\zeta\T(\partial_tS)\zeta\Big]
+  \;={}& -f_y\cdot\gy\rho \;-\; \rho\sum_i f_{y,i}\,g_i \;+\; \frac{\rho}{\eps}\,f_z\T S\zeta \\
+  &+ \frac{\eps}{2}\sum_i q_i\Big[\partial_i^2\rho + 2\,\partial_i\rho\; g_i + \rho\,\big(g_i^2+\partial_ig_i\big)\Big] \\
+  &+ \frac{\rho}{2\eps}\,\zeta\T SQ_zS\zeta - \frac{\rho}{2}\tr(Q_zS) \;-\; \frac{\gamma\rho}{2\eps}\,\abs{r-H_z\zeta}^2 ,
+\end{aligned}
+\label{eq:p_inserted}
+\end{equation}
+with $f_y = f_y^0 + F_{yz}\zeta$ and $f_z = f_z^0 + F_{zz}\zeta$. The decisive observation is that \emph{every term of \eqref{eq:p_inserted} is linear in $\rho$, $\gy\rho$, $\Hy\rho$, with coefficients that are polynomials in $\zeta$}. Matching the powers of $\zeta$ therefore produces equations in which $\rho$ and its derivatives enter linearly, and no division by $\rho$ is ever required. This is the structural reason why no logarithm appears: the Hopf--Cole transformation has already absorbed it.
+
+\subsection{Order matching}
+
+\paragraph{Order 0.}
+Only $g_i^2$ (order $\ge2$), $\partial_ig_i|_0 = -\eps^{-1}A_{\cdot i}\T SA_{\cdot i}$ and the $\zeta$-free parts contribute:
+\begin{equation}
+  \boxed{\;
+  \begin{aligned}
+  \partial_t\rho \;={}& -\,f_y\big(y,\zh\big)\cdot\gy\rho \;+\; \frac{\eps}{2}\sum_{i=1}^{k} q_i\,\partial_{y_i}^2\rho \\
+  &-\; \Big[\,\frac{\gamma}{2\eps}\,\abs{r(y)}^2 + \frac12\tr\big(Q_zS\big) + \frac12\tr\big(Q_yA\T SA\big)\Big]\rho .
+  \end{aligned}\;}
+  \label{eq:hyb_rho}
+\end{equation}
+This is \eqref{eq:linear_p} in $k$ dimensions, with the drift and the observation misfit evaluated at the local Gaussian mean $\zh(y)$, plus two extra decay rates: $\tfrac12\tr(Q_zS)$ --- the peak of the local Gaussian drops as the $z$-diffusion widens it (note that this rate carries no $\eps$) --- and $\tfrac12\tr(Q_yA\T SA)$, the analogous loss due to the $y$-diffusion of a mean field with slope $A$. It is the Hopf--Cole transform of the order-0 equation \eqref{eq:hyb_W}.
+
+\paragraph{Order 1.}
+Collecting the coefficients of $\zeta$ (the terms $2\partial_i\rho\,g_i$ and $\rho\,\partial_ig_i$ of the $y$-diffusion contribute here) and multiplying by $\eps$:
+\begin{equation}
+  \rho\,S\,\partial_t\zh \;=\; \rho\Big[S f_z^0 - SAf_y^0 + \gamma\,H_z\T r\Big]
+  \;+\; \eps\,\big[SAQ_y - F_{yz}\T\big]\gy\rho
+  \;+\; \frac{\eps\rho}{2}\Big[S\,\Delta_Q\zh + 2\sum_i q_i\,(\partial_iS)(\partial_i\zh)\Big].
+  \label{eq:p_order1}
+\end{equation}
+Compare with the order-1 equation \eqref{eq:hyb_z} of the value-function derivation: this is \eqref{eq:hyb_z} multiplied by $\rho S$, with $-\eps\,\gy\rho$ in place of $\rho\,\gy W$. The gradient of $\rho$ appears, not that of its logarithm.
+
+\paragraph{Order 2.}
+Collecting the symmetric matrices of the quadratic terms (now $g_i^2$ contributes through $(A_{\cdot i}\T S\zeta)^2$, and the $y$-diffusion through $2\partial_i\rho\,g_i$) and multiplying by $-2\eps$:
+\begin{equation}
+\begin{aligned}
+  \rho\,\partial_tS \;={}& \rho\Big[\gamma\,H_z\T H_z - F_{zz}\T S - SF_{zz} - SQ_zS - SAQ_yA\T S + F_{yz}\T A\T S + SAF_{yz}\Big] \\
+  &- \rho\,f_y^0\cdot\gy S \;+\; \eps\sum_i q_i\,\partial_i\rho\,\partial_iS \;+\; \frac{\eps\rho}{2}\,\Delta_QS .
+\end{aligned}
+\label{eq:p_order2}
+\end{equation}
+Again \eqref{eq:hyb_S} multiplied by $\rho$, the term $\eps\sum_iq_i\partial_i\rho\,\partial_iS$ being $\rho$ times the $-\eps Q_y\gy\log\rho\cdot\gy S$ part of the characteristic advection.
+
+\subsection{Weighted variables}
+
+Equations \eqref{eq:p_order1}--\eqref{eq:p_order2} give $\partial_t\zh$ and $\partial_tS$ only after division by $\rho$, which would bring back $\gy\rho/\rho=\gy\log\rho$. The division is unnecessary: combine them with the order-0 equation into evolution equations for the \emph{weighted} fields
+\[
+  \rho, \qquad \zr := \rho\,\zh\in\R^m, \qquad \Sr := \rho\,S\in\R^{m\times m}
+\]
+(max-marginal, weighted mean, weighted information), using $\partial_t\zr = \zh\,\partial_t\rho + \rho\,\partial_t\zh$ and $\partial_t\Sr = S\,\partial_t\rho + \rho\,\partial_tS$. Write $\mathcal L$ for the transport--diffusion operator of \eqref{eq:hyb_rho} and $R$ for its decay rate,
+\[
+  \mathcal L X := \partial_t X + f_y\big(y,\zh\big)\cdot\gy X - \tfrac{\eps}{2}\Delta_Q X,
+  \qquad
+  R := \frac{\gamma}{2\eps}\abs{r}^2 + \frac12\tr(Q_zS) + \frac12\tr\big(Q_yA\T SA\big).
+\]
+In the sum, the $\eps\,\gy\rho$ terms of \eqref{eq:p_order1}--\eqref{eq:p_order2} are exactly the cross terms $\eps\sum_iq_i\,\partial_i\rho\,\partial_i(\cdot)$ of $\Delta_Q(\rho\,\cdot) = \rho\,\Delta_Q(\cdot) + 2\sum_iq_i\partial_i\rho\,\partial_i(\cdot) + (\cdot)\,\Delta_Q\rho$, and the transport terms recombine likewise, giving
+\begin{align}
+  \mathcal L\rho &= -R\,\rho, \label{eq:w_rho}\\
+  \mathcal L\zr &= -R\,\zr + \rho\Big[ f_z\big(y,\zh\big) + \gamma\,S^{-1}H_z\T r + \eps\,S^{-1}\!\sum_{i} q_i\,(\partial_iS)(\partial_i\zh)\Big] - \eps\,S^{-1}F_{yz}\T\gy\rho, \label{eq:w_m}\\
+  \mathcal L\Sr &= -R\,\Sr + \rho\Big[ \gamma\,H_z\T H_z - F_{zz}\T S - SF_{zz} - SQ_zS - SAQ_yA\T S + F_{yz}\T A\T S + SAF_{yz}\Big]. \label{eq:w_Sigma}
+\end{align}
+All three fields are transported and diffused by the \emph{same} linear operator $\mathcal L$ as $p$ itself, with the common decay $-R$ and sources equal to $\rho$ times the tracker's right-hand sides \eqref{eq:tracker_x}--\eqref{eq:tracker_S}. This is no accident: the $y$-part of \eqref{eq:linear_p} is linear and commutes with taking "moments" in $z$, and $(\rho,\zr,\Sr)$ are the closure's moments. No logarithm remains. The gradient $\gy\rho$ survives only in the $O(\eps)$ coupling through $F_{yz}$ (absent in the triangular case of \S\ref{sec:triangular}), and the Gaussian parameters $\zh = \zr/\rho$, $S=\Sr/\rho$ (and $A=\gy\zh$, needed in $R$ and in \eqref{eq:w_Sigma} only when $Q_y\ne0$ or $F_{yz}\ne0$) are required pointwise, to evaluate the sources, at nodes where $\rho$ is not negligible --- where $\rho\approx0$ the node carries no weight and its parameters are immaterial, so in practice they are frozen below a threshold. The inverse $S^{-1}$ in \eqref{eq:w_m} is the local covariance the tracker computes anyway.
+
+\subsection{Relation to the value-function derivation, and the triangular case}
+
+The two derivations are the same closure. The linear equation \eqref{eq:linear_p} equals $-(p/\eps)$ times the residual of the viscous HJB \eqref{eq:hjb_eps}; dividing by $G$ instead of $p$ leaves $-(\rho/\eps)$ times that residual, whose expansion in $\zeta$ is the one of \S3.4. Matching orders therefore yields the equations of \S\ref{sec:hybrid} multiplied by $\rho$ --- and the multiplication by $\rho$ is precisely what turns $\gy W = -\eps\gy\rho/\rho$ into $-\eps\gy\rho$. In other words: the value-function form is the natural one for the \emph{parameters} $(W,\zh,S)$, the density form for the \emph{weighted moments} $(\rho,\zr,\Sr)$; the logarithm belongs to the conversion between the two, not to the closure.
+
+For an implementation the density form is the right one: the existing $k$-dimensional transport and split-diffusion steps of the grid filter are applied component-wise to the $1+m+m(m+1)/2$ fields $(\rho,\zr,\Sr)$, and the observation and $z$-diffusion steps are the tracker's, applied per node to $(\zh,S)$ and multiplied back by $\rho$. The $y$-diffusion of $(\rho,\rho\zh)$ followed by the division $\zh=\zr/\rho$ is the $\rho$-weighted average of the neighbouring means --- a discrete moment matching of the mean; for the information it averages $S$ rather than the covariance, the difference (the spread of the neighbouring means) being an $O(\eps)$ effect of the same order as the closure itself.
+
+In the triangular case ($f_y=f_y(y)$, $Q_y=0$) every coupling disappears and \eqref{eq:w_rho} reduces to
+\[
+  \partial_t\rho + f_y\cdot\gy\rho \;=\; -\Big[\frac{\gamma}{2\eps}\abs{r(y)}^2 + \frac12\tr\big(Q_zS(y)\big)\Big]\rho ,
+\]
+and for a parameter direction ($f_y=0$) to the explicit weight of each node,
+\[
+  \rho(y,t) = \rho(y,0)\,\exp\Big(-\int_0^t\Big[\frac{\gamma}{2\eps}\abs{r(y,s)}^2 + \frac12\tr\big(Q_zS(y,s)\big)\Big]\dd s\Big),
+\]
+the multiple-model weight of the tracker attached to $y$, decaying with its accumulated cost.
+
+\subsection{Structure and stability}
+\label{sec:stability}
+
+\paragraph{The hidden Riccati structure of \eqref{eq:w_Sigma}.}
+Group the source of \eqref{eq:w_Sigma} with the \emph{effective} Jacobian and noise
+\begin{equation}
+  \tilde F := F_{zz} - A\,F_{yz}, \qquad \tilde Q := Q_z + A\,Q_y\,A\T .
+  \label{eq:effective}
+\end{equation}
+Since $-F_{zz}\T S - SF_{zz} + F_{yz}\T A\T S + SAF_{yz} = -\tilde F\T S - S\tilde F$ and $-SQ_zS - SAQ_yA\T S = -S\tilde QS$, and since $\tfrac12\tr(Q_zS)+\tfrac12\tr(Q_yA\T SA) = \tfrac12\tr(\tilde QS)$, equations \eqref{eq:w_Sigma} and the decay rate read, exactly,
+\begin{equation}
+  \mathcal L\Sr = -R\,\Sr + \rho\Big[\gamma\,H_z\T H_z - \tilde F\T S - S\tilde F - S\tilde QS\Big],
+  \qquad
+  R = \frac{\gamma}{2\eps}\abs r^2 + \frac12\tr\big(\tilde Q S\big).
+  \label{eq:w_Sigma_riccati}
+\end{equation}
+Both objects have a meaning. The deviation $\zeta = z-\zh(y)$ of a trajectory from the local mean evolves by $\dot\zeta = f_z - A f_y - \partial_t\zh$, whose Jacobian in $z$ at fixed $y$ is $F_{zz} - AF_{yz} = \tilde F$; and a model error $(w_y,w_z)$ of covariance $\operatorname{diag}(Q_y,Q_z)$ perturbs $\zeta$ by $w_z - Aw_y$, of covariance $Q_z + AQ_yA\T = \tilde Q$. So \eqref{eq:w_Sigma_riccati} is nothing but the \emph{information Riccati equation of the deviation variable} $\zeta$ --- the tracker's equation \eqref{eq:tracker_S} with the slope of the mean field folded into the dynamics and the noise --- transported along the characteristics, weighted by $\rho$ and damped at the rate $R$. Everything known about Riccati equations transfers.
+
+\begin{proposition}[maximum principle for $\rho$]
+Let $S(\cdot,t)\succeq0$ on $[0,T]$. Then $R\ge0$, and the solution of \eqref{eq:w_rho} with Neumann, periodic or Dirichlet boundary conditions satisfies $0\le\rho(\cdot,t)\le\norm{\rho(\cdot,0)}_\infty$ for all $t\in[0,T]$, the upper bound being nonincreasing in $t$.
+\end{proposition}
+\begin{proof}
+\eqref{eq:w_rho} is a linear parabolic equation $\partial_t\rho + f_y^0\cdot\gy\rho - \tfrac\eps2\Delta_Q\rho + R\rho = 0$ with a bounded drift and a nonnegative zero-order coefficient; the weak maximum principle applies (with $\rho=0$ on a Dirichlet wall, $\partial_n\rho=0$ on a Neumann wall, and no boundary in a periodic direction). Nonnegativity of $R$ is $\abs r^2\ge0$ and $\tr(\tilde QS) = \tr(\tilde Q^{1/2}S\tilde Q^{1/2})\ge0$.
+\end{proof}
+
+\begin{proposition}[cone invariance for $\Sr$]
+Consider the Lie splitting of \eqref{eq:w_rho}, \eqref{eq:w_Sigma_riccati} into (i) the local Riccati flow $\partial_t\Sr = -R\Sr + \rho[\gamma H_z\T H_z - \tilde F\T S - S\tilde F - S\tilde QS]$ at each $y$ (with $\rho$, $S=\Sr/\rho$ frozen in $\mathcal L$), and (ii) the linear transport--diffusion $\mathcal L X = 0$ applied to each entry of $\Sr$. Both steps map fields with values in the closed convex cone $\mathcal K = \{\Sr\succeq0\}$ into $\mathcal K$-valued fields; hence so does the split scheme, and its limit.
+\end{proposition}
+\begin{proof}[Proof sketch]
+(i) Where $\rho>0$, write $\Sr=\rho S$: since $\partial_t\rho=-R\rho$ in step (i), the term $-R\Sr$ is exactly $S\,\partial_t\rho$, and $S$ itself obeys $\partial_tS = \gamma H_z\T H_z - \tilde F\T S - S\tilde F - S\tilde QS$, the information-form Riccati equation with $\tilde Q\succeq0$. Its flow preserves $S\succeq0$, even from a singular initial matrix --- the classical result for the Kalman--Bucy equation~\cite{KalmanBucy1961,Bucy1972}; in the splitting of \S\ref{sec:cycle} it is visible step by step: $S+\dt\gamma H_z\T H_z$, $\Phi^{-\mathsf T}S\Phi^{-1}$ and $S(I+\dt\tilde QS)^{-1}$ all map $\mathcal K$ into itself. Where $\rho=0$, $\Sr=0$ stays in $\mathcal K$. (ii) The semigroup of a scalar linear parabolic operator is positivity preserving, and the same scalar operator acts on every entry: for any fixed $v\in\R^m$, $v\T\Sr v$ is a scalar field solving $\mathcal L(v\T\Sr v)=0$ from nonnegative data, hence stays nonnegative. A sum of two generators each sub-tangential to a closed convex cone leaves it invariant (Nagumo), which is what the Trotter product formula expresses.
+\end{proof}
+
+\begin{remark}[two-sided Riccati bounds]
+Along a characteristic on which the linearised pair $(\tilde F, H_z)$ is uniformly observable and $(\tilde F,\tilde Q^{1/2})$ uniformly controllable, the classical bounds of Bucy~\cite{Bucy1972} give $c_1I\preceq S(y,t)\preceq c_2I$ for $t\ge t_0$, with constants depending on the observability and controllability Gramians only. This is exactly what the mean equation \eqref{eq:w_m} needs: $S^{-1}$ bounded. The bounds are on $S=\Sr/\rho$, i.e.\ they are meaningful where $\rho$ is not negligible --- precisely where the parameters matter.
+\end{remark}
+
+\begin{remark}[the mean equation]
+Given $\rho\in[\rho_{\min},\rho_{\max}]$ with $\rho_{\min}>0$ on a subdomain and the bounds on $S$ above, \eqref{eq:w_m} is a linear parabolic equation for $\zr$ with bounded coefficients (the innovation $r(y,\zr/\rho)$ is Lipschitz in $\zr$ there), hence well posed with $L^2$ and $L^\infty$ estimates: bounded data give bounded $\zr$. This is stability in the PDE sense --- continuous dependence --- not a statement that $\zh$ tracks the truth, which is the next item.
+\end{remark}
+
+\begin{proposition}[exact case: convergence of the bank of trackers]
+Assume the triangular parameter structure of \S\ref{sec:triangular} ($f_y=0$, $Q_y=0$), conditionally linear dynamics and observation (\S\ref{sec:exact}), noise-free data generated at the parameter $y^\star$, and for every node $y$ uniform observability of $(F_{zz}(y),H_z(y))$ and controllability of $(F_{zz}(y),Q_z^{1/2})$. Then:
+\begin{enumerate}[nosep,label=(\roman*)]
+  \item at the true node, the estimation error $\zh(y^\star,t)-z(t)$ tends to zero exponentially (Kalman--Bucy);
+  \item for every node $y$, $S(y,t)$ converges to the steady-state information $S_\infty(y)$ of its Riccati equation, and the innovation $r(y,t)$ converges to the output discrepancy $\delta_y(t)$ between the steady-state estimator of model $y$ driven by the true output and that output;
+  \item the log-weight ratio satisfies
+  \begin{multline*}
+    \log\frac{\rho(y,t)}{\rho(y^\star,t)} = \log\frac{\rho(y,0)}{\rho(y^\star,0)}
+    -\frac{\gamma}{2\eps}\int_0^t\big(\abs{r(y,s)}^2 - \abs{r(y^\star,s)}^2\big)\dd s \\
+    -\; \frac12\int_0^t\tr\big(Q_z\,(S(y,s)-S(y^\star,s))\big)\dd s ,
+  \end{multline*}
+  so that $\rho(y,t)/\rho(y^\star,t)\to0$ exponentially whenever the model at $y$ is \emph{output-distinguishable} from the truth, $d_y^2 := \liminf_{t\to\infty}\frac1t\int_0^t\abs{\delta_y}^2\dd s > 0$, provided
+  \[
+    \gamma\, d_y^2 \;>\; \eps\,\Big[\tr\big(Q_zS_\infty(y^\star)\big) - \tr\big(Q_zS_\infty(y)\big)\Big]_+ .
+  \]
+\end{enumerate}
+\end{proposition}
+\begin{proof}[Proof sketch]
+(i)--(ii) are the classical stability of the Kalman--Bucy filter under uniform observability and controllability~\cite{KalmanBucy1961,AndersonMoore1979}, applied at each node, where the closure is exact. (iii) is \eqref{eq:w_rho} integrated at two nodes with $f_y=0$, $Q_y=0$; the first integral grows like $\tfrac{\gamma}{2\eps}d_y^2\,t$ and the second at most like $\tfrac12\abs{\tr(Q_z(S_\infty(y)-S_\infty(y^\star)))}\,t$.
+\end{proof}
+
+Item (iii) is the minimum-energy multiple-model consistency result (Magill~\cite{Magill1965}, Hassani et al.~\cite{Hassani2009}) with one addition that the value-function derivation makes explicit: the \emph{volume term} $\tfrac12\tr(Q_zS)$. A node whose steady-state information is smaller (a broader conditional Gaussian) loses less peak height under the $z$-diffusion, and at fixed $\eps$ this competes with the output discrepancy --- the deterministic counterpart of the Occam factor of a Bayesian marginal likelihood. The condition in (iii) says that the discrepancy wins as soon as $\eps$ is small relative to $\gamma d_y^2$; in the limit $\eps\to0$ (pure minimum energy) it always does, and the argmin of $W$ identifies $y^\star$ whenever the models are output-distinguishable.
+
+\begin{proposition}[discrete cone stability]
+Consider the discrete hybrid cycle of \S\ref{sec:cycle}: per-node tracker steps for $(\zh,S)$, and the grid filter's transport and split implicit-Euler diffusion applied entry-wise to $(\rho,\zr,\Sr)$. If the split diffusion step is nodally positive (the mesh condition of the library, $\dt\,\eps q_i/2$ large enough relative to the local mesh size squared) and the transport interpolation weights are nonnegative, then $\rho\ge0$ and $\Sr\succeq0$ at every node are preserved by every step of the cycle.
+\end{proposition}
+\begin{proof}
+Per node: $S+\dt\gamma H_z\T H_z\succeq S$; $\Phi^{-\mathsf T}S\Phi^{-1}\succeq0$; $S(I+\dt Q_zS)^{-1} = (S^{-1}+\dt Q_z)^{-1}\succeq0$ (in the limit sense when $S$ is singular); the weight $\rho$ is multiplied by positive factors. On the grid: a nodally positive diffusion step and a transport step with nonnegative weights write each new node value as a nonnegative combination of old node values, and nonnegative combinations of PSD matrices (resp.\ nonnegative scalars) are PSD (resp.\ nonnegative).
+\end{proof}
+The two hypotheses are exactly those under which the grid filter itself preserves the positivity of $p$: the split scheme (\texttt{DiffusionScheme::SplitEuler}) was chosen for the first, and the second fails for the degree-$p$ Lagrange interpolation of the transport step beyond first order, for $\Sr$ as for $p$ --- the same, documented, caveat. In the triangular case ($f_y=0$, $Q_y=0$) neither grid step acts on $(\zr,\Sr)$, and the cone stability of the bank of trackers is unconditional.
+
+\paragraph{What is not covered.}
+Two things are out of reach of these arguments, and should be. The \emph{closure error} --- the dropped $O(\zeta^3)$ terms outside the conditionally linear case --- is a modelling error, not a stability question; controlling it needs smallness of $\partial_z^3V$, and the local results for the extended Kalman filter~\cite{Reif1999} and for the Mortensen observer~\cite{Krener2003,BreitenSchroeder2023} are the right template (bounded error for small initial error and bounded second derivatives). And \emph{global} convergence in $y$ for nonlinear models is exactly what no local argument can give --- it is the multimodality that made the single tracker fail on \texttt{kepler\_mu}, now represented on the grid rather than closed away.
+
+% ===========================================================================
+\section{A shared curvature: the ansatz with $S$ independent of $y$}
+% ===========================================================================
+\label{sec:sharedS}
+
+Between the tracker (one Gaussian, mean affine in $y$, constant curvature) and the hybrid of Appendices~\ref{sec:hybrid}--\ref{sec:density} (mean and curvature arbitrary fields on the $y$-grid) sits an intermediate closure: a mean field $\zh(y,t)$ per node but a \emph{single} information matrix $S(t)$ shared by all nodes. It is the analogue of the "common covariance" device of multiple-model and ensemble filters, and the natural option when $m$ is large and $N^k$ matrices of size $m\times m$ are unaffordable. This appendix derives it from the linear equation \eqref{eq:linear_p}, in the general setting of Appendix~\ref{sec:density} ($f_y=f_y(y,z)$, $Q_y=\operatorname{diag}(q_i)$ possibly nonzero), and shows where it differs from the per-node closure: the order-2 identity is no longer closed and must be projected.
+
+\subsection{The ansatz and its derivatives}
+
+Replace \eqref{eq:p_ansatz} by
+\begin{equation}
+  p(y,z,t) \;=\; \rho(y,t)\,G(y,z,t), \qquad
+  G := \exp\Big(-\frac{1}{2\eps}\,\zeta\T S(t)\,\zeta\Big), \qquad \zeta := z-\zh(y,t),
+  \label{eq:sh_ansatz}
+\end{equation}
+with $S=S(t)$ symmetric positive definite and \emph{independent of $y$}. The unknowns are the fields $\rho$ and $\zh$ on the $y$-grid and one global matrix: $N^k(1+m) + m(m+1)/2$ numbers. With $\partial_iS=0$ the derivatives of Appendix~\ref{sec:density} simplify --- the $y$-derivatives of $G$ come from the mean field only, through its slope $A=\gy\zh$:
+\begin{align*}
+  \partial_tG &= \frac1\eps\Big[(\partial_t\zh)\T S\zeta - \tfrac12\,\zeta\T\dot S\,\zeta\Big]G, \qquad
+  \gz G = -\frac1\eps\,S\zeta\,G, \\
+  \sum_a q_a\,\partial_{z_a}^2G &= \Big[\frac1{\eps^2}\,\zeta\T SQ_zS\zeta - \frac1\eps\tr(Q_zS)\Big]G, \qquad
+  \partial_{y_i}G = \frac1\eps\,A_{\cdot i}\T S\zeta\,G, \\
+  \partial_{y_i}^2G &= \Big[\frac1{\eps^2}\big(A_{\cdot i}\T S\zeta\big)^2 + \frac1\eps\Big((\partial_i^2\zh)\T S\zeta - A_{\cdot i}\T SA_{\cdot i}\Big)\Big]G .
+\end{align*}
+Note that $\partial_{y_i}G/G$ is now \emph{linear} in $\zeta$ (it was quadratic in Appendix~\ref{sec:density}, through $\zeta\T\partial_iS\zeta$).
+
+\subsection{Inserting the ansatz into the linear equation}
+
+With the linearisations $f_y = f_y^0+F_{yz}\zeta$, $f_z = f_z^0+F_{zz}\zeta$, $d^2\approx\abs{r-H_z\zeta}^2$ of Appendix~\ref{sec:hybrid}, inserting \eqref{eq:sh_ansatz} into \eqref{eq:linear_p} and dividing by $G$ gives
+\begin{equation}
+\begin{aligned}
+  \partial_t\rho + \frac\rho\eps\Big[(\partial_t\zh)\T S\zeta - \tfrac12\zeta\T\dot S\zeta\Big]
+  \;={}& -f_y\cdot\gy\rho \;-\; \frac\rho\eps\sum_i f_{y,i}\,A_{\cdot i}\T S\zeta \;+\; \frac\rho\eps\,f_z\T S\zeta \\
+  &+ \frac\eps2\sum_iq_i\Big[\partial_i^2\rho + \frac2\eps\,\partial_i\rho\,A_{\cdot i}\T S\zeta
+     + \frac\rho{\eps^2}\big(A_{\cdot i}\T S\zeta\big)^2\Big] \\
+  &+ \frac\rho2\sum_iq_i\Big[(\partial_i^2\zh)\T S\zeta - A_{\cdot i}\T SA_{\cdot i}\Big]
+  \;+\; \frac\rho{2\eps}\,\zeta\T SQ_zS\zeta \\
+  &-\; \frac\rho2\tr(Q_zS) \;-\; \frac{\gamma\rho}{2\eps}\abs{r-H_z\zeta}^2 .
+\end{aligned}
+\label{eq:sh_inserted}
+\end{equation}
+
+\subsection{Order matching: two closed equations and one that is not}
+
+\paragraph{Order 0.} Unchanged from \eqref{eq:hyb_rho}:
+\begin{equation}
+  \partial_t\rho \;=\; -f_y^0\cdot\gy\rho + \frac\eps2\sum_iq_i\,\partial_i^2\rho
+  - \Big[\frac{\gamma}{2\eps}\abs{r(y)}^2 + \frac12\tr(Q_zS) + \frac12\tr\big(Q_yA\T SA\big)\Big]\rho .
+  \label{eq:sh_rho}
+\end{equation}
+The volume term $\tfrac12\tr(Q_zS)$ is now the \emph{same} at every node: it no longer discriminates between hypotheses (see the remark at the end).
+
+\paragraph{Order 1.} Collecting the coefficients of $\zeta$ and multiplying by $\eps$:
+\begin{equation}
+  \rho\,S\,\partial_t\zh \;=\; \rho\Big[Sf_z^0 - SAf_y^0 + \gamma H_z\T r\Big] + \eps\big[SAQ_y - F_{yz}\T\big]\gy\rho + \frac{\eps\rho}2\,S\,\Delta_Q\zh ,
+  \label{eq:sh_z}
+\end{equation}
+i.e.\ \eqref{eq:p_order1} without its $\partial_iS$ term. It holds pointwise in $y$: the mean field is still governed node by node (with the shared $S$ in the gain $\gamma S^{-1}H_z(y)\T r(y)$), and in the value-function variables it reads $\partial_t\zh + A\,c = f_z^0 + \gamma S^{-1}H_z\T r + S^{-1}F_{yz}\T\gy W + \tfrac\eps2\Delta_Q\zh$ with $c = f_y^0+Q_y\gy W$.
+
+\paragraph{Order 2.} Collecting the symmetric matrices of the quadratic terms and multiplying by $-2\eps/\rho$ (the $\partial_i\rho$ terms of \eqref{eq:sh_inserted} are linear in $\zeta$ and do not contribute here, because $\partial_{y_i}G/G$ is linear):
+\begin{equation}
+  \dot S \;=\; \mathcal R(y,t) := \gamma\,H_z\T H_z - \tilde F\T S - S\tilde F - S\tilde QS,
+  \qquad \tilde F := F_{zz}-AF_{yz},\quad \tilde Q := Q_z + AQ_yA\T ,
+  \label{eq:sh_S_pointwise}
+\end{equation}
+the Riccati right-hand side of Appendix~\ref{sec:stability}, evaluated at $(y,\zh(y))$. The left-hand side is independent of $y$; the right-hand side is not, through $H_z(y,\zh(y))$, $F_{zz}(y,\zh(y))$, $F_{yz}$ and $A(y)$. \emph{The ansatz is therefore not closed at order 2}: no single $S(t)$ can satisfy \eqref{eq:sh_S_pointwise} at every node, and the identity has to be enforced in a projected sense.
+
+\subsection{Projection}
+
+Write the order-2 residual of \eqref{eq:sh_inserted}, after division by $G$, as $\tfrac{\rho(y)}{2\eps}\,\zeta\T\big[\mathcal R(y,t)-\dot S\big]\zeta$. A projection replaces "$=0$ for all $y$" by "$=0$ on average over $y$", with a weight concentrated on the support of $\rho$:
+\begin{equation}
+  \dot S \;=\; \big\langle\mathcal R(\cdot,t)\big\rangle_w
+  \;=\; \gamma\,\langle H_z\T H_z\rangle_w - \langle\tilde F\rangle_w\T S - S\langle\tilde F\rangle_w - S\langle\tilde Q\rangle_w S,
+  \qquad \langle g\rangle_w := \frac{\int g(y)\,w(y)\dd y}{\int w(y)\dd y},
+  \label{eq:sh_S}
+\end{equation}
+where the averages commute with the multiplications by the constant $S$. This is a Riccati equation with averaged coefficients. Two weightings are natural:
+\begin{itemize}[nosep]
+  \item $w=\rho$ (mass weighting: each hypothesis contributes in proportion to its plausibility) --- in the value-function variables, $w = e^{-W/\eps}$, computed as a softmax of $-W/\eps$ with no division by $\rho$;
+  \item $w=\rho^2$, which is what the $L^2(\dd y\,\dd z)$ Galerkin condition gives when the residual is made orthogonal to the tangent direction $\partial p/\partial S\propto\rho\,\zeta\zeta\T G$ (the $z$-integral against $G^2$ is an invertible linear map of $\mathcal R-\dot S$, so the condition reduces to $\langle\mathcal R\rangle_{\rho^2}=\dot S$).
+\end{itemize}
+Both, and any weight $\rho^s$ with $s>0$, concentrate on the mode $y^\star(t)=\argmax\rho$ as $\eps\to0$; the Laplace-consistent choice in the minimum-energy framework is therefore the evaluation at the mode, $\dot S = \mathcal R(y^\star(t),t)$: the curvature of the best hypothesis, shared by all. The choice of $w$ is the one modelling decision this closure adds to the per-node one.
+
+\subsection{When it is exact, and how it sits in the hierarchy}
+
+\begin{proposition}[closure of the shared-curvature ansatz]
+The residual \eqref{eq:sh_S_pointwise} vanishes identically in $y$ --- so that \eqref{eq:sh_ansatz} is closed without projection --- iff $\mathcal R$ does not depend on $y$ on the support of $\rho$. In the triangular case ($F_{yz}=0$, $Q_y=0$) this holds when $F_{zz}$ and $H_z$ are independent of $y$, i.e.\ when the grid directions enter the $z$-dynamics and the observation only through their drifts: $f_z(y,z) = a(y)+B\,z$, $h(y,z) = h_0(y)+H\,z$. For such models the closure is exact whenever the per-node one is (conditionally linear-Gaussian data), and the two coincide.
+\end{proposition}
+Examples: an unknown forcing amplitude or offset on the spring chain (parameter in $a(y)$, exact); an unknown stiffness ($B$ depends on $y$) or Kepler's $\mu$ (in $F_{zz}$ and, through the orbit phase, in $H_z(\zh(y))$): the true conditional curvature varies with the hypothesis, and the shared $S$ is an approximation --- mild if the steady-state informations $S_\infty(y)$ of the hypotheses are alike, poor if some hypotheses are much better constrained than others, since the gain $\gamma S^{-1}H_z(y)\T$ at those nodes then has the right direction but the wrong magnitude.
+
+The hierarchy of closures, from the least to the most expressive, is
+\begin{center}
+$\rho(y)\,G(z)$ (product: $\zh$, $S$ constant)
+\;$\subset$\; tracker ($\zh$ affine in $y$, $S$ constant, $\rho$ Gaussian)
+\;$\subset$\; \textbf{shared curvature} ($\zh(y)$ free, $S$ constant)
+\;$\subset$\; hybrid ($\zh(y)$, $S(y)$ free)
+\;$\subset$\; grid.
+\end{center}
+The product ansatz is \emph{not} admissible: it is less expressive than the tracker (it sets the cross-information $S_{yz}$ to zero) and its order-1 identity is already not closed. The shared-curvature ansatz contains the tracker --- restrict $\zh$ to affine functions and $\rho$ to Gaussians, then $A=-S^{-1}S_{zy}$ is constant, $\mathcal R$ is $y$-independent for a linear model, and \eqref{eq:sh_S} reduces to \eqref{eq:tracker_S} for the $z$-block --- and is contained in the hybrid.
+
+\subsection{Discrete cycle and cost}
+
+Per time step: the observation and $z$-diffusion updates of $S$ are done \emph{once}, with averaged coefficients,
+\[
+  S^+ = S + \dt\,\gamma\,\langle H_z\T H_z\rangle_w, \qquad S \leftarrow S\big(I+\dt\,\langle\tilde Q\rangle_wS\big)^{-1},
+\]
+the transport of $S$ with the averaged tangent, $S\leftarrow\langle\Phi_{zz}^{-\mathsf T}S\,\Phi_{zz}^{-1}\rangle_w$ (or with $\Phi_{zz}$ at the mode), and there is no $y$-diffusion of $S$ at all; the mean field is updated node by node as in the per-node closure, with the shared $S$, and the profile $\rho$ (or $W$) as in Appendix~\ref{sec:density}. Cost: $O(N^k m)$ for the means and $O(m^3)$ for the single Riccati step, against $O(N^k m^3)$ for per-node curvatures. On \texttt{kepler\_mu} this saves $10$ of the $15$ numbers per node and $N_\theta-1$ Riccati solves of size $4$ --- nothing; the closure earns its place when $m$ is large (a discretised PDE state with a few parameters), where $N^k$ matrices $m\times m$ are out of reach and one shared covariance is the standard compromise.
+
+\begin{remark}[the volume term and the Occam bias]
+With a shared $S$ the decay rate $\tfrac12\tr(Q_zS)$ in \eqref{eq:sh_rho} is common to all nodes and cancels from every comparison between hypotheses (only $\tfrac12\tr(Q_yA\T SA)$ still varies, through the slope of the mean field). The Occam-type competition of Appendix~\ref{sec:stability} --- a broader conditional Gaussian losing less peak height --- therefore disappears; so does, however, the genuine information that one hypothesis is better constrained than another, which the per-node curvature carries. Whether this is a loss or a simplification depends on whether the $S_\infty(y)$ differ materially.
+\end{remark}
+
+% ===========================================================================
+\section{Conditionally affine coordinates: the ansatz after a change of variables $z'=T(y,z)$}
+% ===========================================================================
+\label{sec:coords}
+
+Nothing in the ansatz \eqref{eq:p_ansatz} requires the Gaussian directions to be the model's native coordinates. This appendix examines the hybrid closure after a change of variables in the Gaussian block,
+\begin{equation}
+  z' = T(y,z), \qquad z = U(y,z') := T(y,\cdot)^{-1}(z'),
+  \label{eq:E_T}
+\end{equation}
+chosen so that the $z'$-dynamics are \emph{conditionally affine given $y$}. The map acts on the $z$-block at fixed $y$: it leaves $f_y$ and $Q_y$ untouched, so neither the triangular structure of \S\ref{sec:main} ($f_y=f_y(y)$) nor the further restriction $Q_y=0$ made here is a consequence of the change of variables --- both are \emph{assumed}, as assumptions on the model (see the remark at the end of \S E.2 for the situation where the grid directions themselves are changed). We derive the analogues of \eqref{eq:hyb_rho}--\eqref{eq:p_order2} and \eqref{eq:w_rho}--\eqref{eq:w_Sigma}, and identify what the change of coordinates buys: the transport step becomes exactly closed, and the remaining closure errors sit in the observation and --- through a state-dependent noise --- in the diffusion.
+
+\subsection{The linear equation in the new coordinates}
+
+Let $x=(y,z)$ and $x'=(y,z')$, and write $\tilde p(y,z',t) := p(y,U(y,z'),t)$: $p$ is transported like a value function, not like a density, so there is \emph{no Jacobian factor}. In particular the max-marginal is invariant, $\max_{z'}\tilde p = \max_zp = \rho$: the profile $\rho(y,t)$ of the hybrid is the same field in every choice of $z$-coordinates; only the Gaussian parameters transform. For $u(x)=\tilde u(T(x))$ the chain rule gives $\partial_iu = T_{a,i}\,\tilde\partial_a\tilde u$ and $\partial_i\partial_ju = T_{a,i}T_{b,j}\,\tilde\partial_a\tilde\partial_b\tilde u + T_{a,ij}\,\tilde\partial_a\tilde u$, hence the linear equation \eqref{eq:linear_p} becomes
+\begin{equation}
+  \partial_t\tilde p \;=\; -\,f_y\cdot\gy\tilde p \;-\; \hat f_z\cdot\nabla_{\!z'}\tilde p
+  \;+\; \frac\eps2\tr\!\big(Q'(y,z')\,\nabla_{\!z'}^2\tilde p\big) \;-\; \frac{\gamma}{2\eps}\,d\big(y_{\rm obs},h'(y,z')\big)^2\,\tilde p ,
+  \label{eq:E_linear}
+\end{equation}
+with the three transformed coefficients
+\begin{equation}
+\begin{gathered}
+  f'_z := \partial_yT\,f_y + \partial_zT\,f_z, \qquad
+  Q' := \partial_zT\,Q_z\,\partial_zT\T, \\
+  c := \Delta_{Q_z}T = \sum_{ij}(Q_z)_{ij}\,\partial_{z_i}\partial_{z_j}T ,
+  \qquad
+  \hat f_z := f'_z - \tfrac\eps2\,c ,
+\end{gathered}
+  \label{eq:E_coeffs}
+\end{equation}
+all evaluated at $(y,U(y,z'))$, and $h'(y,z') := h(y,U(y,z'))$. Three things happened. The drift transformed as a vector field ($f'_z$). The noise transformed as a tensor and became \emph{state-dependent}, $Q'=Q'(y,z')$, unless $T$ is affine in $z$. And a first-order term appeared, $-\tfrac\eps2c\cdot\nabla_{z'}$: the It\^o correction of the change of variables (the drift acquired by a diffusion under a nonlinear map, cf.\ \S\ref{sec:softmin}), which we absorb into the effective drift $\hat f_z$. With $Q_y\neq0$ the noise would in addition acquire cross terms $Q_y\,\partial_yT\T$ between $y$ and $z'$; we exclude this case here.
+
+\subsection{The assumption}
+
+\begin{equation}
+  f'_z(y,z') \;=\; a(y) + B(y)\,z' \qquad\text{(conditionally affine given $y$)}.
+  \label{eq:E_affine}
+\end{equation}
+Globally and with a time-independent $T$ this is an integrability assumption: the flow of the $z$-block, at frozen $y$, is conjugate to a linear one. It holds for the spring chain in modal coordinates (with $T$ linear: $Q'$ constant, $c=0$), for Kepler and Kepler-$\mu$ in orbital elements (equinoctial elements to avoid the singularity at $e=0$; only the mean longitude is dynamic, $\dot\ell = n(a;\theta)$, so $B$ has a single nonzero entry $\partial n/\partial a$ and $a(y)$ collects the slow drifts due to the softening), and for the simple pendulum in action--angle variables away from the separatrix; it fails for chaotic models (double pendulum, Lorenz), where at best an approximately linearising chart exists and the residual goes into the Gauss--Newton closure. Note the freedom offered by the conditioning: for a near-integrable system with $d$ degrees of freedom, the $d$ actions (and the parameters) go to the grid and the $d$ angles to the Gaussian block --- \emph{invariants on the grid, phases Gaussian}.
+
+\begin{remark}[changing the grid directions too]
+The split "invariants on the grid" is a change of variables of the \emph{whole} state, $(y',z') = T_{\rm full}(x)$, not of the $z$-block at fixed $y$ as in \eqref{eq:E_T}. For it, $f_{y'}=0$ is a \emph{consequence} (the actions are invariants), but $Q_{y'}=0$ is \emph{not}: a model noise defined on the native state projects onto the invariants, and the transformed noise $Q' = DT_{\rm full}\,Q\,DT_{\rm full}\T$ acquires a $y'$-block and cross terms between $y'$ and $z'$. To remain in the setting of this appendix one must either \emph{model} the noise on the phases only --- an assumption --- or keep $Q_{y'}\ne0$ with cross terms and use the general machinery of Appendix~\ref{sec:density}. In the Kepler-$\mu$ example of this appendix the grid direction is the parameter $\theta$ alone, $T$ maps $(q,p)$ to the orbital elements at fixed $\theta$, and $f_\theta=0$, $q_\theta=0$ hold by the model's own assumptions.
+\end{remark}
+
+\subsection{Order matching}
+
+Insert $\tilde p = \rho(y,t)\,G$, $G=\exp(-{\zeta'}\T S'\zeta'/2\eps)$, $\zeta' := z'-\zh'(y,t)$, into \eqref{eq:E_linear} and divide by $G$, exactly as in \S2.4. Relative to \eqref{eq:T_inserted} three terms change. The drift term is now \emph{exactly} quadratic in $\zeta'$, $\tfrac\rho\eps\hat f_z\T S'\zeta'$ with $\hat f_z = a+B\zh' + B\zeta' - \tfrac\eps2(c^0 + C\zeta') + O(\eps{\zeta'}^2)$, where $c^0 := c(y,\zh')$ and $C := \partial_{z'}c$. The diffusion term carries the state-dependent noise: expanding $Q'(y,z') = {Q'}^0 + \sum_a\zeta'_a\,\partial_aQ' + \tfrac12\sum_{ab}\zeta'_a\zeta'_b\,\partial_{ab}Q' + \dots$ around $\zh'$ (with $\partial_a := \partial_{z'_a}$),
+\begin{multline*}
+  \frac\eps2\,\frac{\tr\big(Q'\nabla_{z'}^2(\rho G)\big)}{G}
+  \;=\; \frac{\rho}{2\eps}\,{\zeta'}\T S'{Q'}^0S'\zeta' \;-\; \frac\rho2\,\tr({Q'}^0S') \\
+  -\; \frac\rho2\sum_a\zeta'_a\,\tr\big(\partial_aQ'\,S'\big) \;-\; \frac\rho4\sum_{ab}\zeta'_a\zeta'_b\,\tr\big(\partial_{ab}Q'\,S'\big) + O({\zeta'}^3).
+\end{multline*}
+The new contributions are derivatives of one scalar function, the \emph{noise potential}
+\begin{equation}
+  \psi(y,z') := \tr\big(Q'(y,z')\,S'(y,t)\big), \qquad \nabla_{z'}\psi = \big(\tr(\partial_aQ'S')\big)_a, \qquad \nabla_{z'}^2\psi = \big(\tr(\partial_{ab}Q'S')\big)_{ab},
+  \label{eq:E_psi}
+\end{equation}
+differentiated in $z'$ with $S'$ held fixed. The observation is linearised as before, $r' := y_{\rm obs}\ominus h'(y,\zh')$, $H' := \partial_{z'}h'(y,\zh') = H_z\,\partial_zU$. Matching the orders $0$, $1$, $2$ in $\zeta'$ gives the counterparts of \eqref{eq:hyb_rho}--\eqref{eq:p_order2}:
+
+\begin{proposition}[hybrid closure in conditionally affine coordinates]
+Under \eqref{eq:E_affine}, with $\hat F := \partial_{z'}\hat f_z = B - \tfrac\eps2C$ and $\psi$ as in \eqref{eq:E_psi},
+\begin{align}
+  \partial_t\rho + f_y\cdot\gy\rho &= -\Big[\frac{\gamma}{2\eps}\abs{r'}^2 + \frac12\,\psi(y,\zh')\Big]\rho , \label{eq:E_rho}\\
+  \partial_t\zh' + (f_y\cdot\gy)\,\zh' &= \hat f_z(y,\zh') + \gamma\,{S'}^{-1}{H'}\T r' - \frac\eps2\,{S'}^{-1}\nabla_{z'}\psi(y,\zh') , \label{eq:E_z}\\
+  \partial_tS' + (f_y\cdot\gy)\,S' &= \gamma\,{H'}\T H' - \hat F\T S' - S'\hat F - S'{Q'}^0S' + \frac\eps2\,\nabla_{z'}^2\psi(y,\zh') . \label{eq:E_S}
+\end{align}
+\end{proposition}
+\begin{proof}
+Order 0 collects the $\zeta'$-free terms: the transport of $\rho$, $-\tfrac\rho2\tr({Q'}^0S')$ and the misfit. Order 1: $\tfrac\rho\eps S'\partial_t\zh' = -\tfrac\rho\eps S'A'f_y + \tfrac\rho\eps S'\hat f_z(y,\zh') + \tfrac{\gamma\rho}\eps {H'}\T r' - \tfrac\rho2\nabla_{z'}\psi$, with $A' := \gy\zh'$ and $A'f_y = (f_y\cdot\gy)\zh'$; multiply by $\eps {S'}^{-1}/\rho$. Order 2: as in \S2.5, with ${\zeta'}\T\hat F\T S'\zeta'$ from the drift (exact, since $\hat f_z$ is affine in $z'$ up to the $O(\eps)$ It\^o term, whose Jacobian is $-\tfrac\eps2C$) and the two new terms $\tfrac{\rho}{2\eps}{\zeta'}\T S'{Q'}^0S'\zeta' - \tfrac\rho4{\zeta'}\T(\nabla^2_{z'}\psi)\zeta'$ from the diffusion; multiply by $-2\eps/\rho$ and symmetrise.
+\end{proof}
+
+The weighted form is immediate here, because with $Q_y=0$ the operator $\mathcal LX = \partial_tX + f_y\cdot\gy X$ is a derivation: with $\zr' := \rho\zh'$, $\Sr' := \rho S'$ and $R' := \tfrac{\gamma}{2\eps}\abs{r'}^2 + \tfrac12\psi(y,\zh')$,
+\begin{align}
+  \mathcal L\rho &= -R'\rho, \label{eq:E_w_rho}\\
+  \mathcal L\zr' &= -R'\zr' + \rho\Big[\hat f_z(y,\zh') + \gamma {S'}^{-1}{H'}\T r' - \tfrac\eps2 {S'}^{-1}\nabla_{z'}\psi\Big], \label{eq:E_w_z}\\
+  \mathcal L\Sr' &= -R'\Sr' + \rho\Big[\gamma {H'}\T H' - \hat F\T S' - S'\hat F - S'{Q'}^0S' + \tfrac\eps2\nabla_{z'}^2\psi\Big], \label{eq:E_w_S}
+\end{align}
+the analogue of \eqref{eq:w_rho}--\eqref{eq:w_Sigma}. (With $Q_y\ne0$ the $y$-diffusion terms of Appendix~\ref{sec:density} would be added unchanged, and the cross terms $Q_y\partial_yT\T$ of the transformed noise would couple the two blocks; the weighted form is then the useful one, for the reasons of Appendix~\ref{sec:density}.)
+
+\subsection{Relation to the native coordinates, and what is gained}
+
+At the mode the two closures agree to second order: since $\tilde p(y,\cdot) = p(y,U(y,\cdot))$, the maximiser transforms as $\zh' = T(y,\zh)$ and the Hessian of $-\eps\log\tilde p$ at a critical point transforms tensorially, $S' = \partial_zT^{-\mathsf T}\,S\,\partial_zT^{-1}$. What differs is the \emph{shape} of the Gaussian away from the mode, and therefore which steps of the cycle are closed exactly:
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Transport is exactly closed.} $\hat f_z$ is affine in $z'$ (up to $O(\eps)$), so a Gaussian in $z'$ stays Gaussian under the flow: $\hat F = B(y) - \tfrac\eps2C$ is exact, not a linearisation, and the discrete transport is closed-form, $\zh'\leftarrow e^{B\dt}\zh' + (\dots)$, $\Phi_{z'z'} = e^{B(y)\dt}$ (for nilpotent $B$, $I+\dt B$), with no Newton solve. In native coordinates the transport nonlinearity is the error that \emph{accumulates} over time (the phase problem of Kepler); here it is gone.
+  \item \textbf{The noise is where the closure error moved.} A state-dependent $Q'$ does not map Gaussians to Gaussians; the terms in $\psi$ are its first-order effect: a drift $-\tfrac\eps2{S'}^{-1}\nabla\psi$ of the mean toward regions of smaller noise, a curvature correction $\tfrac\eps2\nabla^2\psi$, and the It\^o drift $-\tfrac\eps2c$. All are $O(\eps)$, they vanish if $T$ is affine in $z$, and they vanish identically if the model noise is \emph{defined} on $z'$ (a modelling choice, e.g.\ noise on the orbital elements).
+  \item \textbf{The information equation decouples from the data when $h'$ is affine in $z'$.} Then $H'$ depends on $y$ only, and \eqref{eq:E_S} contains neither $\zh'$ (up to the $O(\eps)$ $\psi$-terms) nor $\rho$: $S'(y,t)$ can be precomputed per node before the run, or replaced by its steady state, and the per-step cost per node drops to that of \eqref{eq:E_z}, which is then a \emph{linear} equation for $\zh'$. When $h'$ is nonlinear in $z'$ (Kepler's equation for $\ell\mapsto$ position) the observation is the one closure left, and it acts over a single step --- mild, compared with a transport nonlinearity integrated over many periods.
+\end{itemize}
+
+\subsection{Caveats}
+
+The chart must cover the support of $p$ (equinoctial rather than classical elements at small eccentricity; action--angle variables break at separatrices). Angles in $z'$ are periodic, so the Gaussian must stay narrow on the circle --- the per-node structure guarantees this as long as each node stays phase-locked --- or be replaced by a von Mises factor. If the noise is defined in native coordinates, $Q'$ is state-dependent and the $\psi$-terms must be kept; if it is defined on $z'$, they are absent by construction. And the change of coordinates does nothing for the grid directions: $y$, its transport and its resolution are as in \S\ref{sec:main}.
+
+% ===========================================================================
+\section{The Zakai equation, and the hybrid closure by moments}
+% ===========================================================================
+\label{sec:zakai}
+
+This appendix records the stochastic counterpart of the linear equation \eqref{eq:linear_p} --- the Zakai equation --- and what it changes for the hybrid closure: integrating it against $1$, $z$, $zz\T$ gives exact equations for the first moments of $p$ in $z$, and the Gaussian ansatz closes them by plain calculus, without expanding around the mode. In the conditionally linear case the result coincides with Appendices~\ref{sec:hybrid}--\ref{sec:density}; the weight of a node decays with the misfit integrated over the width of the Gaussian instead of the misfit at the mode plus a volume term, and the shared-curvature ansatz of Appendix~\ref{sec:sharedS} receives the equation it was missing.
+
+\subsection{The Zakai equation in the same notation}
+
+Replace in \eqref{eq:linear_p} the transport term $-f\cdot\grad p$ by its conservative form $-\grad\!\cdot\!(fp) = -f\cdot\grad p - (\grad\!\cdot\! f)\,p$:
+\begin{equation}
+  \partial_t p \;=\; -\,\grad\!\cdot\!(f\,p) \;+\; \frac{\eps}{2}\sum_{d=1}^n q_d\,\partial_d^2 p \;-\; \frac{\gamma}{2\eps}\, d\big(y,h(x)\big)^2\, p .
+  \label{eq:zakai}
+\end{equation}
+This is the Zakai equation~\cite{Zakai1969,BainCrisan2009} of the stochastic filtering problem
+\begin{equation}
+  \dd X_t = f(X_t)\,\dd t + \sqrt{\eps}\,Q^{1/2}\,\dd B_t, \qquad
+  \dd Y_t = h(X_t)\,\dd t + \sqrt{\eps/\gamma}\;\dd V_t
+  \label{eq:sde}
+\end{equation}
+(model noise of covariance $\eps Q$ and observation noise of covariance $(\eps/\gamma)I$ per unit time --- the scalings of the energy \eqref{eq:energy}), written for observations sampled at the steps; with a continuous observation path the last term becomes $\frac\gamma\eps\,p\,h\T\!\circ\dd Y - \frac{\gamma}{2\eps}\abs h^2p\,\dd t$ (Stratonovich form), and for observations $y_n$ at the steps the equation is the Bayes recursion "multiply by the likelihood $e^{-\gamma\dt\abs{y_n-h}^2/2\eps}$, then propagate by the Fokker--Planck semigroup" --- the cycle of \S1.4. Here $p$ is the \emph{unnormalised conditional density}, to be normalised by its integral rather than by its maximum, and its integral is the marginal likelihood of the observations.
+
+The only difference with \eqref{eq:linear_p} is the term $-(\grad\cdot f)\,p$: the Zakai equation transports a probability mass, \eqref{eq:linear_p} a value function. It vanishes for Hamiltonian models ($\grad\cdot f=0$: the springs, the pendulums, Kepler, and their unknown-parameter variants) and is a uniform factor for Lorenz ($\grad\cdot f = -(\sigma+1+\beta)$ constant), so for every model of the library the two equations coincide up to normalisation; they would differ materially only for a flow whose divergence varies in space (state-dependent damping, Van der Pol). Conversely, $V=-\eps\log p$ of a Zakai solution is the value function of a stochastic control problem (Fleming--Mitter~\cite{FlemingMitter1982}), and as $\eps\to0$ the viscous HJB \eqref{eq:hjb_eps} tends to the deterministic \eqref{eq:hjb}: the Mortensen filter is the \emph{small-noise limit} of the stochastic filter, in which the posterior concentrates on the minimum-energy trajectory --- which is why $\eps$ is called the temperature.
+
+\subsection{Exact moment equations}
+
+Take the triangular structure of \S\ref{sec:main} ($f_y=f_y(y)$, $Q=\operatorname{diag}(Q_y,Q_z)$, $Q_y$ possibly nonzero), and define the first three moments of $p$ in $z$ at fixed $y$,
+\begin{equation}
+  \bar\rho(y,t) := \int p\,\dd z, \qquad \zr(y,t) := \int z\,p\,\dd z, \qquad \Mr(y,t) := \int zz\T p\,\dd z .
+  \label{eq:moments}
+\end{equation}
+Integrate \eqref{eq:zakai} against $1$, $z$ and $zz\T$ (boundary terms vanish; $\int z\,\partial_{z_a}^2p = 0$, $\int zz\T\,\partial_{z_a}^2 p = 2e_ae_a\T\bar\rho$):
+\begin{align}
+  \partial_t\bar\rho + \gy\!\cdot\!(f_y\bar\rho) - \tfrac\eps2\Delta_Q\bar\rho &= -\frac{\gamma}{2\eps}\int d^2\,p\,\dd z , \label{eq:mom0}\\
+  \partial_t\zr + \gy\!\cdot\!(f_y\zr) - \tfrac\eps2\Delta_Q\zr &= \int f_z\,p\,\dd z \;-\; \frac{\gamma}{2\eps}\int z\,d^2\,p\,\dd z , \label{eq:mom1}\\
+  \partial_t\Mr + \gy\!\cdot\!(f_y\Mr) - \tfrac\eps2\Delta_Q\Mr &= \int\big(f_zz\T + zf_z\T\big)p\,\dd z \;+\; \eps\,Q_z\,\bar\rho \;-\; \frac{\gamma}{2\eps}\int zz\T d^2\,p\,\dd z . \label{eq:mom2}
+\end{align}
+These are \emph{exact}: no expansion, no closure yet. The $y$-part of the operator is linear and commutes with $\int\dd z$, which is why the three moments are transported and diffused by one and the same operator --- the "same operator $\mathcal L$ for all fields" of \S2.6, obtained here in one line and with the conservative transport. The weighted variables of \S2.6 are these moments: $\zr = \bar\rho\,\zh$ and, in the Gaussian closure below, $\Mr = \bar\rho\,(\eps P + \zh\zh\T)$.
+
+\subsection{Closing the moment equations with the ansatz \eqref{eq:sh_ansatz}}
+
+Take the Gaussian ansatz of Appendix~\ref{sec:sharedS},
+\[
+  p = \rho(y,t)\,G, \qquad G = \exp\Big(-\frac{1}{2\eps}\,\zeta\T S(t)\,\zeta\Big), \qquad \zeta = z-\zh(y,t),
+\]
+with $S$ symmetric positive definite and independent of $y$, and write $P := S^{-1}$. Everything below is calculus: the integrals over $z$ of polynomials against $G$. With $c_S := \int G\,\dd z = (2\pi\eps)^{m/2}\det S^{-1/2}$,
+\begin{equation}
+  \begin{gathered}
+  \int \zeta\,G\,\dd z = 0, \qquad
+  \int \zeta\zeta\T G\,\dd z = \eps P\,c_S, \qquad
+  \int \zeta\,(\zeta\T b)\,G\,\dd z = \eps Pb\,c_S, \\
+  \int \zeta\zeta\T(\zeta\T\!A\zeta)\,G\,\dd z = \eps^2\big(P\tr(AP) + 2PAP\big)c_S
+  \end{gathered}
+  \label{eq:gauss_int}
+\end{equation}
+for any vector $b$ and symmetric matrix $A$ (odd moments vanish). The three moments \eqref{eq:moments} of the ansatz are therefore
+\begin{equation}
+  \bar\rho = \rho\,c_S, \qquad \zr = \bar\rho\,\zh, \qquad \Mr = \bar\rho\,\big(\eps P + \zh\zh\T\big),
+  \label{eq:moments_ansatz}
+\end{equation}
+so that $(\bar\rho,\zr,\Mr)$ carry exactly the unknowns $(\rho,\zh,S)$ of the ansatz --- $\bar\rho$ differs from $\rho$ by the width factor $c_S(t)$, the same at every node.
+
+\paragraph{The right-hand sides.} In the conditionally linear case $f_z = a(y)+B(y)z$, $h = h_0(y)+H_z(y)z$, so that $d^2 = \abs{r - H_z\zeta}^2$ with $r := y_{\rm obs}\ominus h(y,\zh)$, the integrals of \eqref{eq:mom0}--\eqref{eq:mom2} follow from \eqref{eq:gauss_int}. Writing
+\begin{equation}
+  \bar R(y,t) := \frac{\gamma}{2\eps}\Big(\abs r^2 + \eps\tr\big(H_zPH_z\T\big)\Big)
+  \label{eq:Rbar}
+\end{equation}
+for the misfit of the ansatz integrated over its width,
+\begin{gather*}
+  \int d^2 p\,\dd z = \tfrac{2\eps}{\gamma}\,\bar R\,\bar\rho, \qquad
+  \int z\,d^2 p\,\dd z = \tfrac{2\eps}{\gamma}\,\bar R\,\zr \;-\; 2\eps\,\bar\rho\,PH_z\T r, \\
+  \int zz\T d^2 p\,\dd z = \tfrac{2\eps}{\gamma}\,\bar R\,\Mr \;-\; 2\eps\,\bar\rho\big(\zh r\T H_zP + PH_z\T r\zh\T\big) \;+\; 2\eps^2\,\bar\rho\,PH_z\T H_zP, \\
+  \int f_z\,p\,\dd z = \bar\rho\,(a+B\zh), \\
+  \int\big(f_zz\T+zf_z\T\big)p\,\dd z = \bar\rho\Big[(a+B\zh)\zh\T + \zh(a+B\zh)\T\Big] + \eps\,\bar\rho\,(BP+PB\T).
+\end{gather*}
+
+\paragraph{The closed system in moment variables.} Substituting, and writing $\mathcal L u := \partial_tu + \gy\!\cdot\!(f_yu) - \tfrac\eps2\Delta_Qu$ for the common $y$-operator of \eqref{eq:mom0}--\eqref{eq:mom2},
+\begin{align}
+  \mathcal L\bar\rho &= -\,\bar R\,\bar\rho, \label{eq:cl_rho}\\
+  \mathcal L\zr &= -\,\bar R\,\zr \;+\; \bar\rho\,\big(a + B\zh + \gamma\,PH_z\T r\big), \label{eq:cl_z}\\
+  \mathcal L\Mr &= -\,\bar R\,\Mr \;+\; \bar\rho\,\Big[(a+B\zh)\zh\T + \zh(a+B\zh)\T + \gamma\big(\zh r\T H_zP + PH_z\T r\zh\T\big) \notag\\
+  &\qquad\qquad\qquad\quad + \eps\big(BP + PB\T + Q_z - \gamma\,PH_z\T H_zP\big)\Big], \label{eq:cl_M}
+\end{align}
+with $\zh$, $P$ on the right read off from \eqref{eq:moments_ansatz}. This is the moment counterpart of the weighted system \eqref{eq:w_rho}--\eqref{eq:w_Sigma}: the same operator $\mathcal L$ on every field, each right-hand side equal to $-\bar R$ times the field plus $\bar\rho$ times a pointwise tracker expression, hence discretisable exactly as in \S2.8 (transport and diffusion of the three fields by the grid solver, then a per-node update). The decay rate is now $\bar R$: there is no separate volume term.
+
+\paragraph{Back to $(\bar\rho,\zh,P)$.} For $u$ any field, $\mathcal L(\bar\rho u) = u\,\mathcal L\bar\rho + \bar\rho\,\mathcal D u$ with
+\begin{equation}
+  \mathcal D u := \partial_tu + c\cdot\gy u - \tfrac\eps2\Delta_Qu, \qquad c := f_y - \eps\,Q_y\gy\log\bar\rho = f_y + Q_y\gy\bar W, \quad \bar W := -\eps\log\bar\rho ,
+  \label{eq:D_op}
+\end{equation}
+the characteristic velocity of \S2.5 (with $\bar W = W + \text{const}(t)$, since $S$ is $y$-independent), and $\mathcal D(uv\T) = (\mathcal Du)v\T + u(\mathcal Dv)\T - \eps\sum_iq_i\,\partial_iu\,\partial_iv\T$. Inserting \eqref{eq:moments_ansatz} into \eqref{eq:cl_z} and using \eqref{eq:cl_rho}:
+\begin{equation}
+  \mathcal D\zh \;=\; a + B\zh + \gamma\,PH_z\T r ,
+  \label{eq:cl_zhat}
+\end{equation}
+the mean-field equation \eqref{eq:sh_z} of Appendix~\ref{sec:sharedS}, in covariance form. Inserting into \eqref{eq:cl_M}, the $\zh\zh\T$ terms cancel against \eqref{eq:cl_zhat}, and with $A := \gy\zh$ what is left is, pointwise in $y$,
+\begin{equation}
+  \bar\rho\,\Big[\dot P - \big(BP + PB\T + Q_z + AQ_yA\T - \gamma\,PH_z\T H_zP\big)\Big] \;=\; 0 .
+  \label{eq:cl_P_pointwise}
+\end{equation}
+The bracket is the covariance Riccati right-hand side with the deviation noise $\tilde Q = Q_z + AQ_yA\T$ of \S2.5, evaluated at $(y,\zh(y))$; it depends on $y$ while $\dot P$ does not, so --- exactly as in \eqref{eq:sh_S_pointwise} --- the order-2 identity cannot hold pointwise. What the ansatz \emph{can} satisfy is its $y$-integral: integrating \eqref{eq:cl_M} over $y$ removes the transport and diffusion terms (Neumann or periodic boundaries), and \eqref{eq:cl_P_pointwise} integrated in $y$ gives
+\begin{equation}
+  \dot P \;=\; \bar BP + P\bar B\T + \bar Q - \gamma\,P\bar HP, \qquad
+  \bar X := \frac{\int\bar\rho\,X\,\dd y}{\int\bar\rho\,\dd y} \quad\text{for } X = B,\; Q_z + AQ_yA\T,\; H_z\T H_z .
+  \label{eq:cl_P}
+\end{equation}
+Because $P$ is shared, the $\bar\rho$-weighted average of the right-hand side is the same Riccati equation with $\bar\rho$-averaged coefficients: \emph{one} matrix Riccati equation for the whole grid, which is the projection Appendix~\ref{sec:sharedS} left open, made explicit by the moment identity --- the second moment $\iint\zeta\zeta\T p\,\dd z\,\dd y$ of the whole field is what the shared $P$ matches. In the parameter case ($f_y=0$, $Q_y=0$) with a single node, \eqref{eq:cl_rho}, \eqref{eq:cl_zhat}, \eqref{eq:cl_P} are the tracker equations \eqref{eq:tracker_x}--\eqref{eq:tracker_S} written for $P=S^{-1}$.
+
+\paragraph{Consistency with the max-marginal weight.} From $\bar\rho = \rho\,c_S$, $\partial_t\log\rho = \partial_t\log\bar\rho + \tfrac12\tr(S^{-1}\dot S)$, and with $\dot S = -S\dot PS$ from \eqref{eq:cl_P_pointwise} (read pointwise),
+\[
+  \tfrac12\tr(S^{-1}\dot S) = -\tr B - \tfrac12\tr\big(\tilde QS\big) + \tfrac\gamma2\tr\big(H_zPH_z\T\big),
+\]
+so that $\mathcal L\rho = -\big[\tfrac{\gamma}{2\eps}\abs r^2 + \tfrac12\tr(Q_zS) + \tfrac12\tr(Q_yA\T SA) + \tr B\big]\rho$: this is \eqref{eq:sh_rho}, up to the divergence term $\tr B = \grad_z\cdot f_z$ of the conservative transport in \eqref{eq:zakai}. The two formulations agree; the volume term of the max-marginal is the width factor $c_S(t)$ of the moment, and the term $\tfrac\gamma2\tr(H_zPH_z\T)$ of $\bar R$ is what $\tfrac12\tr(S^{-1}\dot S)$ removes again.
+
+\paragraph{With $S=S(y)$ instead.} The same computation with the per-node ansatz \eqref{eq:p_ansatz} ($P=P(y,t)$) closes pointwise: \eqref{eq:cl_zhat} is unchanged and \eqref{eq:cl_P_pointwise} becomes $\mathcal DP = BP + PB\T + Q_z + AQ_yA\T - \gamma PH_z\T H_zP$, the covariance form of \eqref{eq:w_Sigma_riccati} with the $\eps\,\partial_iS$ terms absorbed by the operator $\mathcal D$ (they come from $\mathcal L$ acting on $\bar\rho P$ and from $c$ being built with $\bar\rho$, which then includes $\det S(y)^{-1/2}$).
+
+\paragraph{Beyond the conditionally linear case.} For nonlinear $f_z$, $h$ the integrals $\int f_z\,G\,\dd z$, $\int f_z\zeta\T G\,\dd z$, $\int d^2G\,\dd z$, \dots\ are Gaussian-weighted integrals to be evaluated by quadrature (Gauss--Hermite in $\zeta$) per node. The closure then replaces the Taylor data $f_z(\zh)$, $F_{zz}(\zh)$, $H_z(\zh)$ of Appendix~\ref{sec:hybrid} by averages of $f_z$ and $h$ over the width of the Gaussian: a weighted linearisation, exact when $f_z$ and $h$ are polynomials of degree within the quadrature order, and identical to the Taylor closure in the conditionally linear case.
+
+\subsection{Estimators, outputs, and what it costs}
+
+The first moment $\int x\,p\,\dd x / \int p\,\dd x$ is an estimate of the state that is a quadrature on the grid (Gauss--Lobatto weights), smooth in time, with no sub-grid refinement of the argmax needed; in the hybrid it is $\zr/\bar\rho$ per node. Integrated marginals $\int p\,\dd z$ replace the max-marginals in the outputs, and the total mass $\int p\,\dd x$ --- meaningless for \eqref{eq:linear_p} --- is, for \eqref{eq:zakai}, a quantity that compares competing models.
+
+The costs are structural rather than computational. The transport must be conservative: the semi-Lagrangian step needs the Jacobian factor, $p(\xi)\leftarrow p(\varphi^{-1}(\xi))\,\det D\varphi^{-1}(\xi)$, precomputable with the plan and equal to $1$ for Hamiltonian models (a constant for Lorenz). One leaves the minimum-energy framework: the estimate is a moment rather than the minimiser of an energy, and the invariance of the max-marginal under changes of $z$-coordinates (Appendix~\ref{sec:coords}) becomes the transformation rule of $p$ with its Jacobian. For the full grid filter nothing simplifies: the equation is the same up to the divergence term and the code already solves it. For the \emph{hybrid}, integrating is the cleaner route: the closed system \eqref{eq:cl_rho}--\eqref{eq:cl_M} follows from \eqref{eq:gauss_int} in a few lines, the volume term is replaced by the width-integrated misfit $\bar R$, and the shared-curvature closure of Appendix~\ref{sec:sharedS} gets its missing equation \eqref{eq:cl_P}.
+
+% ===========================================================================
+\section{When is the hybrid exact? The Rao--Blackwell structure}
+% ===========================================================================
+\label{sec:exact}
+
+The closure drops all terms of order $\ge3$ in $\zeta$. It is therefore \emph{exact} whenever no such terms arise, i.e.\ whenever the true $V$ is quadratic in $z$ for every $y$ at all times. Since \eqref{eq:hjb_eps} maps functions quadratic in $z$ to functions quadratic in $z$ precisely when its coefficients are affine in $z$, we get:
+
+\begin{proposition}[exact case]
+If, for every $y$,
+\begin{enumerate}[nosep,label=(\roman*)]
+  \item the dynamics are affine in $z$: $f(y,z) = a(y) + B(y)\,z$ (arbitrary dependence on $y$),
+  \item the observation is affine in $z$: $h(y,z) = h_0(y) + H_z(y)\,z$, with the Euclidean distance,
+  \item $Q_z$ is constant and the prior $V_0$ is quadratic in $z$,
+\end{enumerate}
+then the solution of \eqref{eq:hjb_eps} is of the form \eqref{eq:ansatz_hybrid} for all $t$, and the hybrid equations \eqref{eq:hyb_W}--\eqref{eq:hyb_S} are exact.
+\end{proposition}
+
+Such models are called \emph{conditionally linear-Gaussian}: given the nonlinear coordinates $y$, the rest of the state is a linear-Gaussian system. This is exactly the structure exploited, in the stochastic setting, by the \emph{Rao--Blackwellized} or \emph{marginalized particle filter}~\cite{Doucet2000,Schon2005}: particles explore the nonlinear subspace, and each particle carries a Kalman filter for the conditionally linear one. The hybrid of \S\ref{sec:hybrid} is the deterministic (Mortensen, minimum-energy) counterpart of Rao--Blackwellization, with the $y$-grid in the role of the particles, and the max-marginal $W$ in the role of the marginal likelihood. This is the one-sentence justification of the construction:
+\begin{center}
+  \emph{the partial Gaussian closure is the Rao--Blackwellization of the HJB equation.}
+\end{center}
+In the exact case the choice of closure principle is immaterial; outside it, the Taylor matching used here (the Laplace-type closure of Mortensen~\cite{Mortensen1968} and Hijab~\cite{Hijab1980}) is the one consistent with the tracker, while the alternative of projecting the density onto the Gaussian family by moment matching (the projection filter~\cite{Brigo1998}) would define a different, $\eps$-dependent hybrid. Both coincide when $V$ is exactly quadratic in $z$.
+
+% ===========================================================================
+\section{The triangular case: a bank of trackers}
+% ===========================================================================
+\label{sec:triangular}
+
+The most useful --- and simplest --- instance is the \emph{triangular} structure
+\begin{equation}
+  \dot y = f_y(y) \quad(\text{no dependence on } z), \qquad Q_y = 0 .
+  \label{eq:triangular}
+\end{equation}
+Then $F_{yz}=0$, $c = f_y$, $\Delta_Q=0$, and every coupling term in \eqref{eq:hyb_W}--\eqref{eq:hyb_S} vanishes:
+\begin{align}
+  \partial_t W + f_y\cdot\gy W &= \tfrac12\gamma\,\abs{r}^2 + \tfrac{\eps}{2}\tr(Q_zS), \label{eq:tri_W}\\
+  \partial_t\zh + (f_y\cdot\gy)\zh &= f_z(y,\zh) + \gamma\,S^{-1}H_z\T r, \label{eq:tri_z}\\
+  \partial_t S + (f_y\cdot\gy)S &= \gamma\,H_z\T H_z - F_{zz}\T S - SF_{zz} - SQ_zS . \label{eq:tri_S}
+\end{align}
+Along each characteristic $\dot y = f_y(y)$ of the grid directions, \eqref{eq:tri_z}--\eqref{eq:tri_S} are \emph{exactly} the tracker equations \eqref{eq:tracker_x}--\eqref{eq:tracker_S} for the $z$-subsystem at the frozen $y$, and \eqref{eq:tri_W} integrates that tracker's observation cost (plus the $\eps$ volume term) along the characteristic. If moreover $f_y=0$ --- the grid directions are \emph{parameters} --- the characteristics are the grid points themselves and the hybrid is literally a \textbf{bank of independent trackers, one per grid point}, with
+\begin{equation}
+  W(y,t) = W(y,0) + \int_0^t\Big(\tfrac12\gamma\,\abs{r(y,s)}^2 + \tfrac{\eps}{2}\tr\big(Q_zS(y,s)\big)\Big)\dd s .
+  \label{eq:bank_W}
+\end{equation}
+No closure error is made beyond the tracker's own: this is the classical multiple-model filter, obtained here as a special case of the general theory rather than as a separate heuristic.
+
+\subsection{Worked example: Kepler with unknown \texorpdfstring{$\mu$}{mu}}
+\label{sec:kepler}
+
+The model \texttt{kepler\_mu} has state $(q_1,q_2,p_1,p_2,\theta)$ with $\mu=\mu_0 2^\theta$ and $\dot\theta=0$. Take $y=\theta$ ($k=1$) and $z=(q,p)$ ($m=4$). The structure is triangular with $f_y=0$; with $q_\theta=0$ (the default) we are in the bank-of-trackers case. The hybrid thus consists of
+\begin{itemize}[nosep]
+  \item a one-dimensional grid in $\theta$ (say $N_\theta$ points on $(-1,1)$),
+  \item at each $\theta_j$, one tracker on the 4-dimensional Kepler problem at the parameter $\mu(\theta_j)$: the mean $\zh_j\in\R^4$ and the information $S_j\in\R^{4\times4}$ ($4+10$ numbers),
+  \item the scalar $W_j$ accumulating that tracker's cost \eqref{eq:bank_W}.
+\end{itemize}
+The estimate of $\theta$ is $\argmin_j W_j$; the estimate of the state is the corresponding $\zh_j$. The cost is $15\,N_\theta$ numbers instead of $N^4 N_\theta$ grid values: at the viewer's defaults ($N=21$, $N_\theta=5$) that is $75$ against $\approx 10^6$, and even a fine parameter grid of $N_\theta\approx 60$ --- which one would want for a well-resolved profile $W(\theta)$ --- stays below $10^3$.
+
+This construction resolves the failure documented in the library test
+\begin{center}
+  \texttt{tracker\_estimates\_theta\_from\_q1\_observations} \quad (in \texttt{src/models/kepler\_mu.rs}).
+\end{center}
+A single tracker, started at $\theta=0$ with the truth at $\theta_{\rm true}=0.4$, transits near the truth and then collapses into a secondary minimum ($\theta\approx0.13$): over a few orbital periods the $q_1$-likelihood is \emph{phase-aliased} --- several values of $\theta$ produce orbits that agree with the data on part of the window --- so $V$ has several local minima in $\theta$, and the unimodal closure picks one. In the hybrid the $\theta$-direction is on the grid, where multimodality is represented exactly: the tracker at (or near) $\theta_{\rm true}$ stays phase-locked and accumulates almost no cost, the others accumulate cost as their orbits drift out of phase, and $W(\theta)$ develops its global minimum at the truth regardless of how many local minima appear on the way. The single tracker's problem was never the estimation of $(q,p)$ given $\mu$ --- that is a well-conditioned, essentially local problem --- but the estimation of $\theta$; the hybrid assigns each direction to the solver that suits it.
+
+% ===========================================================================
+\section{The discrete cycle for the hybrid}
+% ===========================================================================
+\label{sec:cycle}
+
+The library discretises \eqref{eq:linear_p} by splitting; the hybrid inherits the same four-step structure, each step applied to the triple $(W,\zh,S)$ at every $y$-grid point. We describe the general case and note what disappears in the triangular one.
+
+\paragraph{Step 1 --- observation.}
+Adding $\dt\,\tfrac12\gamma\abs{r - H_z\zeta}^2$ to a function quadratic in $\zeta$ gives another quadratic; completing the square gives the \emph{exact} update (for $h$ affine in $z$)
+\begin{equation}
+\begin{aligned}
+  S^+ &= S + \dt\,\gamma H_z\T H_z, \qquad
+  \zh^+ = \zh + \dt\,\gamma\,(S^+)^{-1}H_z\T r, \\
+  W^+ &= W + \dt\,\tfrac12\gamma\abs r^2 - \tfrac12\,(\dt\,\gamma)^2\, r\T H_z (S^+)^{-1} H_z\T r ,
+\end{aligned}
+\label{eq:cycle_obs}
+\end{equation}
+where the last term is the decrease of the minimum due to the shift of the minimiser. This is the tracker's observation step (with $S^+$ in place of $S$ in the mean update --- the implicit form, exact for the quadratic problem) plus the bookkeeping of $W$. Cost: one $m\times m$ solve per grid point.
+
+\paragraph{Step 4 --- diffusion in $z$.}
+The heat flow in $z$ maps a Gaussian to a Gaussian: $S \leftarrow S\,(I + \dt\,Q_zS)^{-1}$, $\zh$ unchanged, and $W \leftarrow W + \dt\,\tfrac{\eps}{2}\tr(Q_zS)$ (to first order; exactly, $W \leftarrow W + \tfrac{\eps}{2}\log\det(I+\dt\,Q_zS)$, the loss of peak height of the widening Gaussian). Exact, one $m\times m$ inverse per grid point.
+
+\paragraph{Step 4' --- diffusion in $y$ (only if $Q_y\ne0$).}
+This is the one step where the closure is genuinely approximate. Diffusing $e^{-W(y)/\eps}\,\mathcal N\big(z;\zh(y),\eps S(y)^{-1}\big)$ in $y$ mixes the Gaussians of neighbouring grid points into a Gaussian \emph{mixture} in $z$, which must be re-closed to a single Gaussian per $y$. The continuous-time equations \eqref{eq:w_rho}--\eqref{eq:w_Sigma} tell us what the result must be to first order: in the weighted variables the $y$-diffusion is the \emph{same} split implicit-Euler step as for $p$, applied component-wise to $\rho$, $\rho\zh$ and $\rho S$, followed by the algebraic terms $\tfrac12\tr(Q_yA\T SA)$ in the decay and $-SAQ_yA\T S$ in the $S$ source. Dividing back by $\rho$ makes the new mean the $\rho$-weighted average of the neighbouring means (moment matching of the mean) and the new information the weighted average of the informations; re-closing the mixture by full moment matching (mean \emph{and} covariance, including the spread of the neighbouring means) is the projection-filter choice~\cite{Brigo1998}, more accurate by an $O(\eps)$ term. In the triangular case with $Q_y=0$ this step is absent.
+
+\paragraph{Steps 2--3 --- transport.}
+The exact transport is $V^+(y,z) = V\big(\varphi^{-1}(y,z)\big)$. Write $\varphi^{-1}(y,z) = \big(\psi_y(y,z),\psi_z(y,z)\big)$. Then
+\[
+  V^+(y,z) = W\big(\psi_y\big) + \tfrac12\big(\psi_z - \zh(\psi_y)\big)\T S(\psi_y)\big(\psi_z - \zh(\psi_y)\big),
+\]
+which is no longer quadratic in $z$ when $\varphi$ is nonlinear. Re-closing means, at each grid point $y$: find the minimiser $\zh^+(y)=\argmin_z V^+(y,z)$ (an $m$-dimensional Gauss--Newton problem, warm-started from the transported mean, one or two iterations suffice), set $W^+(y)$ to the minimal value and $S^+(y)$ to the Gauss--Newton Hessian at the minimiser. The field $W$ must be interpolated at $\psi_y(y,\zh^+(y))$ --- the same spectral interpolation as the current transport step, but at a point that depends on $\zh^+(y)$, so the precomputed evaluation plan does not apply in general.
+
+In the \textbf{triangular case} everything simplifies: $\psi_y = \psi_y(y)$ does not depend on $z$, so $W$ is transported exactly as today (plan included), and at each $y$ the pair $(\zh,S)$ undergoes the tracker's transport with the $z$-block of the flow Jacobian: $\zh\leftarrow\varphi_z(y,\zh)$, $S\leftarrow\Phi_{zz}^{-\mathsf T}S\Phi_{zz}^{-1}$, with $\Phi_{zz}=\partial_z\varphi_z$ computed by the existing \texttt{gl4\_step\_with\_jacobian}. With $f_y=0$ even the $W$-transport is the identity.
+
+\paragraph{Summary of the triangular cycle} (per $y$-grid point, $Q_y=0$, $f_y=0$):
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+step & $(\zh,S)$ & $W$ \\
+\midrule
+observation & tracker step 1, $H_z$ and $r$ at $(y,\zh)$ & $+\dt\tfrac12\gamma\abs r^2 - \tfrac12(\dt\gamma)^2\, r\T H_z(S^+)^{-1}H_z\T r$ \\
+model forward & refresh $y_{\rm obs}$ & --- \\
+transport & tracker step 3 with $\varphi_z(y,\cdot)$, $\Phi_{zz}$ & --- \\
+diffusion & tracker step 4 with $Q_z$ & $+\tfrac{\eps}{2}\log\det(I+\dt\,Q_zS)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Everything in this table already exists in \texttt{src/tracker.rs} except the accumulation of $W$: the triangular hybrid is a thin driver around a \texttt{Vec} of trackers.
+
+% ===========================================================================
+\section{A moving frame: the ansatz \texorpdfstring{$p=\rho\big(R(t)(x-\xh(t))\big)$}{p = rho(R(x - xhat))}}
+% ===========================================================================
+\label{sec:frame}
+
+The grid filter pays for its generality with a box that must contain every state the reference may visit, resolved uniformly. This appendix analyses the alternative of a \emph{moving window}: a grid that follows the mode of $p$ and is oriented and scaled by its curvature. The ansatz is
+\begin{equation}
+  p(x,t) \;=\; \rho\big(\xi,t\big), \qquad \xi := R(t)\,\big(x-\xh(t)\big), \qquad R(t)\in GL_n(\R),
+  \label{eq:frame_ansatz}
+\end{equation}
+where $\rho$ is a function on a grid in $\xi$ and the pair $(\xh,R)$ fixes the position, orientation and scale of that grid. Unlike \eqref{eq:ansatz_tracker} and \eqref{eq:T_ansatz}, \eqref{eq:frame_ansatz} is \emph{not} a closure: with $\rho$ arbitrary it is a change of variables, exact for \emph{any} choice of $(\xh,R)$, and the frame is a gauge. It becomes an approximation only when $\rho$ is restricted to a box $\abs{\xi_d}\le L_d$ with $p\equiv0$ outside (the Dirichlet-wall semantics of \texttt{FilterParams::dirichlet}). The role of the analysis for small $x-\xh$ is to fix the gauge so that this truncation is harmless: the frame must absorb the position, the orientation and the scale of $p$ around its mode, and the small-$\xi$ expansion says exactly which equations $(\xh,R)$ must then satisfy, what is left for the grid, and how large the box must be. The result is that the frame obeys the tracker equations \eqref{eq:tracker_x}--\eqref{eq:tracker_S} corrected by the third and fourth derivatives of $V$ at the mode --- which the grid provides --- and that in the frame, on the scale $\sqrt\eps$, $\rho$ is a standard Gaussian plus corrections in powers of $\sqrt\eps$, so that the box is $\eps$-independent. This is the "moving window" branch of the open performance question of \texttt{CLAUDE.md}.
+
+Throughout, $y$ denotes the observation as in \S\ref{sec:setting} and Appendix~\ref{sec:tracker} (there is no grid/Gaussian split of the state here), $r := y\ominus h(\xh)$ is the innovation, $F:=\partial f(\xh)$, $H:=\partial h(\xh)$, and $Q$ is the full model-noise covariance (diagonal in the library).
+
+\subsection{The change of frame}
+
+Set $W(\xi,t) := -\eps\log\rho(\xi,t)$, so that $V(x,t) = W\big(R(x-\xh),t\big)$. Two rates describe the motion of the frame: the rotation and deformation rate of the axes, and the velocity of the origin relative to the flow, in frame coordinates,
+\begin{equation}
+  \Omega := \dot R R^{-1}\in\R^{n\times n}, \qquad
+  u := R\,\big(\dot{\xh} - f(\xh)\big)\in\R^n ,
+  \label{eq:frame_rates}
+\end{equation}
+and three transported coefficients:
+\begin{equation}
+  Q_R := RQR\T, \qquad F_R := RFR^{-1}, \qquad H_R := HR^{-1}.
+  \label{eq:frame_coeffs}
+\end{equation}
+
+\begin{lemma}[the equation in the frame]
+Under \eqref{eq:frame_ansatz}, $V$ solves \eqref{eq:hjb_eps} if and only if $W$ solves
+\begin{equation}
+  \partial_tW + f_R\cdot\grad W + \tfrac12\,\grad W\T Q_R\,\grad W - \frac\eps2\,\tr\big(Q_R\grad^2W\big) \;=\; \tfrac12\gamma\, d\big(y,h_R(\xi)\big)^2,
+  \label{eq:frame_hjb}
+\end{equation}
+and, equivalently, $p$ solves \eqref{eq:linear_p} if and only if
+\begin{equation}
+  \partial_t\rho \;=\; -\,f_R\cdot\grad\rho \;+\; \frac\eps2\,\tr\big(Q_R\grad^2\rho\big) \;-\; \frac{\gamma}{2\eps}\,d\big(y,h_R(\xi)\big)^2\,\rho ,
+  \label{eq:frame_linear}
+\end{equation}
+where all derivatives are in $\xi$, $h_R(\xi) := h(\xh + R^{-1}\xi)$, and the \emph{frame drift} is
+\begin{equation}
+  f_R(\xi,t) \;:=\; R\,f\big(\xh + R^{-1}\xi\big) - R\,\dot{\xh} + \Omega\,\xi .
+  \label{eq:frame_drift}
+\end{equation}
+\end{lemma}
+\begin{proof}
+At fixed $x$, $\partial_t\xi = \dot R(x-\xh) - R\dot{\xh} = \Omega\xi - R\dot{\xh}$, hence $\partial_tV = \partial_tW + \grad W\cdot(\Omega\xi - R\dot{\xh})$. The chain rule gives $\grad_xV = R\T\grad W$ and $\grad_x^2V = R\T\grad^2W\,R$, so $f\cdot\grad_xV = (Rf)\cdot\grad W$, $\grad_xV\T Q\grad_xV = \grad W\T RQR\T\grad W$ and $\tr(Q\grad_x^2V) = \tr(RQR\T\grad^2W)$. Substituting in \eqref{eq:hjb_eps} and collecting the first-order terms into \eqref{eq:frame_drift} gives \eqref{eq:frame_hjb}; \eqref{eq:frame_linear} follows by the Hopf--Cole computation of \S1.4, which uses nothing about the coefficients but their form.
+\end{proof}
+
+Equation \eqref{eq:frame_linear} has exactly the structure of \eqref{eq:linear_p} --- a drift, a diffusion, a misfit --- so the four-step cycle applies verbatim in the frame. Two things change: the drift \eqref{eq:frame_drift} contains the motion of the frame, and the diffusion matrix $Q_R$ is in general \emph{full}, even for diagonal $Q$ (see \S\ref{sec:frame_gauge} for the frames in which it stays diagonal).
+
+\subsection{The expansion at the origin and the gauge conditions}
+\label{sec:frame_expansion}
+
+Assume $W(\cdot,t)$ smooth near $\xi=0$ and expand, with the tensors
+\[
+  \Sigma := \grad^2W(0,t)\in\R^{n\times n}, \qquad T_3 := \grad^3W(0,t)\in\R^{n\times n\times n}, \qquad T_4 := \grad^4W(0,t)\in\R^{n\times n\times n\times n},
+\]
+all symmetric in their indices:
+\begin{equation}
+  W(\xi,t) = W_0(t) + g(t)\cdot\xi + \tfrac12\,\xi\T\Sigma\xi + \tfrac16\,T_3[\xi,\xi,\xi] + \tfrac1{24}\,T_4[\xi,\xi,\xi,\xi] + O(\abs\xi^5).
+  \label{eq:frame_taylor}
+\end{equation}
+We use the following contractions: for a matrix $B$ and a vector $v$,
+\begin{align*}
+  (B\!:\!T_3)_c &:= \sum_{a,b}B_{ab}T_{3,abc}\in\R^n, &
+  (B\!:\!T_4)_{ab} &:= \sum_{c,d}B_{cd}T_{4,abcd}\in\R^{n\times n}, \\
+  T_3[v]_{ab} &:= \sum_cT_{3,abc}\,v_c\in\R^{n\times n}, &&
+\end{align*}
+so that $\grad W = g + \Sigma\xi + \tfrac12T_3[\xi,\xi,\cdot] + O(\abs\xi^3)$ and $\grad^2W = \Sigma + T_3[\xi] + \tfrac12\,T_4[\xi,\xi,\cdot,\cdot] + O(\abs\xi^3)$.
+
+The frame has $n+n^2$ parameters. They are fixed by two \emph{gauge conditions}, imposed at every $t$:
+\begin{enumerate}[nosep,label=(G\arabic*)]
+  \item \textbf{position}: $g(t)\equiv0$ --- the origin of the grid is the minimiser of $V$, $\xh(t) = \argmin_xV(\cdot,t)$ (requires $\Sigma\succ0$: a nondegenerate mode);
+  \item \textbf{shape}: either $\Sigma(t)\equiv I$ (\emph{whitening}: $R$ fixes orientation and scale, $n(n+1)/2$ conditions) or $\Sigma(t)$ diagonal with $R$ orthogonal (\emph{principal axes}: $R$ fixes the orientation only, the $n$ scales stay free).
+\end{enumerate}
+Condition (G1) uses the $n$ degrees of freedom of $\xh$; the whitening condition uses $n(n+1)/2$ of the $n^2$ of $R$, and the remaining $n(n-1)/2$ --- the skew part of $\Omega$ --- are the \emph{orientation gauge}, free and discussed in \S\ref{sec:frame_gauge}.
+
+We expand the misfit as in Appendix~\ref{sec:tracker}, but keep the second-order term of $h$ this time:
+\begin{equation}
+\begin{gathered}
+  \tfrac12\gamma\,d\big(y,h_R(\xi)\big)^2 \;=\; \tfrac12\gamma\abs r^2 - \gamma\,r\T H_R\,\xi + \tfrac12\,\xi\T\big(\gamma H_R\T H_R - \gamma K_R\big)\xi + O(\abs\xi^3), \\
+  K_R := R^{-\mathsf T}\Big(\sum_j r_j\,\grad^2h_j(\xh)\Big)R^{-1},
+\end{gathered}
+  \label{eq:frame_misfit}
+\end{equation}
+which is the Taylor expansion of $\tfrac12\gamma\abs{y-h(\xh+R^{-1}\xi)}^2$ for the Euclidean distance (for a bearing, the same with $h$ replaced by the angle and $r$ by the shortest angular difference). Setting $K_R=0$ is the linearisation of $h$ used by the tracker; $K_R = O(\abs r)$ vanishes when the frame tracks the data.
+
+\begin{proposition}[mode equations]
+\label{prop:frame_mode}
+Under the position gauge (G1), the orders $0$, $1$, $2$ in $\xi$ of \eqref{eq:frame_hjb} are
+\begin{align}
+  \text{order 0:}\quad & \dot W_0 - \frac\eps2\,\tr\big(Q_R\Sigma\big) \;=\; \tfrac12\gamma\abs r^2, \label{eq:frame_o0}\\
+  \text{order 1:}\quad & \Sigma\,u \;=\; \gamma\,H_R\T r - \frac\eps2\,\big(Q_R\!:\!T_3\big), \label{eq:frame_o1}\\
+  \text{order 2:}\quad & \dot\Sigma + (F_R+\Omega)\T\Sigma + \Sigma(F_R+\Omega) \;=\; \gamma H_R\T H_R - \gamma K_R - \Sigma Q_R\Sigma + T_3[u] + \frac\eps2\,\big(Q_R\!:\!T_4\big). \label{eq:frame_o2}
+\end{align}
+Written for the minimiser $\xh$ and the curvature $S := R\T\Sigma R = \grad_x^2V(\xh,t)$ of $V$ in the original coordinates, they are frame-free:
+\begin{align}
+  \dot{\xh} &= f(\xh) + \gamma\,S^{-1}H\T r \;-\; \frac\eps2\,S^{-1}\big(Q\!:\!\grad^3V(\xh)\big), \label{eq:frame_xhat}\\
+  \dot S &= \gamma\,H\T H - \gamma K - F\T S - SF - SQS \;+\; \grad^3V(\xh)\big[\dot{\xh}-f(\xh)\big] \;+\; \frac\eps2\,\big(Q\!:\!\grad^4V(\xh)\big), \label{eq:frame_S}
+\end{align}
+with $K := \sum_jr_j\grad^2h_j(\xh)$ and the contractions taken with the $x$-derivatives of $V$.
+\end{proposition}
+\begin{proof}
+Insert \eqref{eq:frame_taylor} with $g\equiv0$ (hence $\dot g\equiv0$) into \eqref{eq:frame_hjb}, using $f_R(\xi) = -u + (F_R+\Omega)\xi + O(\abs\xi^2)$ from \eqref{eq:frame_drift} and \eqref{eq:frame_rates}. Term by term, up to $O(\abs\xi^3)$:
+\begin{align*}
+  \partial_tW &= \dot W_0 + \tfrac12\,\xi\T\dot\Sigma\,\xi,\\
+  f_R\cdot\grad W &= -\,u\T\Sigma\xi \;+\; \xi\T(F_R+\Omega)\T\Sigma\,\xi - \tfrac12\,T_3[\xi,\xi,u],\\
+  \tfrac12\grad W\T Q_R\grad W &= \tfrac12\,\xi\T\Sigma Q_R\Sigma\,\xi,\\
+  -\tfrac\eps2\tr(Q_R\grad^2W) &= -\tfrac\eps2\tr(Q_R\Sigma) - \tfrac\eps2\,(Q_R\!:\!T_3)\cdot\xi - \tfrac\eps4\,\xi\T(Q_R\!:\!T_4)\,\xi ,
+\end{align*}
+where the last line uses $\tr(Q_RT_3[\xi]) = \sum_{abc}(Q_R)_{ab}T_{3,abc}\xi_c$ and $\tr\big(Q_R\,\tfrac12T_4[\xi,\xi,\cdot,\cdot]\big) = \tfrac12\sum_{abcd}(Q_R)_{cd}T_{4,abcd}\xi_a\xi_b$, by the symmetry of $T_4$. Matching the constant, linear and quadratic parts against \eqref{eq:frame_misfit} gives \eqref{eq:frame_o0}, \eqref{eq:frame_o1}, and --- after symmetrising the quadratic form $\xi\T(F_R+\Omega)\T\Sigma\xi$ and multiplying by 2 --- \eqref{eq:frame_o2}.
+
+For the frame-free form: $u = R(\dot{\xh}-f(\xh))$ and $S=R\T\Sigma R$ give $R^{-1}\Sigma^{-1}H_R\T = (R\T\Sigma R)^{-1}H\T = S^{-1}H\T$; since $\grad_x^3V = T_3[R\cdot,R\cdot,R\cdot]$, one checks $\big(Q\!:\!\grad^3V\big) = R\T(Q_R\!:\!T_3)$, hence $R^{-1}\Sigma^{-1}(Q_R\!:\!T_3) = S^{-1}(Q\!:\!\grad^3V)$, which is \eqref{eq:frame_xhat}. For \eqref{eq:frame_S}, $\dot S = \dot R\T\Sigma R + R\T\dot\Sigma R + R\T\Sigma\dot R = R\T\big(\Omega\T\Sigma + \dot\Sigma + \Sigma\Omega\big)R$, and conjugating \eqref{eq:frame_o2} by $R$ maps $H_R\T H_R\mapsto H\T H$, $K_R\mapsto K$, $F_R\T\Sigma\mapsto F\T S$, $\Sigma Q_R\Sigma\mapsto SQS$, $T_3[u]\mapsto\grad^3V[\dot{\xh}-f]$ and $(Q_R\!:\!T_4)\mapsto(Q\!:\!\grad^4V)$.
+\end{proof}
+
+\begin{remark}[a direct check]
+\eqref{eq:frame_xhat}--\eqref{eq:frame_S} are the exact evolution of the minimiser and of the Hessian of any solution of \eqref{eq:hjb_eps} along its mode, and can be obtained without the frame by differentiating $\grad V(\xh(t),t)=0$ and $S(t)=\grad^2V(\xh(t),t)$ in time and eliminating $\partial_t\grad V$, $\partial_t\grad^2V$ with \eqref{eq:hjb_eps} at $\xh$, where $\grad V=0$. The frame computation reproduces them because (G1) ties the origin to the mode; this is what makes the frame equations \emph{equations for the frame}.
+\end{remark}
+
+\subsection{Reading the mode equations}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{The tracker, corrected.} Dropping the three terms in $K$, $\grad^3V$ and $\grad^4V$, \eqref{eq:frame_xhat}--\eqref{eq:frame_S} are the tracker \eqref{eq:tracker_x}--\eqref{eq:tracker_S}. The tracker is thus the truncation of the exact mode dynamics that neglects the non-Gaussianity of $p$ at the mode: $K$ and $\grad^3V[\dot{\xh}-f]$ are $O(\abs r)$ (they vanish when the frame is phase-locked on the data) and the two $\eps$-terms are the effect of the diffusion on a skewed or flat-topped $p$. In the frame these corrections are exactly what the grid carries: $T_3$ and $T_4$ are read off $\rho$ at the origin, and \eqref{eq:frame_o1}--\eqref{eq:frame_o2} are then \emph{exact}, not a closure.
+  \item \textbf{The skewness shift.} In one dimension, $W = \tfrac12\sigma\xi^2 + \tfrac16a\xi^3$ with $a>0$ is steeper on the right, so $p$ has its heavy tail on the left; \eqref{eq:frame_xhat} gives the correction $-\eps qa/(2\sigma)<0$: diffusion moves the mode toward the heavy tail, as it must. The mode and the mean of $p$ differ by this $O(\eps)$ amount, which is why the argmax of the grid filter and the tracker's $\xh$ are not expected to agree beyond $O(\eps)$ even on a well-resolved grid.
+  \item \textbf{The $\eps\to0$ limit.} As in Appendix~\ref{sec:tracker}, $\eps$ enters the frame only through the $\eps$-terms and the normalisation $W_0$; at $\eps=0$ the mode equations are Mortensen's, with the second-order observation term $K$ and the third derivative along the innovation --- the terms that the second-order minimum-energy estimator keeps and the first-order one drops.
+\end{itemize}
+
+\subsection{The translating frame, \texorpdfstring{$R=I$}{R = I}: a closed system for \texorpdfstring{$\xh$}{xhat} and \texorpdfstring{$\rho$}{rho}}
+\label{sec:frame_translate}
+
+The simplest instance keeps the axes of the original coordinates and only lets the grid \emph{translate}:
+\begin{equation}
+  p(x,t) \;=\; \rho\big(x-\xh(t),\,t\big), \qquad \xi = x-\xh(t) .
+  \label{eq:tr_ansatz}
+\end{equation}
+Then $R=I$, $\Omega=0$, $Q_R=Q$, $H_R=H$, $u = \dot{\xh}-f(\xh)$, and \eqref{eq:frame_linear} is
+\begin{equation}
+  \boxed{\;
+  \partial_t\rho \;+\; \big(f(\xh+\xi) - \dot{\xh}\big)\cdot\grad\rho
+  \;=\; \frac\eps2\sum_{d=1}^nq_d\,\partial_d^2\rho \;-\; \frac{\gamma}{2\eps}\,d\big(y,h(\xh+\xi)\big)^2\,\rho ,\;}
+  \label{eq:tr_rho}
+\end{equation}
+the linear equation \eqref{eq:linear_p} seen from a frame moving at the velocity $\dot{\xh}$: the only changes are the shift of the flow and of the observation by $\xh$, and the extra drift $-\dot{\xh}$. The diffusion is unchanged, diagonal, and the current solver applies verbatim. The shape gauge (G2) is gone --- $R$ is fixed --- so the only condition left is the position gauge (G1), which for the density reads
+\begin{equation}
+  \grad\rho(0,t) \;=\; 0 \qquad\text{for all } t
+  \label{eq:tr_gauge}
+\end{equation}
+(the mode of $\rho$ is the origin of the grid, $\xh(t)=\argmax_xp(\cdot,t)$; we assume it nondegenerate, $-\grad^2\rho(0,t)\succ0$). It closes the system: \eqref{eq:tr_gauge} determines $\dot{\xh}$ from $\rho$, and \eqref{eq:tr_rho} then evolves $\rho$.
+
+\begin{proposition}[translating frame]
+\label{prop:tr}
+Let $\rho$ solve \eqref{eq:tr_rho}. The gauge \eqref{eq:tr_gauge} holds for all $t$ if and only if it holds at $t=0$ and
+\begin{equation}
+  \boxed{\;
+  \dot{\xh} \;=\; f(\xh) \;+\; \frac{\gamma}{\eps}\,C^{-1}H\T r \;+\; \frac\eps2\,C^{-1}\,\frac{\big(Q\!:\!\grad^3\rho\big)(0,t)}{\rho(0,t)},
+  \qquad C := -\,\frac{\grad^2\rho(0,t)}{\rho(0,t)} \succ 0,\;}
+  \label{eq:tr_xhat}
+\end{equation}
+where $r = y\ominus h(\xh)$, $H=\partial h(\xh)$, and $(Q\!:\!\grad^3\rho)_c = \sum_{a,b}Q_{ab}\,\partial_{abc}\rho$ --- for diagonal $Q$, $\sum_aq_a\,\partial_{aac}\rho$. The system \eqref{eq:tr_rho}, \eqref{eq:tr_xhat} is exact: it is \eqref{eq:linear_p} in a moving frame, no approximation being made until $\rho$ is truncated to a box in $\xi$.
+\end{proposition}
+\begin{proof}
+Differentiate \eqref{eq:tr_gauge} in time: $\partial_t\grad\rho(0,t)=0$. Take the gradient of \eqref{eq:tr_rho} at $\xi=0$, where $\grad\rho=0$. The drift term gives $\grad\big[(f(\xh+\xi)-\dot{\xh})\cdot\grad\rho\big]_{\xi=0} = F\T\grad\rho(0) + \grad^2\rho(0)\,\big(f(\xh)-\dot{\xh}\big) = \grad^2\rho(0)\,\big(f(\xh)-\dot{\xh}\big)$; the diffusion gives $\tfrac\eps2\,(Q\!:\!\grad^3\rho)(0)$; the misfit gives $-\tfrac{\gamma}{2\eps}\big[\rho(0)\,\grad(d^2)(0) + d^2\,\grad\rho(0)\big] = \tfrac\gamma\eps\,\rho(0)\,H\T r$, since $\grad_\xi\,d\big(y,h(\xh+\xi)\big)^2\big|_{\xi=0} = -2H\T r$. Hence
+\[
+  0 = \partial_t\grad\rho(0) = -\grad^2\rho(0)\big(f(\xh)-\dot{\xh}\big) + \tfrac\eps2\,(Q\!:\!\grad^3\rho)(0) + \tfrac\gamma\eps\,\rho(0)\,H\T r ,
+\]
+and solving for $\dot{\xh}$ with $\grad^2\rho(0) = -\rho(0)\,C$ gives \eqref{eq:tr_xhat}. Conversely, if \eqref{eq:tr_xhat} holds then $\partial_t\grad\rho(0,t)=0$, so $\grad\rho(0,t)=\grad\rho(0,0)=0$.
+\end{proof}
+
+\paragraph{Reading \eqref{eq:tr_xhat}.}
+In terms of $W=-\eps\log\rho$, at the mode $S = \grad^2W(0) = \eps\,C$ and $\grad^3W(0) = -\eps\,\grad^3\rho(0)/\rho(0)$, so \eqref{eq:tr_xhat} is the mode equation \eqref{eq:frame_xhat}, $\dot{\xh} = f(\xh) + \gamma S^{-1}H\T r - \tfrac\eps2S^{-1}(Q\!:\!\grad^3V)$, with the curvature and the skewness \emph{read off the grid at the origin} instead of being carried by the frame. Three terms:
+\begin{itemize}[leftmargin=1.5em]
+  \item $f(\xh)$: the frame follows the flow --- the transport of the mode;
+  \item $\tfrac\gamma\eps C^{-1}H\T r$: the observation pulls the mode toward the data by the innovation, weighted by the inverse curvature of $\rho$ --- the tracker's gain $\gamma S^{-1}H\T r$, since $\eps C=S$. It is $O(\eps^{-1})$ in $\rho$-units because $C$, the curvature of $\rho$ itself, is $O(\eps^{-1})$ where $p$ is sharp; the product is $O(1)$;
+  \item $\tfrac\eps2C^{-1}(Q\!:\!\grad^3\rho)/\rho$: the diffusion moves the mode toward the heavy tail when $\rho$ is skewed; it vanishes when $\rho$ is Gaussian at the origin ($\grad^3\rho(0)=0$) --- in particular it is absent from the tracker, whose density is Gaussian by construction.
+\end{itemize}
+The second-order equation \eqref{eq:frame_S} is no longer an equation for the frame: $S=\eps C$ is now a diagnostic evaluated on $\rho$, and its evolution is what \eqref{eq:tr_rho} produces automatically. What is lost with respect to the whitened frame of \S\ref{sec:frame_scale} is the $\eps$-independence of the box: the window has the orientation and the scale of the original coordinates, so its half-widths $L_d$ must be chosen from the expected curvature, $L_d\gg\sqrt{\eps\,(S^{-1})_{dd}}$, exactly as the box of the present filter is chosen from the state ranges --- but around the mode only, which is the whole gain: a box of a few standard deviations instead of the full range of the trajectory.
+
+\paragraph{The discrete cycle.}
+The gauge \eqref{eq:tr_gauge} is enforced once per step: the density is moved through the three operations of the cycle on a grid that stays put, and the grid is re-centred on the mode at the end. Per step, with $(\xh_n,\rho_n)$ given and $\grad\rho_n(0)=0$:
+\begin{enumerate}[leftmargin=1.5em,nosep]
+  \item observation: $\rho\leftarrow\rho_n\cdot\exp\big(-\eps^{-1}\dt\,\gamma\,d(y,h(\xh_n+\xi))^2/2\big)$;
+  \item transport in the frame of $\xh_n$: $\rho(\xi)\leftarrow\rho\big(\varphi^{-1}(\xh_n+\xi)-\xh_n\big)$, the current semi-Lagrangian step with $\varphi^{-1}$ evaluated at the physical points $\xh_n+\xi$;
+  \item diffusion: the current split step, unchanged;
+  \item re-centring: $\xi^*:=\argmax\rho$ (from \texttt{argmax\_p}, refined by the local quadratic fit of the To-do list), $\xh_{n+1}:=\xh_n+\xi^*$, $\rho_{n+1}(\xi):=\rho(\xi+\xi^*)$ --- one interpolation by a translation, $\rho=0$ outside the old box.
+\end{enumerate}
+Steps 1--3 are the present filter on a box centred at $\xh_n$; step 4 is the discrete form of the gauge, and $\xi^*$ --- the sum of the displacements of the mode by the observation ($\dt\,\tfrac\gamma\eps C^{-1}H\T r$), the flow ($\dt\,f$) and the diffusion (the skewness term) --- is the integral of \eqref{eq:tr_xhat} over the step, computed by the grid. No equation beyond \eqref{eq:tr_rho} is integrated. Two remarks: the mode must stay in the box between two re-centrings, $\dt\,\abs{f(\xh)+\tfrac\gamma\eps C^{-1}H\T r}\ll L$, a constraint on $\dt$ in terms of the box; and the translation of step 4 can be composed with the next step's transport ($\rho(\varphi^{-1}(\xh_{n+1}+\xi)-\xh_{n+1}+\xi^*) = \rho(\varphi^{-1}(\xh_{n+1}+\xi)-\xh_n)$) to save one interpolation. The precomputed plan of \texttt{pre\_compute\_flow\_inv} does not apply, since the map of step 2 changes with $\xh_n$; the \texttt{convect} path is used, on the small grid, and the Dirichlet wall gives the tail semantics $p\equiv0$ outside the window, as in \S\ref{sec:frame_cycle}. This is the minimal moving-window filter, and the natural first implementation and validation target (spring chain, then Kepler) before any orientation or scaling of the frame is added.
+
+\subsection{The shape gauge and the orientation gauge}
+\label{sec:frame_gauge}
+
+\paragraph{Whitening, $\Sigma\equiv I$.}
+Then $S = R\T R$, and \eqref{eq:frame_o2} with $\dot\Sigma=0$ reads
+\begin{equation}
+  \Omega + \Omega\T \;=\; M_R := \gamma H_R\T H_R - \gamma K_R - F_R\T - F_R - Q_R + T_3[u] + \frac\eps2\,(Q_R\!:\!T_4) \;=\; R^{-\mathsf T}\,\dot S\,R^{-1},
+  \label{eq:frame_whiten}
+\end{equation}
+with $\dot S$ from \eqref{eq:frame_S}: the symmetric part of $\Omega$ is determined, $\operatorname{sym}\Omega = \tfrac12R^{-\mathsf T}\dot SR^{-1}$, and the skew part is free. The solutions are all the $R(t) = O(t)\,S(t)^{1/2}$ with $O(t)$ orthogonal and $\dot OO\T$ arbitrary: the orientation gauge is the choice of $O$. Three natural choices:
+\begin{itemize}[leftmargin=1.5em]
+  \item \emph{Symmetric frame}: $R = S^{1/2}$, the symmetric square root. No rotation is introduced beyond what the change of $S$ imposes; simplest to state, and $\Omega = \tfrac{\dd}{\dd t}(S^{1/2})\,S^{-1/2}$.
+  \item \emph{Co-rotating frame}: $\operatorname{skew}\Omega = -\operatorname{skew}F_R$. Then the linearised drift seen by $\rho$, $(F_R+\Omega)\xi$, has the symmetric matrix $\operatorname{sym}F_R + \operatorname{sym}\Omega$: the grid turns with the local rotation of the flow and $\rho$ sees only stretching at the linear level. For a Hamiltonian flow this removes the fast rotation in each $(q,p)$ plane from the transport step.
+  \item \emph{Axis-aligned diffusion}: see below.
+\end{itemize}
+
+\paragraph{Principal axes, $R$ orthogonal, $\Sigma=\Lambda=\operatorname{diag}(\lambda_1,\dots,\lambda_n)$.}
+Then $S = R\T\Lambda R$ is the eigendecomposition of $S$, $\Omega=\dot RR\T$ is skew, and $\Omega\T\Lambda + \Lambda\Omega = \Lambda\Omega - \Omega\Lambda$ has entries $(\lambda_i-\lambda_j)\Omega_{ij}$. Equation \eqref{eq:frame_o2} becomes, with $M_R := R\,\dot S\,R\T$ its right-hand side,
+\begin{equation}
+  \dot\lambda_i = (M_R)_{ii}, \qquad \Omega_{ij} = \frac{(M_R)_{ij}}{\lambda_i-\lambda_j}\quad(i\ne j),
+  \label{eq:frame_principal}
+\end{equation}
+the classical formulas for the derivatives of eigenvalues and eigenvectors. They are singular where two curvatures cross: at a crossing the principal axes are undefined and the frame would spin. This is a genuine obstacle in $n\ge2$ (the spring chain crosses curvatures every half period), and a reason to prefer a whitening gauge, which has no such singularity.
+
+\paragraph{Axis-aligned diffusion.}
+The library's diffusion solver is a tensor product and needs a diagonal $Q_R$. Assume $Q\succ0$.
+\begin{lemma}
+$Q_R = RQR\T$ is diagonal if and only if $R = D\,O\,Q^{-1/2}$ with $O$ orthogonal and $D$ diagonal, and then $Q_R = D^2$. Combined with whitening, $R\T R = S$, the pair $(O,D)$ is determined (up to the ordering and signs of the rows of $O$) by the eigendecomposition
+\begin{equation}
+  Q^{1/2}\,S\,Q^{1/2} \;=\; O\T D^2\,O .
+  \label{eq:frame_aligned}
+\end{equation}
+\end{lemma}
+\begin{proof}
+$Q_R = (RQ^{1/2})(RQ^{1/2})\T$ is diagonal iff the rows of $RQ^{1/2}$ are orthogonal, i.e.\ $RQ^{1/2} = DO$ with $O$ orthogonal and $D$ the row norms. Then $S = R\T R = Q^{-1/2}O\T D^2OQ^{-1/2}$, which is \eqref{eq:frame_aligned}.
+\end{proof}
+So there is exactly one frame, up to the trivial symmetries, that whitens the curvature \emph{and} keeps the diffusion axis-aligned; in it the existing solver runs unchanged with the per-direction coefficients $q_d\leftarrow d_i^2$. Its rates follow from $\Omega = \dot RR^{-1} = \dot DD^{-1} + D\,\omega\,D^{-1}$ with $\omega:=\dot OO\T$ skew, so that \eqref{eq:frame_whiten} splits into
+\[
+  \frac{2\dot d_i}{d_i} = (M_R)_{ii}, \qquad \omega_{ij} = \frac{d_id_j}{d_i^2-d_j^2}\,(M_R)_{ij}\quad(i\ne j):
+\]
+the frame is a principal-axes frame for $Q^{1/2}SQ^{1/2}$ rather than for $S$, and it inherits the crossing singularity of \eqref{eq:frame_principal}. With isotropic noise $Q=qI$ the two coincide, $R = DO$ with $O\T D^2O = qS$, and the frame diffusion coefficient in direction $i$ is $q\lambda_i(S)$: the narrower the density in a direction, the faster it diffuses in whitened units, as it should. Directions with $q_d=0$ (a constant parameter, as $\theta$ in \texttt{kepler\_mu}) do not fit this gauge; they are the directions that belong to the global grid of \S\ref{sec:main} rather than to a window, see \S\ref{sec:frame_cycle}.
+
+\subsection{What the grid carries: the scale \texorpdfstring{$\sqrt\eps$}{sqrt(eps)}}
+\label{sec:frame_scale}
+
+In the whitening gauge the expansion \eqref{eq:frame_taylor} gives
+\[
+  \rho(\xi,t) \;=\; e^{-W_0/\eps}\;\exp\Big(-\frac{\abs\xi^2}{2\eps}\Big)\;\exp\Big(-\frac{1}{\eps}\Big[\tfrac16T_3[\xi,\xi,\xi] + \tfrac1{24}T_4[\xi,\xi,\xi,\xi] + \dots\Big]\Big).
+\]
+The mass sits at $\abs\xi = O(\sqrt\eps)$; on that scale, $\xi = \sqrt\eps\,\eta$,
+\begin{equation}
+\begin{aligned}
+  \rho \;&\propto\; e^{-\abs\eta^2/2}\;\exp\Big(-\sqrt\eps\,\tfrac16T_3[\eta,\eta,\eta] - \eps\,\tfrac1{24}T_4[\eta,\eta,\eta,\eta] - \dots\Big) \\
+  &=\; e^{-\abs\eta^2/2}\Big(1 - \sqrt\eps\,\tfrac16T_3[\eta,\eta,\eta] + O(\eps)\Big).
+\end{aligned}
+  \label{eq:frame_scaled}
+\end{equation}
+This is the precise content of the small-$\xi$ analysis. The frame absorbs the orders $0$, $1$, $2$ of $W$; what the grid carries is a \emph{standard Gaussian in $\eta$ plus an expansion in powers of $\sqrt\eps$}, whose coefficients are the higher Taylor coefficients of $V$ at the mode in whitened units --- the non-Gaussianity of the filter. Three consequences.
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{An $\eps$-independent box.} Using $\eta$ as the grid coordinate (i.e.\ replacing $R$ by $R/\sqrt\eps$, which changes $\Sigma\equiv I$ into $\Sigma\equiv\eps I$ and nothing else in the gauge) the box $\abs{\eta_d}\le L$ is the same for every $\eps$, with $L\approx4$--$6$ standard deviations. The truncation discards a relative mass $\sim L^{n-2}e^{-L^2/2}$ of the Gaussian part, and it is legitimate as long as $W-W_0\gg\eps$ on the boundary of the box, i.e.\ as long as the higher orders do not undo the quadratic growth there: $\sqrt\eps\,L^3\abs{T_3}\lesssim1$ is the condition for the expansion \eqref{eq:frame_scaled} to be usable across the box, and a second well within reach of the box is what the window cannot represent. Nothing else is assumed: inside the box the grid resolves all orders.
+  \item \textbf{The equation in the scaled frame is $\eps$-free but for the stiff innovation terms.} In $\eta$, \eqref{eq:frame_linear} reads $\partial_t\rho + \tilde f\cdot\grad_\eta\rho = \tfrac12\tr(Q_R\grad_\eta^2\rho) - \tfrac{\gamma}{2\eps}d^2\rho$ with $\tilde f(\eta) = f_R(\sqrt\eps\,\eta)/\sqrt\eps = -u/\sqrt\eps + (F_R+\Omega)\eta + O(\sqrt\eps)$, and $\tfrac{\gamma}{2\eps}d^2 = \tfrac{\gamma}{2\eps}\abs r^2 - \tfrac{\gamma}{\sqrt\eps}\,r\T H_R\eta + \tfrac\gamma2\abs{H_R\eta}^2 + O(\sqrt\eps)$. The two $O(\eps^{-1/2})$ terms are the push of the observation on the mode and the counter-motion of the frame, and they cancel exactly in the mode equation \eqref{eq:frame_o1} (with $\Sigma=I$, $u = \gamma H_R\T r + O(\eps)$). Everything else is $O(1)$. In a split cycle, however, the two are applied in \emph{separate} steps, each moving the mode by $\dt\,\abs u/\sqrt\eps$ in $\eta$-units before the other undoes it: one needs $\dt\,\gamma\abs{H_R\T r}\ll L\sqrt\eps$ for the mode to stay in the box between the two steps, or --- better --- the observation step and the re-centring of the frame fused into one, as in \S\ref{sec:frame_cycle}.
+  \item \textbf{What is lost.} The window represents one mode. A second mode of $V$ outside the box is invisible, exactly as for the tracker; the difference is that within a few standard deviations of the mode the window is exact where the tracker is not (the phase-aliased likelihood of \S\ref{sec:kepler} is an example of a well \emph{outside} the window, and for it the $\theta$ direction must stay on the global grid).
+\end{itemize}
+
+\subsection{The discrete cycle in the frame}
+\label{sec:frame_cycle}
+
+Let $(\xh_n,R_n)$ be the frame at step $n$ and $\rho_n$ the grid field. One cycle:
+\begin{enumerate}[leftmargin=1.5em,nosep]
+  \item \textbf{Observation}, in the frame $n$: $\rho\leftarrow\rho\cdot\exp\big(-\eps^{-1}\dt\,\gamma\,d(y,h(\xh_n+R_n^{-1}\xi))^2/2\big)$ --- the current step with $h$ composed with the frame.
+  \item \textbf{Frame update}: $(\xh_n,S_n)\to(\xh_{n+1},S_{n+1})$ by the tracker's discrete cycle of \texttt{src/tracker.rs} (observation, transport with the exact discrete tangent $\Phi$, diffusion), then $R_{n+1}$ from $S_{n+1}$ by the shape gauge of \S\ref{sec:frame_gauge} --- e.g.\ \eqref{eq:frame_aligned}, with the rows of $O$ matched to those of the previous step to keep the orientation continuous.
+  \item \textbf{Transport and re-framing}, in one interpolation:
+  \begin{equation}
+    \rho_{n+1}(\xi) \;=\; \rho\Big(R_n\big(\varphi^{-1}(\xh_{n+1}+R_{n+1}^{-1}\xi) - \xh_n\big)\Big),
+    \label{eq:frame_transport}
+  \end{equation}
+  the semi-Lagrangian step of the current code with the composed inverse map. Since $\xh_{n+1}\approx\varphi(\xh_n + \dt\,\gamma(S_n^+)^{-1}H\T r)$, the mode that step 1 has displaced to $\xi\approx\dt\,\gamma(\Sigma^+)^{-1}H_R\T r$ lands back at $\xi\approx0$: this is the fusion of the observation push and the frame's counter-motion of \S\ref{sec:frame_scale}, and it removes the stiffness. The map changes every step, so the precomputed plan of \texttt{pre\_compute\_flow\_inv} does not apply; the \texttt{convect} path is used, on a grid that is smaller by orders of magnitude (a $21^4$ window costs $\approx0.03$\,s per iteration against $\approx2$\,s for the $26.6$M-DOF box of \texttt{pendulum\_rod}). Near the origin the map is $\approx R_n\Phi^{-1}R_{n+1}^{-1}\xi$, a small deformation when the frame is whitened, since $R_{n+1}\Phi R_n^{-1}$ is then close to orthogonal.
+  \item \textbf{Diffusion}, in the frame $n+1$: the split implicit-Euler step with the diagonal $Q_{R_{n+1}} = D_{n+1}^2$ in the axis-aligned gauge, or with the full $Q_R$ otherwise (a mixed-derivative term the tensor-product solver does not have --- the axis-aligned gauge is the one that works with the library as it is).
+\end{enumerate}
+\emph{Boundary.} The Dirichlet wall ($p\equiv0$ outside the box) is the correct condition for a window: when the curvature sharpens the box shrinks in $x$ and the discarded values are the negligible tail; when it widens, the box grows and the new points, where $\rho$ was assumed zero, are filled by the transport with zeros --- consistent with the assumption, and the diffusion step then fills them from the interior.
+
+\emph{Re-anchoring.} With the frame driven by the tracker, steps 2 drop the $O(\abs r)$ and $O(\eps)$ corrections of \eqref{eq:frame_xhat}--\eqref{eq:frame_S}; the true mode of $\rho$ therefore drifts away from $\xi=0$ at a rate $O(\eps)+O(\abs r)$ per unit time, and nothing pulls it back. The remedy is to use the tracker for the \emph{increment} over one step and to re-anchor the frame on the grid at every step: $\xh_{n+1} \leftarrow \xh_{n+1} + R_{n+1}^{-1}\xi^*$ with $\xi^* = \argmax\rho_{n+1}$ (the existing \texttt{argmax\_p}, refined by the local quadratic fit of the To-do list, which also yields the curvature $\Sigma^*$ to correct $S_{n+1}$). This is the discrete counterpart of the exact mode equations: the increments of \eqref{eq:frame_xhat}--\eqref{eq:frame_S} over $\dt$ differ from the tracker's by exactly the amounts the re-anchoring absorbs, and the estimate is then the grid's own mode, the tracker serving only as a predictor of where the window goes.
+
+\emph{Combination with the hybrid.} For a parameter direction (or any direction where $V$ is multimodal) the window is the wrong tool and the global grid of \S\ref{sec:main} the right one. The two compose: in the triangular setting, keep $y$ on the global grid and replace the Gaussian in $z$ of \eqref{eq:T_ansatz} by a $y$-dependent frame with a small grid in $\xi_z$,
+\[
+  p(y,z,t) = \rho\big(y,\ R(y,t)\,(z-\zh(y,t)),\ t\big),
+\]
+a "grid of small windows". At each $y$-node the frame obeys the bank-of-trackers equations \eqref{eq:tri_z}--\eqref{eq:tri_S} corrected as in Proposition~\ref{prop:frame_mode}, and the small grid corrects the Gaussian closure in $z$ where the model is not conditionally linear; for the \texttt{kepler\_mu} example this gives the $\theta$-profile $W(\theta)$ of \S\ref{sec:kepler} without the closure error of the tracker in $(q,p)$. The $y$-derivatives of the frame enter the transport and the $y$-diffusion of $\rho$ through terms of the same form as the $A=\gy\zh$ terms of \S\ref{sec:main}; their derivation is left for when the plain window has been validated.
+
+\subsection{Caveats and validation}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Unimodality in the framed directions}, by construction; the window is a tracker with an exact local correction, not a substitute for the global grid.
+  \item \textbf{Curvature crossings.} Every gauge that aligns the axes with a principal-axes decomposition (\eqref{eq:frame_principal}, \eqref{eq:frame_aligned}) is singular at coalescing eigenvalues. In practice the discrete gauge (an eigendecomposition per step, with the rows of $O$ matched to the previous step) only spins the frame by a finite angle across a crossing; the interpolation \eqref{eq:frame_transport} absorbs it at the cost of one re-sampling. The symmetric or co-rotating whitening frames have no singularity but need a full $Q_R$ in the diffusion.
+  \item \textbf{Noise-free directions} ($q_d=0$) admit no whitening with axis-aligned diffusion; they belong to the global grid.
+  \item \textbf{Validation}, in this order. (i) Spring chain, tracker-driven whitened window: the model is linear-Gaussian, $T_3=T_4=0$ and $K=0$, so $\rho$ must remain the standard Gaussian \eqref{eq:frame_scaled} in $\eta$ up to grid and splitting error, and the window's argmax must reproduce the Kalman filter as the tracker does (\texttt{matches\_kalman\_filter\_on\_linear\_model}); this isolates the re-framing interpolation. (ii) Pendulum and Kepler: compare the window's argmax and curvature with the full-box filter's at the same $\eps$ and $\dt$, as functions of $L$ and of the grid resolution in $\eta$; the difference must decay like the discarded tail in $L$. (iii) Lorenz-63, where the tracker locks on from $x$ alone: the window should stay locked with a box of a few standard deviations while the full box needs the whole attractor.
+\end{itemize}
+
+% ===========================================================================
+\section{Caveats}
+% ===========================================================================
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Diagonal $S$ does not recover the tracker.} The proposal "one position and one variance per Gaussian direction" corresponds to $S(y)$ diagonal. With $m\ge2$ Gaussian directions this drops the cross-information $S_{ab}$, which is essential: on the spring chain, the position--velocity correlation is what makes the Kalman filter work, and a diagonal-information tracker is a different, poorer estimator. Recovering the tracker in the limit $k=0$ requires the full symmetric $S$, i.e.\ $m + m(m+1)/2$ numbers per grid point; this equals $2$ only for $m=1$. For $m=4$ (Kepler) it is $14$ --- still negligible against a grid.
+  \item \textbf{Unimodality in $z$.} At each $y$ the closure is a single Gaussian: any multimodality of $V$ must live in the grid directions. Choosing the split $x=(y,z)$ is a modelling decision, guided by \S\ref{sec:exact} (directions entering affinely may be Gaussian) and \S\ref{sec:triangular} (directions whose dynamics are autonomous of the rest are cheap to keep on the grid).
+  \item \textbf{$W$ versus the marginal.} With $\eps>0$ the max-marginal $e^{-W/\eps}$ and the integrated marginal differ by $\det S(y)^{-1/2}$; keeping the $\tfrac{\eps}{2}\tr(Q_zS)$ source in \eqref{eq:hyb_W} makes $W$ consistent with the viscous filter. Dropping it gives the pure minimum-energy hybrid; the two agree as $\eps\to0$.
+  \item \textbf{The $y$-diffusion step} is the only place where a genuine closure (mixture $\to$ Gaussian) is performed at the discrete level; its error should be measured (see below) before the hybrid is used with $Q_y\neq0$.
+\end{itemize}
+
+% ===========================================================================
+\section{Validation plan}
+% ===========================================================================
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Exactness on a conditionally linear model.} Spring chain, one grid direction and one Gaussian direction (e.g.\ $y=$ position, $z=$ velocity, or the reverse). The model is linear, hence conditionally linear given $y$: the hybrid must reproduce the Kalman filter (and the tracker, already validated against it) to round-off. This isolates the transport re-closure, since $\psi_y$ depends on $z$ for the spring.
+  \item \textbf{Bank of trackers on \texttt{kepler\_mu}.} $\theta$ on a 1D grid, $(q,p)$ Gaussian, $q_\theta=0$, $\theta_{\rm true}=0.4$: the profile $W(\theta)$ must have its global minimum at $\theta_{\rm true}$ while the single tracker fails; compare $e^{-W/\eps}$ with the $\theta$ max-marginal of the full 5D grid filter, which it should approach as the latter's $(q,p)$ resolution increases (the 5D filter carries the same information, at the price of resolving Gaussians on a grid).
+  \item \textbf{$y$-diffusion re-closure.} Repeat 2 with $q_\theta>0$ and measure the difference to the 5D filter as a function of $q_\theta$ and $\dt$: this quantifies the only approximate step of the scheme.
+\end{enumerate}
+
+\begin{thebibliography}{9}\small
+\bibitem{Mortensen1968} R.\,E. Mortensen, \emph{Maximum-likelihood recursive nonlinear filtering}, J.\ Optim.\ Theory Appl.\ 2 (1968) 386--394.
+\bibitem{Hijab1980} O.\,B. Hijab, \emph{Minimum energy estimation}, PhD thesis, University of California, Berkeley, 1980.
+\bibitem{Krener2003} A.\,J. Krener, \emph{The convergence of the minimum energy estimator}, in: New Trends in Nonlinear Dynamics and Control, LNCIS 295, Springer, 2003.
+\bibitem{FlemingSoner2006} W.\,H. Fleming, H.\,M. Soner, \emph{Controlled Markov Processes and Viscosity Solutions}, 2nd ed., Springer, 2006.
+\bibitem{FlemingMitter1982} W.\,H. Fleming, S.\,K. Mitter, \emph{Optimal control and nonlinear filtering for nondegenerate diffusion processes}, Stochastics 8 (1982) 63--77.
+\bibitem{BainCrisan2009} A. Bain, D. Crisan, \emph{Fundamentals of Stochastic Filtering}, Springer, 2009.
+\bibitem{Zakai1969} M. Zakai, \emph{On the optimal filtering of diffusion processes}, Z.\ Wahrscheinlichkeitstheorie verw.\ Geb.\ 11 (1969) 230--243.
+\bibitem{BoueDupuis1998} M. Bou\'e, P. Dupuis, \emph{A variational representation for certain functionals of Brownian motion}, Ann.\ Probab.\ 26 (1998) 1641--1659.
+\bibitem{Freidlin1985} M. Freidlin, \emph{Functional Integration and Partial Differential Equations}, Annals of Mathematics Studies 109, Princeton University Press, 1985.
+\bibitem{KalmanBucy1961} R.\,E. Kalman, R.\,S. Bucy, \emph{New results in linear filtering and prediction theory}, J.\ Basic Eng.\ 83 (1961) 95--108.
+\bibitem{Bucy1972} R.\,S. Bucy, \emph{The Riccati equation and its bounds}, J.\ Comput.\ System Sci.\ 6 (1972) 343--353.
+\bibitem{AndersonMoore1979} B.\,D.\,O. Anderson, J.\,B. Moore, \emph{Optimal Filtering}, Prentice-Hall, 1979.
+\bibitem{Magill1965} D.\,T. Magill, \emph{Optimal adaptive estimation of sampled stochastic processes}, IEEE Trans.\ Autom.\ Control 10 (1965) 434--439.
+\bibitem{Hassani2009} V. Hassani, A.\,P. Aguiar, M. Athans, A.\,M. Pascoal, \emph{Multiple model adaptive estimation and model identification using a minimum energy criterion}, Proc.\ American Control Conference, 2009.
+\bibitem{Reif1999} K. Reif, S. G\"unther, E. Yaz, R. Unbehauen, \emph{Stochastic stability of the discrete-time extended Kalman filter}, IEEE Trans.\ Autom.\ Control 44 (1999) 714--728.
+\bibitem{BreitenSchroeder2023} T. Breiten, J. Schr\"oder, \emph{Local well-posedness of the Mortensen observer}, preprint, 2023.
+\bibitem{Soner1986} H.\,M. Soner, \emph{Optimal control with state-space constraint I}, SIAM J.\ Control Optim.\ 24 (1986) 552--561.
+\bibitem{Doucet2000} A. Doucet, N. de Freitas, K. Murphy, S. Russell, \emph{Rao-Blackwellised particle filtering for dynamic Bayesian networks}, Proc.\ UAI, 2000.
+\bibitem{Schon2005} T. Sch\"on, F. Gustafsson, P.-J. Nordlund, \emph{Marginalized particle filters for mixed linear/nonlinear state-space models}, IEEE Trans.\ Signal Process.\ 53 (2005) 2279--2289.
+\bibitem{Brigo1998} D. Brigo, B. Hanzon, F. Le Gland, \emph{A differential geometric approach to nonlinear filtering: the projection filter}, IEEE Trans.\ Autom.\ Control 43 (1998) 247--252.
+\end{thebibliography}
+
+\end{document}

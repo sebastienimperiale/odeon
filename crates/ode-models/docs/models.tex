@@ -1,0 +1,172 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.6cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\newcommand{\T}{^{\mathsf T}}
+\newcommand{\dd}{\,\mathrm{d}}
+\setlength{\parskip}{4pt}\setlength{\parindent}{0pt}
+
+% One section per model, each with a named destination and a label
+% model:<name>, whose page number the build writes to models.aux
+% (\newlabel{model:<name>}{{<section>}{<page>}...}): the viewer's "About
+% this model" button reads it there and opens the browser on this file
+% (built locally) as  models.pdf#page=<page>  (or #nameddest=<name> when
+% the .aux is not at hand).
+\newcommand{\modelsection}[2]{\clearpage\hypertarget{#1}{}\section{#2}\label{model:#1}}
+
+\title{The forward models of the \texttt{ode-models} crate}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{What a model provides}
+Every model of the crate implements one contract, the \texttt{Model} trait of \texttt{crates/ode-models/src/model.rs}: parameters and pure maps of a state, no state of its own. It provides a time step $\delta t$; the exact discrete flow $\varphi$ over one step and its inverse $\varphi^{-1}$ (for the symmetric Gauss--Legendre schemes, one step with $-\delta t$; for the linear chain, a stored matrix); the observation $h(x)$, the discrepancy $d(y,h(x))^2$ the filter multiplies the density by given the observation $y$ of the step, and the innovation $y\ominus h(x)$ (the shortest angular difference for a bearing); the tangents $\partial\varphi$ and $\partial h$ for the Gaussian closure; the periodic components with their intervals (the angles of the pendulums); and whether the flow is autonomous, which lets the filter cache $\varphi^{-1}$ of its grid. The state is one flat vector, $x\in\mathbb R^n$, in the order given with each model. The reference trajectory and its observations $y_n=h(x_n)+\eta_n$ are generated outside the model (\texttt{ode-models-spec}), by the same flow. The viewer's ``About this model'' button opens this document at the model's section.
+
+\tableofcontents
+
+\modelsection{spring}{Linear spring chain}
+$N$ equal masses $\rho$ on a line, body 1 attached to a wall, each body to the next by a spring of stiffness $a$ per unit length, the free end unattached. With $Y\in\mathbb R^N$ the positions and $V=\dot Y$,
+\[
+  M\,\ddot Y + K\,Y = 0, \qquad M=\rho\,I, \qquad K=\frac a\ell\,\mathrm{tridiag}(-1,\,2,\,-1)\ \text{with last row } (-1,\ 1),
+\]
+a conservative linear system, $H=\tfrac12 V\T MV+\tfrac12 Y\T KY$. \textbf{State} $x=(Y;V)\in\mathbb R^{2N}$. \textbf{Time stepping} implicit midpoint: $x_{n+1}=T\,x_n$ with a constant matrix $T$, symplectic, exactly invertible ($T^{-1}$ stored), so transport is the linear map $\varphi^{-1}=T^{-1}$.
+
+\textbf{Observation} one position $h(x)=y_i$ (the selected mass), optionally with noise. \textbf{Role in the library}: the linear--Gaussian reference — the tracker equals the Kalman filter here, and the grid filter's argmax follows it to node accuracy.
+
+\textbf{References:} \href{https://en.wikipedia.org/wiki/Harmonic_oscillator}{Harmonic oscillator (Wikipedia)}, \href{https://en.wikipedia.org/wiki/Midpoint_method}{Implicit midpoint method (Wikipedia)}.
+
+\modelsection{spring_mass}{Spring chain with an unknown mass}
+$N$ bodies on a line, body 1 attached to a wall, consecutive bodies linked by springs of stiffness $k$; $y_1,\dots,y_N$ are the displacements from rest. Bodies $1,\dots,N-1$ have the known mass $m$, the free-end body the unknown mass
+\[
+  m_N(\theta)=m_0\,2^{\theta}, \qquad \dot\theta=0,
+\]
+$\theta$ the log-parameter to estimate (in doublings of $m_0$; positive $m_N$ for every $\theta$, a Gaussian prior in $\theta$ is log-normal in $m_N$). For $N=1$ the single body is the unknown one. \textbf{Dynamics}
+\[
+  \dot y=v, \qquad m_i\,\dot v_i=-(K y)_i, \qquad \dot\theta=0, \qquad K=k\,\mathrm{tridiag}(-1,2,-1),\ K_{NN}=k .
+\]
+\textbf{State} $x=(y_1..y_N,\,v_1..v_N,\,\theta)\in\mathbb R^{2N+1}$. \textbf{Time stepping} Gauss--Legendre 4 (symplectic, symmetric: $\varphi^{-1}$ = one step with $-\delta t$); $\theta$ is exactly conserved, energy at fixed $\theta$ too.
+
+\textbf{Conditionally linear}: given $\theta$ the dynamics are linear in $(y,v)$ — the class where the hybrid grid--Gaussian closure is exact. \textbf{Observation} one position $y_i$. In the filter $q_\theta=0$ (no diffusion in $\theta$): each $\theta$-slice runs its own chain, the observation alone discriminates them.
+
+\textbf{References:} \href{https://en.wikipedia.org/wiki/Harmonic_oscillator}{Harmonic oscillator (Wikipedia)}, \href{https://en.wikipedia.org/wiki/Rao\%E2\%80\%93Blackwell_theorem}{Rao--Blackwellisation (Wikipedia)}.
+
+\modelsection{pendulum}{Double pendulum, point masses}
+Mass $m_1$ hangs from a fixed pivot by a massless rod of length $\ell_1$, mass $m_2$ from $m_1$ by a rod of length $\ell_2$; gravity $g$ downward. \textbf{State} $x=(q_1,q_2,p_1,p_2)$, $q_i$ the angle of rod $i$ with the downward vertical, $p_i$ its conjugate momentum, $\Delta=q_1-q_2$:
+\begin{align*}
+  H(x)&=\frac{m_2\ell_2^2p_1^2+(m_1+m_2)\ell_1^2p_2^2-2m_2\ell_1\ell_2\,p_1p_2\cos\Delta}{2m_2\ell_1^2\ell_2^2\,(m_1+m_2\sin^2\Delta)} \\
+      &\quad+(m_1+m_2)g\ell_1(1-\cos q_1)+m_2g\ell_2(1-\cos q_2)+m_2g\ell_2 .
+\end{align*}
+Hamilton's equations $\dot q=\partial_pH$, $\dot p=-\partial_qH$; chaotic at large amplitude. \textbf{Time stepping} Gauss--Legendre 4 (2-stage implicit Runge--Kutta, symplectic; Newton with the analytic Jacobian), symmetric so $\varphi^{-1}$ = one step with $-\delta t$.
+
+\textbf{Observation} the tip position $(x,y)=(\ell_1\sin q_1+\ell_2\sin q_2,\ -\ell_1\cos q_1-\ell_2\cos q_2)$, a vector observation of the two angles. The angles are periodic on $(-\pi,\pi]$: the filter uses periodic boundary conditions in $q_1,q_2$.
+
+\textbf{References:} \href{https://en.wikipedia.org/wiki/Double_pendulum}{Double pendulum (Wikipedia)}, \href{https://en.wikipedia.org/wiki/Gauss\%E2\%80\%93Legendre_method}{Gauss--Legendre methods (Wikipedia)}.
+
+\modelsection{pendulum_rod}{Double pendulum, rigid rods}
+Two identical uniform rods of mass $m$ and length $\ell$, pinned end to end below a fixed pivot; gravity $g$ downward (the \emph{swaptube} model). Moment of inertia $I=m\ell^2/3$ about a rod's centre. \textbf{State} $x=(q_1,q_2,p_1,p_2)$, angles with the downward vertical and conjugate momenta, $\Delta=q_1-q_2$:
+\[
+  H(x)=\frac{6\,(p_1^2+4p_2^2-3p_1p_2\cos\Delta)}{m\ell^2\,(16-9\cos^2\Delta)}+\tfrac12 mg\ell\,\big(3(1-\cos q_1)+(1-\cos q_2)\big),
+\]
+\begin{gather*}
+  \dot q_1=\frac{6}{m\ell^2}\,\frac{2p_1-3p_2\cos\Delta}{16-9\cos^2\Delta}, \qquad
+  \dot q_2=\frac{6}{m\ell^2}\,\frac{8p_2-3p_1\cos\Delta}{16-9\cos^2\Delta}, \\
+  \dot p_1=-\tfrac12 m\ell^2\big(\dot q_1\dot q_2\sin\Delta+3\tfrac g\ell\sin q_1\big), \qquad
+  \dot p_2=-\tfrac12 m\ell^2\big(-\dot q_1\dot q_2\sin\Delta+\tfrac g\ell\sin q_2\big).
+\end{gather*}
+\textbf{Time stepping} Gauss--Legendre 4, symplectic and symmetric ($\varphi^{-1}$ = one step with $-\delta t$). Released from rest at $(q_1,q_2)=(2.453,\,-2.7727)$ the tip traces the heart-shaped orbit. \textbf{Observation} the tip position; angles periodic on $(-\pi,\pi]$.
+
+\textbf{References:} \href{https://en.wikipedia.org/wiki/Double_pendulum}{Double pendulum (Wikipedia)}, \href{https://github.com/2swap/swaptube}{swaptube (GitHub)}.
+
+\modelsection{kepler}{Kepler problem, softened}
+A body of unit mass in the field of a fixed centre at the origin, in the orbital plane. \textbf{State} $x=(q_1,q_2,p_1,p_2)$, Cartesian position and momentum, with the Plummer-softened potential
+\[
+  H(x)=\tfrac12|p|^2-\frac{\mu}{\sqrt{|q|^2+a^2}}, \qquad \dot q=p, \qquad \dot p=-\frac{\mu\,q}{(|q|^2+a^2)^{3/2}} .
+\]
+$a=0$ is Newtonian gravity (closed ellipses); $a>0$ (default $0.1$) bounds the force by $\mu/a^2$, so the flow and its Newton solve are defined at every point of the filter's box, which contains the origin; at $|q|\approx1$ the change is $O(a^2)$. Units: $\mu=1$ gives the circular orbit of radius 1, speed 1, period $2\pi$; the orbit of semi-major axis 1 and eccentricity $e$ starts at perihelion $q=(1-e,0)$, $p=(0,\sqrt{(1+e)/(1-e)})$.
+
+\textbf{Conserved} energy $H$ and angular momentum $L=q_1p_2-q_2p_1$ (a quadratic invariant, conserved exactly by Gauss--Legendre 4; $H$ up to the bounded $O(\delta t^4)$ oscillation of a symplectic scheme). \textbf{Observations} (one selected): the coordinate $q_1$; the range $|q|$ (the polar angle unobserved: ring-shaped densities in the $(q_1,q_2)$ plane); the bearing $\operatorname{atan2}(q_2,q_1)$, whose discrepancy is the shortest angular difference.
+
+\textbf{References:} \href{https://en.wikipedia.org/wiki/Kepler_problem}{Kepler problem (Wikipedia)}, \href{https://en.wikipedia.org/wiki/Plummer_model}{Plummer model (Wikipedia)}.
+
+\modelsection{kepler_mu}{Kepler problem with an unknown gravitational parameter}
+The softened Kepler dynamics with the gravitational parameter as an extra state:
+\[
+  \mu(\theta)=\mu_0\,2^{\theta}, \qquad \dot\theta=0, \qquad
+  \dot q=p, \qquad \dot p=-\frac{\mu(\theta)\,q}{(|q|^2+a^2)^{3/2}} .
+\]
+\textbf{State} $x=(q_1,q_2,p_1,p_2,\theta)\in\mathbb R^5$; $\theta$ counts doublings of $\mu_0$ ($\theta=\pm1\Leftrightarrow\mu=2\mu_0,\ \mu_0/2$), $\mu>0$ for every real $\theta$, and a Gaussian prior in $\theta$ is log-normal in $\mu$. \textbf{Time stepping} Gauss--Legendre 4; $\theta$ is exactly conserved (its stage equation decouples), $L$ too, $H$ up to $O(\delta t^4)$.
+
+\textbf{Identifiability} $\mu$ sets the period (Kepler's third law) and is identifiable from position observations; the satellite's mass would not be, since it cancels from $\ddot q$. \textbf{Observations} $q_1$, range or bearing, all functions of $q$ only. \textbf{In the filter} $q_\theta=0$: each $\theta$-slice runs its own Kepler flow and the observation discriminates the slices; the twin experiment sets $\theta_{\text{true}}=0.4$, the regime where the $q_1$-likelihood is phase-aliased and the Gaussian tracker falls into a secondary basin — the grid's job.
+
+\textbf{References:} \href{https://en.wikipedia.org/wiki/Kepler_problem}{Kepler problem (Wikipedia)}, \href{https://en.wikipedia.org/wiki/Kepler\%27s_laws_of_planetary_motion}{Kepler's third law (Wikipedia)}, \href{https://en.wikipedia.org/wiki/Plummer_model}{Plummer model (Wikipedia)}.
+
+\modelsection{lorenz}{Lorenz-63}
+The three-mode truncation of Rayleigh--B\'enard convection (Lorenz 1963),
+\[
+  \dot x=\sigma\,(y-x), \qquad \dot y=x\,(\rho-z)-y, \qquad \dot z=xy-\beta z ,
+\]
+\textbf{state} $(x,y,z)\in\mathbb R^3$, parameters $\sigma,\rho,\beta$ (defaults $10$, $28$, $8/3$: the strange attractor). Dissipative: $\nabla\!\cdot\!f=-(\sigma+1+\beta)$, phase-space volume contracts at that constant rate — no Hamiltonian structure, and without model noise the filter density would collapse onto the attractor: the model-noise $q_d$ is what keeps it spread. Fixed points: the origin and, for $\rho>1$, $C_\pm=(\pm\sqrt{\beta(\rho-1)},\ \pm\sqrt{\beta(\rho-1)},\ \rho-1)$, the centres of the two wings.
+
+\textbf{Time stepping} Gauss--Legendre 4 (A-stable, symmetric: $\varphi^{-1}$ = one step with $-\delta t$). The inverse flow of a dissipative system is expanding: leave a generous margin around the attractor in the filter's box. \textbf{Observation} one coordinate, $x$, $y$ or $z$.
+
+\textbf{References:} \href{https://en.wikipedia.org/wiki/Lorenz_system}{Lorenz system (Wikipedia)}, \href{https://doi.org/10.1175/1520-0469(1963)020\%3C0130:DNF\%3E2.0.CO;2}{Lorenz 1963 (JAS, doi)}.
+
+\modelsection{lamppost}{Lamppost}
+A man stands in the plane at $(x,y)$ next to a lamppost at the origin and does not move,
+\[
+  \frac{\mathrm d}{\mathrm dt}(x,y)=0, \qquad h(x,y)=x^2+y^2 ,
+\]
+all that is observed being his squared distance to the lamppost. With the reference at $(0,1)$ the observation is $y_{\text{obs}}\equiv1$ and every point of the unit circle explains the data: the value function is flat on the ring $x^2+y^2=1$ and the density is a \emph{ring}, a continuum of maxima. The grid filter shows it; the tracker, one Gaussian, converges to some point of the ring chosen by the prior — the smallest illustration of what the Gaussian closure loses.
+
+The drunkness is the filter's model noise $q$: the diffusion keeps the ring from collapsing to a curve ($q\equiv0$ sharpens it forever). Optionally the reference itself random-walks (a standard deviation per step), so the ring follows a moving radius. \textbf{Flow} the identity, exactly: no time stepping, $\Phi=I$.
+
+\textbf{References:} \href{https://en.wikipedia.org/wiki/Random_walk}{Random walk (Wikipedia)} (the optional walk of the reference; the model itself is the identity).
+
+\modelsection{cavity}{Cardiac cavity (spherical ventricle)}
+The 0D cardiac cavity of the PhysioBlocks library \cite[Appendix~C]{physioblocks}, itself the spherical reduction \cite{caruel2014} of the Inria heart model \cite{chapelle2012}, in the variant of \cite{manganotti2021}. Continuous level only; not implemented in the crate yet.
+
+\textbf{Kinematics.} The wall is a sphere of mid-surface radius $R_0$ and thickness $d_0$ at rest; one scalar $y$ is the change of radius, $R=R_0+y$. With
+\[
+  C(y)=\Big(1+\frac{y}{R_0}\Big)^2, \qquad
+  V(y)=\frac43\pi\Big(R_0+y-\frac{d_0}{2}\,C(y)^{-1}\Big)^3, \qquad
+  |\Omega_0|=4\pi R_0^2d_0 ,
+\]
+$C$ the fibre component of the right Cauchy--Green tensor, $V$ the cavity volume, $|\Omega_0|$ the tissue volume at rest.
+
+\textbf{Constitutive functions.} Passive elastic energy per unit volume, viscous stress, and the fraction of active tension reachable at a given sarcomere extension $e_c$:
+\[
+  W_e(y)=C_0\exp\!\Big[C_1\big(2C(y)+C(y)^{-2}-3\big)^2\Big]+C_2\exp\!\Big[C_3\big(C(y)-1\big)^2\Big], \qquad
+  \Sigma_v(y,\dot y)=2\eta\,\big(C(y)+2C(y)^{-5}\big)\frac{\dot y}{R_0},
+\]
+and $n_0:\mathbb R\to[0,1]$, a given piecewise-linear function (Fig.~9 of \cite{physioblocks}).
+
+\textbf{State.} $x=(y,\,v,\,e_c,\,K_c,\,T_c)\in\mathbb R^5$: the radius change $y$ and its velocity $v=\dot y$, the sarcomere extension $e_c$ (relative sliding of the myosin over the actin filaments, per half-sarcomere length), the active stiffness $K_c$ and the active tension $T_c$.
+
+\textbf{Inputs.} The cavity pressure $P_V(t)$ (the coupling to the circulation, through the flux $Q=-\dot V(y)$ the cavity delivers) and the electrical activation $u(t)$ (positive during depolarisation, negative during repolarisation; a given periodic function, Fig.~8 of \cite{physioblocks}). Both are prescribed functions of time here.
+
+\textbf{First-order system.}
+\begin{align*}
+  \dot y &= v, \\
+  \rho_0\,\dot v &= -W_e'(y) \;-\; \frac1{R_0}\,\Sigma_v(y,v) \;-\; \frac{k_s}{R_0}\Big(\frac{y}{R_0}-e_c\Big) \;+\; \frac{P_V}{|\Omega_0|}\,V'(y), \\
+  \mu\,\dot e_c &= k_s\Big(\frac{y}{R_0}-e_c\Big) \;-\; T_c, \\
+  \dot K_c &= -\big(|u|+\alpha|\dot e_c|\big)\,K_c + n_0(e_c)\,K_0\,|u|_+, \\
+  \dot T_c &= -\big(|u|+\alpha|\dot e_c|\big)\,T_c + K_c\,\dot e_c + n_0(e_c)\,T_0\,|u|_+ ,
+\end{align*}
+$\rho_0$ the tissue density, $k_s$ the passive elastic modulus of the sarcomeres (the series elastic element between the tissue strain $y/R_0$ and the sarcomere sliding $e_c$), $\mu$ the sarcomere viscosity, $\alpha$ the destruction rate per unit extension rate, $K_0$ and $T_0$ the maximal active stiffness and tension. The second equation is the momentum balance of the wall (passive elasticity, viscosity, sarcomere force, blood pressure); the third is the force balance in the sarcomere; the last two are the two-moment reduction of the Huxley'57 crossbridge model \cite{chapelle2012}, linear in $(K_c,T_c)$ given $(e_c,\dot e_c,u)$: sustained $u>0$ drives $(K_c,T_c)$ towards $n_0(e_c)\,(K_0,T_0)$, sustained $u<0$ towards $(0,0)$. (\cite{physioblocks} uses $\lambda_c=T_c/\sqrt{K_c}$ in place of $T_c$ for its discretisation.)
+
+\textbf{Observation} not defined yet.
+
+\begin{thebibliography}{9}
+\bibitem{physioblocks} D.~Chapelle, C.~Drieu, F.~Kimmig. \emph{PhysioBlocks: A Python Library for Graph-Based Nodal Simulation of Dynamical Physiological Systems.} Preprint, 2026. \href{https://hal.science/hal-05436182v2}{hal-05436182v2}.
+\bibitem{caruel2014} M.~Caruel, R.~Chabiniok, P.~Moireau, Y.~Lecarpentier, D.~Chapelle. Dimensional reductions of a cardiac model for effective validation and calibration. \emph{Biomechanics and Modeling in Mechanobiology} 13(4):897--914, 2014.
+\bibitem{chapelle2012} D.~Chapelle, P.~Le Tallec, P.~Moireau, M.~Sorine. Energy-preserving muscle tissue model: formulation and compatible discretizations. \emph{International Journal for Multiscale Computational Engineering} 10(2), 2012.
+\bibitem{manganotti2021} J.~Manganotti, F.~Caforio, F.~Kimmig, P.~Moireau, S.~Imperiale. Coupling reduced-order blood flow and cardiac models through energy-consistent strategies: modeling and discretization. \emph{Advanced Modeling and Simulation in Engineering Sciences} 8(1), 2021.
+\end{thebibliography}
+
+\end{document}

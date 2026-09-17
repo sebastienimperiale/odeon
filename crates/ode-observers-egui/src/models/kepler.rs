@@ -119,42 +119,8 @@ impl VizModel for KeplerViz {
         "Kepler orbit (softened)"
     }
 
-    fn description(&self) -> String {
-        "Planar Kepler problem: a body of unit mass orbiting a fixed center at the origin \
-         in the softened gravitational potential −μ/√(|q|² + a²). With a = 0 this is \
-         exactly Newtonian gravity (closed ellipses); the softening a bounds the force at \
-         the center so that the flow is well defined everywhere in the filter's state box \
-         (which contains the origin) — it makes the orbit precess slightly. Conservative: \
-         energy and angular momentum are conserved.\n\n\
-         Parameters: μ = GM — gravitational parameter (at μ = 1 the circular orbit of \
-         radius 1 has speed 1 and period 2π); a — softening length.\n\n\
-         State (filter order): q₁, q₂ — Cartesian position; p₁, p₂ — momentum = velocity \
-         (unit mass). The default is the perihelion of the e = 0.5 ellipse of semi-major \
-         axis 1: q = (0.5, 0), p = (0, √3).\n\n\
-         Scene: fixed window [−2, 2]², the center (its softening disc in grey), the orbit \
-         trace, the body with a unit arrow in the direction of its momentum, and the \
-         observed quantity in the accent: the projection onto the q₁ axis, the range circle, \
-         or the bearing ray.\n\n\
-         Observation (one of): q₁ — the line-of-sight coordinate (linear); |q| — the range \
-         (the angle is unobserved: expect ring-shaped densities in the (q₁, q₂) plane); \
-         atan2(q₂, q₁) — the bearing (the range is unobserved; differences are taken mod 2π).\n\n\
-         Unknown μ (option of the estimator viewer): the same orbit with the gravitational \
-         parameter unknown, written μ = μ₀·2^θ with μ₀ the μ above (the estimators' prior) \
-         and θ an extra state variable obeying dθ/dt = 0 (μ > 0 for every real θ; a Gaussian \
-         prior in θ is a log-normal prior in μ; θ reads in doublings of μ₀). The reference \
-         runs at θ_true and the estimators, started at θ = 0, must recover it — μ is \
-         identifiable from position observations, since it sets the orbital period (Kepler's \
-         third law); the satellite's own mass would not be. The run then uses the augmented \
-         state (q₁, q₂, p₁, p₂, θ) on a 5D grid whose θ direction is cheap by default (fixed \
-         domain (−1, 1), few DOFs, q_θ = 0 so nothing diffuses in θ): each θ-slice runs its \
-         own Kepler flow and the observation step discriminates the slices; watch the \
-         (q₁, θ) plane sharpen around θ_true. The default θ_true = 0.4 is deliberately \
-         large: over a few periods the q₁ likelihood is phase-aliased (multimodal in θ) and \
-         the tracker — a Gaussian closure — falls into a secondary basin; the grid filter \
-         can carry the multimodal θ-density until the phase disambiguates. For a regime \
-         where the tracker succeeds, set θ_true ≈ 0.1 and stiffen the (q, p) prior. θ is \
-         not drawn in the scene; read it in the state plots and the θ marginals."
-            .to_string()
+    fn doc_dest(&self) -> Option<&'static str> {
+        Some(if self.params.unknown_mu { "kepler_mu" } else { "kepler" })
     }
 
     fn params_ui(&mut self, ui: &mut egui::Ui) -> bool {

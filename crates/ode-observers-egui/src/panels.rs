@@ -2,15 +2,17 @@
 //! selector, the configuration panels editing a
 //! [`FilterConfig`] (Initial data, Observation, Diffusion — shared by every
 //! estimator; Grid — filter only; Window — box tracker only; LParticles —
-//! particles only; Outputs — the two grid estimators), the Run-button
+//! particles only; Quadrature — unscented only; Outputs — the two grid
+//! estimators), the Run-button
 //! label, and the progress row of a running job with its Cancel button.
 //! The app owns the configuration, the runs and the button itself; this
 //! module only draws.
 
 use ode_observers::jobs::{Estimator, FilterConfig};
+use ode_observers::methods::unscented_kalman::Quadrature;
 
-/// The estimator selector (filter / box tracker / LParticles / tracker),
-/// with the one-line description of each on hover.
+/// The estimator selector (filter / box tracker / LParticles / tracker /
+/// unscented), with the one-line description of each on hover.
 pub fn estimator_selector(ui: &mut egui::Ui, estimator: &mut Estimator) {
     ui.horizontal(|ui| {
         ui.selectable_value(estimator, Estimator::Filter, "filter")
@@ -39,6 +41,15 @@ pub fn estimator_selector(ui: &mut egui::Ui, estimator: &mut Estimator) {
                  curvature S of V at it (minimum-energy / EKF form, \
                  ε-free); cannot track several maxima",
             );
+        ui.selectable_value(estimator, Estimator::Unscented, "unscented")
+            .on_hover_text(
+                "Unscented closure: the same Gaussian matched by its integrals \
+                 (centre x̄, width Σ = εP) — the averages of the exact flow and \
+                 observation computed by a quadrature rule at a few points, no \
+                 Jacobian; equals the tracker on a linear model, keeps the \
+                 second-order term of the flow across the bump otherwise; \
+                 depends on ε (the points spread with √ε); needs σ > 0",
+            );
     });
 }
 
@@ -56,6 +67,7 @@ pub fn config_ui(
     let is_window = estimator == Estimator::Window;
     let is_particles = estimator == Estimator::Particles;
     let is_tracker = estimator == Estimator::Tracker;
+    let is_unscented = estimator == Estimator::Unscented;
     let mut domains_ok = true;
     egui::CollapsingHeader::new("Initial data")
         .id_salt("filter_init")
@@ -324,6 +336,22 @@ pub fn config_ui(
                                 });
     } // Particles only
 
+    if is_unscented {
+        egui::CollapsingHeader::new("Quadrature")
+            .id_salt("unscented_panel")
+            .default_open(true)
+            .show(ui, |ui| {
+                quadrature_ui(ui, &mut cfg.unscented.rule, cfg.vars.len());
+                if cfg.vars.iter().any(|v| v.sigma <= 0.0) {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "σ = 0 in some direction: the Gaussian has no width there — \
+                         set σ > 0 in Initial data.",
+                    );
+                }
+            });
+    } // Quadrature (unscented only)
+
     if is_filter || is_window {
         egui::CollapsingHeader::new("Outputs")
             .id_salt("filter_outputs")
@@ -376,11 +404,69 @@ pub fn config_ui(
     domains_ok
 }
 
+/// The quadrature-rule selector of the unscented closure: the rule, its
+/// parameter (the symmetric rule's spread, the Gauss–Hermite points per
+/// direction) and the resulting number of evaluations per set in `dim`
+/// dimensions.
+pub fn quadrature_ui(ui: &mut egui::Ui, rule: &mut Quadrature, dim: usize) {
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("quadrature_rule")
+            .selected_text(rule.name())
+            .show_ui(ui, |ui| {
+                let symmetric = matches!(rule, Quadrature::Symmetric { .. });
+                if ui.selectable_label(symmetric, "symmetric").on_hover_text(
+                    "The centre and the 2n points x̄ ± h s_i (s_i the columns of a square root \
+                     of Σ), weights 1 − n/h² and 1/(2h²): exact to degree three for every h; \
+                     h = √3 matches the fourth moment along each axis (Julier–Uhlmann's \
+                     unscented transform is h² = n + κ)",
+                ).clicked() && !symmetric {
+                    *rule = Quadrature::DEFAULT;
+                }
+                ui.selectable_value(rule, Quadrature::Cubature, "cubature").on_hover_text(
+                    "Spherical–radial cubature: the 2n points x̄ ± √n s_i with equal weights, \
+                     no centre, no parameter, all weights positive; degree three \
+                     (Arasaratnam–Haykin)",
+                );
+                ui.selectable_value(rule, Quadrature::DegreeFive, "degree five").on_hover_text(
+                    "Fully symmetric degree-five rule (McNamee–Stenger): the centre, the 2n \
+                     axis points and the 2n(n−1) pair points at spread √3; 2n² + 1 evaluations",
+                );
+                let hermite = matches!(rule, Quadrature::GaussHermite { .. });
+                if ui.selectable_label(hermite, "Gauss–Hermite").on_hover_text(
+                    "Tensor product of the one-dimensional Gauss–Hermite rule with m points per \
+                     direction: mⁿ evaluations, exact to degree 2m − 1 (Ito–Xiong)",
+                ).clicked() && !hermite {
+                    *rule = Quadrature::GaussHermite { points: 3 };
+                }
+            });
+        match rule {
+            Quadrature::Symmetric { spread } => {
+                ui.add(egui::DragValue::new(spread).speed(0.02).range(0.1..=10.0).max_decimals(3));
+                ui.label("h").on_hover_text("Spread of the points in units of the width; √3 ≈ 1.732 by default");
+                if ui.small_button("√3").clicked() {
+                    *rule = Quadrature::DEFAULT;
+                }
+            }
+            Quadrature::GaussHermite { points } => {
+                ui.add(egui::DragValue::new(points).range(1..=9));
+                ui.label("points per direction");
+            }
+            _ => {}
+        }
+    });
+    let count = rule.count(dim);
+    ui.small(format!("{count} evaluations of the flow and of h per step"));
+    if count > 20_000 {
+        ui.colored_label(ui.visuals().warn_fg_color, "many points: this run will be slow");
+    }
+}
+
 /// Whether the estimator can start from the configuration's prior: the
-/// translating window needs σ > 0 in every direction (a flat p₀ has no
-/// mode to follow); the others accept any prior.
+/// translating window and the unscented closure need σ > 0 in every
+/// direction (a flat p₀ has no mode to follow, no width to spread points
+/// over); the others accept any prior.
 pub fn prior_ok(cfg: &FilterConfig, estimator: Estimator) -> bool {
-    estimator != Estimator::Window || cfg.vars.iter().all(|v| v.sigma > 0.0)
+    !matches!(estimator, Estimator::Window | Estimator::Unscented) || cfg.vars.iter().all(|v| v.sigma > 0.0)
 }
 
 /// Label of the Run button.
@@ -390,6 +476,7 @@ pub fn run_label(estimator: Estimator) -> &'static str {
         Estimator::Window => "▶  Run box tracker",
         Estimator::Particles => "▶  Run LParticles",
         Estimator::Tracker => "▶  Run tracker",
+        Estimator::Unscented => "▶  Run unscented",
     }
 }
 
@@ -400,6 +487,7 @@ pub fn running_text(estimator: Estimator) -> &'static str {
         Estimator::Window => "box tracking…",
         Estimator::Particles => "LParticles…",
         Estimator::Tracker => "tracking…",
+        Estimator::Unscented => "unscented…",
     }
 }
 

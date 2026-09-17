@@ -22,11 +22,15 @@ use ode_models_spec::spec::{ModelSpec, TwinSpec};
 pub trait VizModel {
     fn name(&self) -> &'static str;
 
-    /// Plain-text description shown in the collapsible "About this model"
-    /// panel above the scene: the physics, the meaning of the parameters
-    /// and state variables, what the scene draws, and what the observation
-    /// choices are. Paragraphs separated by blank lines.
-    fn description(&self) -> String;
+    /// Named destination of the model's section in the models note
+    /// (`crates/ode-models/docs/models.tex`, `\modelsection{<name>}{…}`),
+    /// which the "About this model…" button opens in the browser as the
+    /// local `models.pdf` at that section's page. A model with an
+    /// estimator option augmenting its state points at the section of the
+    /// augmented model while the option is on. `None` = no section.
+    fn doc_dest(&self) -> Option<&'static str> {
+        None
+    }
 
     /// The model-specific parameter form (physical parameters, initial
     /// condition, defaults buttons). Returns `true` when any value was

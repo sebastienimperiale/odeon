@@ -24,7 +24,7 @@
 //! | `ODEON_MAX_RUNS`      | 2         | runs in progress at once; further jobs get 429 |
 //! | `ODEON_MAX_STEPS`     | 200000    | steps of one run |
 //! | `ODEON_MAX_DOFS`      | 2000000   | grid points of a filter or window run |
-//! | `ODEON_MAX_PARTICLES` | 200000    | particles of a particle run |
+//! | `ODEON_MAX_PARTICLES` | 200000    | particles of a particle run, or quadrature points of an unscented run |
 //! | `ODEON_MAX_OUTPUT`    | 50000000  | floats stored by one run's output (snapshots, particle positions, covariances) |
 //! | `ODEON_RUN_TTL`       | 600       | seconds; a run nobody asked about for that long is cancelled and forgotten |
 //!
@@ -271,7 +271,7 @@ fn output_floats(config: &FilterConfig, estimator: Estimator, steps: usize, dim:
             estimates + config.n_snapshots.min(records) * plane
         }
         Estimator::Particles => records * config.particles.n_particles.saturating_mul(dim + 2),
-        Estimator::Tracker => records * (dim + dim * dim),
+        Estimator::Tracker | Estimator::Unscented => records * (dim + dim * dim),
     }
 }
 
@@ -291,6 +291,13 @@ fn admit(runs: &Runs, estimator: Estimator, config: &FilterConfig, steps: usize,
     }
     if estimator == Estimator::Particles && config.particles.n_particles > s.max_particles {
         return refuse(format!("{} particles, the server accepts at most {}", config.particles.n_particles, s.max_particles));
+    }
+    // The quadrature points of the unscented closure are evaluations of the
+    // flow per step, bounded like the particles (a Gauss–Hermite product
+    // rule is exponential in the dimension).
+    let points = config.unscented.rule.count(dim);
+    if estimator == Estimator::Unscented && points > s.max_particles {
+        return refuse(format!("{points} quadrature points, the server accepts at most {}", s.max_particles));
     }
     let floats = output_floats(config, estimator, steps, dim);
     if floats > s.max_output {

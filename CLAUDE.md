@@ -16,11 +16,13 @@ description of the algorithms; their file paths are mapped at their top.
 Odeon/
   Cargo.toml                  workspace (resolver 3), shared version/edition, release profile with symbols
   crates/ode-models/          forward models: Model trait, models/*, gl4 stepper — physics
-                              only, nalgebra its sole dependency (serde optional)          [DONE]
+                              only, nalgebra its sole dependency (serde optional);
+                              docs/models.tex, the models note the viewer's "About this
+                              model…" button opens (build it there with latexmk)         [DONE]
   crates/ode-models-spec/     the driving layer: ModelSpec + visitor, TwinSpec, Reference +
                               twin generator, noise models, Progress                        [DONE]
-  crates/ode-observers/       methods/ (mortensen, mortensen_window, kalman, fleming_viot),
-                              output, jobs (dimension-erased runners + outputs)             [DONE]
+  crates/ode-observers/       methods/ (mortensen, mortensen_window, kalman, unscented_kalman,
+                              fleming_viot), output, jobs (dimension-erased runners + outputs) [DONE]
   crates/ode-observers-egui/  VizModel trait, scenes, parameter forms, palette, playback,
                               model_panels; the four views (filter, box, particles,
                               tracker), estimator panels, and app::App<C: Compute> — the
@@ -35,6 +37,11 @@ Odeon/
                               odeon-observers-server, bin observers-server); serves the
                               built web page at / (apps/observers-client/dist by default)  [DONE]
   docs/                       LaTeX design notes (hybrid_closure.tex, density_filter.tex, figures/)
+                              — copied from the old repository only on 2026-09-16 (they had
+                              been left behind by step 1; the user looked for the tensor-train
+                              work, which is density_filter.tex §5 "A trace ansatz in the
+                              window", and §7 "A population of Gaussians" is newer than the
+                              summary below); PDFs and LaTeX build files git-ignored
   scripts/                    Python plotting scripts for the CLI examples
 ```
 
@@ -490,6 +497,122 @@ pure-algorithms crate.
    The remaining lever is the number of snapshots (the Outputs slider);
    the default of one per step is the old viewer's.
 
+9. **The unscented closure** — added 2026-09-17 on request (a new
+   method, not a change to an existing one; the golden rule below holds).
+   `crates/ode-observers/src/methods/unscented_kalman.rs` implements
+   §3 of `docs/density_filter.tex`: `UnscentedTracker<M, Mod>` with the
+   state (x̄, Σ) — the centre and width of the density, Σ = εP — and
+   `UnscentedParams { q_diag, gamma, eps, rule }`; the cycle mirrors the
+   tracker's: observation (points from (x̄, Σ), η_j = h(χ_j) with the
+   differences taken by the model's `innovation` relative to h(x̄), the
+   pair's integrals ȳ, Σ_yy, Σ_xy by the rule, K = Σ_xy(Σ_yy + εR)⁻¹ with
+   R = I/(γ dt), x̄ += K(y ⊖ ȳ), **Σ −= K(Σ_yy + εR)Kᵀ** — the note's
+   §3.4 prints Σ − KΣ_yyKᵀ, which is not the Gaussian product and would
+   not reproduce the Kalman filter; the code uses the conditioning formula
+   and the tests pin it to the tracker), transport (x̄ = Σ w_j φ(χ_j),
+   Σ = Σ w_j (φ(χ_j) − x̄)(…)ᵀ), diffusion (Σ += ε dt Q). `Quadrature`
+   (serde): `Symmetric { spread }` (2n + 1 points, w₀ = 1 − n/h², default
+   h = √3 = `Quadrature::DEFAULT`), `Cubature` (2n points at √n, equal
+   weights), `DegreeFive` (2n² + 1 points at spread √3, weights
+   (n² − 7n + 18)/18, (4 − n)/18, 1/36 from the moment conditions — the
+   spread is not free), `GaussHermite { points }` (mⁿ points, the 1D rule
+   by Golub–Welsch on the Jacobi matrix, `gauss_hermite(m)`); the square
+   root of Σ is nalgebra's Cholesky, with the symmetric root V√Λ⁺ as the
+   fallback when a rule with negative weights leaves Σ indefinite
+   (`square_root`). `init(center, σ)` needs σ > 0 everywhere (Σ₀ =
+   diag(ε/σ)); `estimate()` = x̄, `covariance()` = Σ/ε (the tracker's P,
+   so the Tracker view's band ±2√(εP) = ±2√Σ is unchanged), `width()` =
+   Σ; implements `Observer<M>`. Tests: the 1D Gauss–Hermite rule (nodes
+   0, ±√3, weights 2/3, 1/6; moments to degree 2m − 1 for m ≤ 8), every
+   rule's degree-two moments on a full 3×3 Σ and the fourth moments of the
+   degree-five rules, **equality with the tracker on the spring for every
+   rule to 1e-9** (x̄ vs x̂, Σ/ε vs P), γ = 0 = the flow, the transport of
+   a quadratic map φ = (x₁ + a x₂², x₂) against the exact Gaussian
+   integrals (degree-five rules on a full Σ, the symmetric rule on a
+   diagonal one; the cubature's Σ₁₁ short by a²Σ₂₂², the tracker's centre
+   short by aΣ₂₂), and the Lorenz lock-on — **at ε = 0.01**: the closure
+   is not ε-free, and at ε = 1 on Lorenz (P ≈ 50 in the unobserved
+   directions) the cloud straddles the attractor and the late error is
+   6.2 for every rule, falling to 0.19 at ε = 0.01 and 0.05 at ε = 0.003
+   (tracker: 0.08) — the note's remark "it is not ε-free", measured.
+   The generic `every_observer_converges_on_the_spring` drives five
+   observers. Job layer: `Estimator::Unscented`, `FilterConfig::unscented:
+   UnscentedConfig { rule }` (`#[serde(default)]`, so older descriptions
+   load), `run_unscented` → a `TrackerOutput` (eps = the
+   configuration's, covariances = Σ/ε), `JobOutput::Unscented(TrackerOutput)`
+   (`TryFrom<JobOutput> for TrackerOutput` accepts both variants),
+   `run_unscented_spec`; test `spring_unscented_job_equals_the_tracker_job`
+   (every rule, plus the JSON round trip of the rule). Server: output
+   size as the tracker's, binary tag 4, the rule's point count bounded by
+   `ODEON_MAX_PARTICLES`. Viewer: "unscented" in the estimator selector;
+   a **Quadrature** panel (rule combo, the symmetric spread with a √3
+   button, the Gauss–Hermite points per direction, the evaluation count
+   with a warning above 20k); ε enabled (it matters), scheme disabled,
+   σ > 0 required (`prior_ok`); an **Unscented** tab reusing the tracker
+   view (`tracker_view::ui_as(ui, out, t, "unscented x̄", 1)` — second
+   series colour, plots keyed by name), and a blue "unscented x̄" overlay
+   beside the red tracker one in the three density views through
+   `filter_view::Overlays { tracker, unscented }` (checkboxes, paths and
+   drawing shared by the views). 125 tests, no warnings. **Unscented
+   density and σ-contours** (same day, on request): the Filter-density
+   view gained an "unscented density" pane (the closure's Gaussian
+   max-marginalized on its own plane, the same `tracker_image` as the
+   tracker pane, keyed cache `unscented_cache`; the two Gaussian panes
+   share `gaussian_pane` over an enum `Gaussian { Tracker, Unscented }`)
+   and, for the comparison on one plot, the "tracker σ" / "unscented σ"
+   toggles drawing the 1σ (dashed) and 2σ ellipses of either Gaussian —
+   `gaussian_contours`: x̄ + k·L(cos θ, sin θ) with LLᵀ = εP_ab the plane's
+   block, the centre taken to its image inside a periodic domain — on
+   every pane (filter, tracker density, unscented density), red and blue
+   like the estimate overlays. Test
+   `gaussian_contours_are_the_sigma_level_sets`. 126 tests.
+   **The models note replaces the "About this model" texts** (same day,
+   copied from the `mortensen` repository's change of the day, on
+   request; the PDF belongs to the models crate):
+   `crates/ode-models/docs/models.tex` (build with `latexmk -pdf
+   models.tex` there; PDF and LaTeX build files git-ignored) — an article
+   with a section on the `Model` contract (rewritten for the stateless
+   models: the reference and its observations come from
+   `ode-models-spec`), a table of contents and one
+   `\modelsection{<name>}{Title}` per model (spring, spring_mass,
+   pendulum, pendulum_rod, kepler, kepler_mu, lorenz, lamppost — the old
+   `random_walk` section renamed), each `\clearpage\hypertarget{<name>}`
+   + `\label{model:<name>}` with dynamics, Hamiltonian, integrator, state,
+   observations, role in the library and a References line of web
+   links. `VizModel::description()` is gone; `VizModel::doc_dest() ->
+   Option<&'static str>` names the section (the spring and Kepler entries
+   point at `spring_mass` / `kepler_mu` while their unknown-parameter
+   option is on). The scene's collapsible text became an **"About this
+   model…" button** (`model_panels::scene_ui`, outcome shown beside it
+   from egui temp memory): `model_panels::open_models_pdf(dest)` opens
+   the browser on `file://<checkout>/crates/ode-models/docs/models.pdf#page=<n>`
+   — the path baked at compile time from the egui crate's
+   `CARGO_MANIFEST_DIR`, by decision (local to the checkout); the page
+   read at click time from `models.aux` (`models_page`, falling back to
+   `#nameddest=<dest>`); the browser from `ODEON_BROWSER` or, on macOS,
+   the first installed of Firefox, Chrome, Chromium, Edge, Brave, Safari,
+   launched as its executable so the fragment survives (Launch Services
+   drops it; Safari's viewer ignores the page anyway); `xdg-open` on
+   Linux, `start` on Windows. On the web page the button opens
+   `models.pdf#nameddest=<dest>` next to the page in a new tab (publish
+   the PDF beside `index.html` to enable it). Tests
+   `page_of_a_model_is_read_from_the_aux_file` and
+   `every_entry_has_a_section_in_the_models_note` (every viewer entry's
+   destination, and the two augmented ones, exist in the tex). 128
+   tests. **A ninth section, `cavity`** (same day, on request): the 0D
+   cardiac cavity of Chapelle–Drieu–Kimmig, *PhysioBlocks* (HAL
+   hal-05436182v2, Appendix C), written at the continuous level only —
+   state (y, v = ẏ, e_c, K_c, T_c), the five first-order equations
+   (momentum balance of the wall with passive elasticity, viscosity,
+   sarcomere force and blood pressure; the sarcomere force balance; the
+   two-moment Huxley law for (K_c, T_c)), the inputs P_V(t) and u(t)
+   (no Hamiltonian, no energy balance, no parameter table — a first
+   version had them, removed by request), and a numbered
+   bibliography of four entries (`thebibliography`, this section only:
+   PhysioBlocks, Caruel 2014, Chapelle–Le Tallec–Moireau–Sorine 2012,
+   Manganotti 2021); no time stepping, no observation, no viewer entry
+   yet (`doc_dest` has no model to point from).
+
 **Golden rule (2026-09-16): nothing touches the algorithms of `ode-observers`
 (nor the models' physics) without the user's explicit consent.** Plumbing —
 derives, formats, jobs, server, UI — is fine; numerics never.
@@ -561,6 +684,18 @@ cannot get a browser-trusted certificate, hence the OVH hostname (a bought
 domain would replace it by editing the Caddyfile only). After a page
 rebuild, hard-refresh the browser (Shift + reload) to drop the old wasm.
 
+**Domain `team-ananke.fr`** (bought at OVH 2026-09-17; target URL
+`https://team-ananke.fr/odeon/?token=ananke`, the root of the domain kept
+free for other things). The web client's default server URL is the page's
+own *directory* (`page_directory(origin, pathname)` in the client's
+`main.rs`, test `the_default_server_is_the_directory_of_the_page`: `/` →
+the origin as before, `/odeon/` → `https://host/odeon`), so the API lives
+under the same prefix and the server itself is untouched: Caddy strips the
+prefix (`redir /odeon /odeon/` + `handle_path /odeon/* { reverse_proxy
+127.0.0.1:8787 }`) and the page is built with `trunk build --public-url
+/odeon/`. DNS: A records of `team-ananke.fr` and `www` → the VPS's IPv4
+(OVH parks new domains on 213.186.33.5), no AAAA.
+
 Known first-time pitfalls met: `apt` waiting on the unattended-upgrades
 lock right after install (wait, do not kill it); `cargo install trunk`
 without `--locked` failing to compile `lightningcss`; a manual test
@@ -574,7 +709,9 @@ as `crates/ode-models/src/...` and `src/noise.rs` as
 `crates/ode-observers/src/methods/{mortensen, mortensen_window, kalman,
 fleming_viot}.rs` (module `ode_observers::methods`, the files named after
 the methods since 2026-09-15; the types keep their names —
-`MortensenFilter`, `BoxTracker`, `MortensenTracker`, `ParticleSystem`) and
+`MortensenFilter`, `BoxTracker`, `MortensenTracker`, `ParticleSystem`;
+`unscented_kalman.rs` / `UnscentedTracker` joined them on 2026-09-17,
+step 9) and
 `output.rs` as `crates/ode-observers/src/output.rs`; the four share the
 **`ode_observers::methods::Observer<M>` trait** (2026-09-15, on
 request): `dt`, `init_gaussian(center, sigma)`, `forward(&y_n)`,

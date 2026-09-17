@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 pub const BINARY: &str = "application/octet-stream";
 
 /// The binary encoding of an output: one tag byte naming the estimator
-/// (0 filter, 1 window, 2 particles, 3 tracker), then the output itself in
+/// (0 filter, 1 window, 2 particles, 3 tracker, 4 unscented), then the output itself in
 /// `postcard` (serde-derived; floats as 8 little-endian bytes, exact).
 /// The tag replaces `JobOutput`'s adjacently tagged JSON form, which only
 /// self-describing formats can read.
@@ -40,6 +40,7 @@ pub fn encode_output(out: &JobOutput) -> postcard::Result<Vec<u8>> {
         JobOutput::Window(o) => postcard::to_allocvec(&(1u8, o)),
         JobOutput::Particles(o) => postcard::to_allocvec(&(2u8, o)),
         JobOutput::Tracker(o) => postcard::to_allocvec(&(3u8, o)),
+        JobOutput::Unscented(o) => postcard::to_allocvec(&(4u8, o)),
     }
 }
 
@@ -51,6 +52,7 @@ pub fn decode_output(bytes: &[u8]) -> postcard::Result<JobOutput> {
         1 => JobOutput::Window(postcard::from_bytes::<BoxOutput>(rest)?),
         2 => JobOutput::Particles(postcard::from_bytes::<ParticleOutput>(rest)?),
         3 => JobOutput::Tracker(postcard::from_bytes::<TrackerOutput>(rest)?),
+        4 => JobOutput::Unscented(postcard::from_bytes::<TrackerOutput>(rest)?),
         _ => return Err(postcard::Error::DeserializeBadEnum),
     })
 }

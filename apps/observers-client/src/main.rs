@@ -17,8 +17,10 @@
 //!
 //! Web: the URL is, in order, the `?server=https://…` query parameter of
 //! the page's address (remembered in the browser's local storage), the
-//! remembered value, or the page's own origin — so a page served by the
-//! server itself needs no configuration, and a page published elsewhere
+//! remembered value, or the page's own directory (its origin for a page
+//! at `/`; `https://host/odeon` for a page at `/odeon/`, the server
+//! sitting behind a reverse proxy that strips the prefix) — so a page
+//! served by the server itself needs no configuration, and a page published elsewhere
 //! (GitHub Pages, say) is shared as one link naming the server:
 //! `https://you.github.io/Odeon/?server=https://my-mac.example.net`.
 //! Editing the field in the estimator section updates the remembered
@@ -67,6 +69,15 @@ impl Default for RemoteCompute {
     }
 }
 
+/// The directory a page lives in, as a URL without its trailing slash:
+/// the origin plus the path up to its last `/` (`/` → the origin,
+/// `/odeon/` and `/odeon/index.html` → `<origin>/odeon`).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn page_directory(origin: &str, pathname: &str) -> String {
+    let dir = pathname.rfind('/').map_or("", |end| &pathname[..end]);
+    format!("{}{dir}", origin.trim_end_matches('/'))
+}
+
 /// Where the web page learns the server URL and token from, and remembers
 /// them.
 #[cfg(target_arch = "wasm32")]
@@ -111,11 +122,16 @@ mod web {
         remembered(key)
     }
 
-    /// `?server=…`, else the remembered URL, else the page's origin.
+    /// `?server=…`, else the remembered URL, else the page's own directory
+    /// — its origin for a page at `/`, `https://host/odeon` for a page at
+    /// `/odeon/` behind a reverse proxy stripping that prefix.
     pub fn server_url() -> String {
         setting("server", SERVER_KEY).unwrap_or_else(|| {
             web_sys::window()
-                .and_then(|w| w.location().origin().ok())
+                .and_then(|w| {
+                    let location = w.location();
+                    Some(super::page_directory(&location.origin().ok()?, &location.pathname().ok()?))
+                })
                 .unwrap_or_else(|| "http://127.0.0.1:8787".to_string())
         })
     }
@@ -236,3 +252,18 @@ fn main() {
 
 #[cfg(target_arch = "wasm32")]
 use eframe::wasm_bindgen::JsCast as _;
+
+#[cfg(test)]
+mod tests {
+    use super::page_directory;
+
+    #[test]
+    fn the_default_server_is_the_directory_of_the_page() {
+        let origin = "https://team-ananke.fr";
+        assert_eq!(page_directory(origin, "/"), origin);
+        assert_eq!(page_directory(origin, "/index.html"), origin);
+        assert_eq!(page_directory(origin, "/odeon/"), "https://team-ananke.fr/odeon");
+        assert_eq!(page_directory(origin, "/odeon/index.html"), "https://team-ananke.fr/odeon");
+        assert_eq!(page_directory(origin, ""), origin);
+    }
+}

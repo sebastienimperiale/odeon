@@ -1,7 +1,8 @@
 //! Tracker view: one time-series plot per state component — the true
-//! (reference) trajectory as a wide neutral line, the tracker estimate x̂
-//! as a thin dashed accent line on top (so both stay visible where they
-//! coincide), its 2σ band, and a faint playback cursor. The y-range of each
+//! (reference) trajectory as a wide neutral line, the estimate x̂ as a thin
+//! dashed accent line on top (so both stay visible where they coincide),
+//! its 2σ band, and a faint playback cursor. Serves the tracker and, with
+//! [`ui_as`], the unscented closure (whose output is the tracker's kind). The y-range of each
 //! plot follows the *estimate* only, ignoring the first 5 % of the steps
 //! (the prior-to-data transient), so that a wild start or a runaway
 //! reference cannot flatten the interesting part.
@@ -21,7 +22,15 @@ const SKIP_FRACTION: f64 = 0.05;
 /// unchecked on first display); clicking the entry shows it.
 const BAND_NAME: &str = "±2√(εP)";
 
+/// The tracker's plots: estimate named "tracker x̂", first series colour.
 pub fn ui(ui: &mut egui::Ui, out: &TrackerOutput, t: f64) {
+    ui_as(ui, out, t, "tracker x̂", 0);
+}
+
+/// The plots of any tracker-kind output: the estimate's legend `name` and
+/// the palette `series` of its colour (the plots are keyed by `name`, so
+/// two views can coexist).
+pub fn ui_as(ui: &mut egui::Ui, out: &TrackerOutput, t: f64, name: &str, series: usize) {
     let m = out.labels.len();
     if m == 0 {
         return;
@@ -30,7 +39,7 @@ pub fn ui(ui: &mut egui::Ui, out: &TrackerOutput, t: f64) {
     let t_final = (n.saturating_sub(1)) as f64 * out.dt;
     let dark = ui.visuals().dark_mode;
     let neutral = ui.visuals().text_color();
-    let accent = palette::series(0, dark);
+    let accent = palette::series(series, dark);
     let band = accent.gamma_multiply(0.18);
     let cursor = neutral.gamma_multiply(0.35);
     // First step used for the y-range: skip the initial transient.
@@ -82,8 +91,8 @@ pub fn ui(ui: &mut egui::Ui, out: &TrackerOutput, t: f64) {
             ]);
         }
 
-        let plot_id = egui::Id::new(("tracker_plot", d));
-        egui_plot::Plot::new(("tracker_plot", d))
+        let plot_id = egui::Id::new(("tracker_plot", name, d));
+        egui_plot::Plot::new(("tracker_plot", name, d))
             .id(plot_id)
             .height(h)
             .y_axis_label(&out.labels[d])
@@ -112,7 +121,7 @@ pub fn ui(ui: &mut egui::Ui, out: &TrackerOutput, t: f64) {
                         .width(3.0),
                 );
                 plot_ui.line(
-                    egui_plot::Line::new("tracker x̂", estimate)
+                    egui_plot::Line::new(name, estimate)
                         .color(accent)
                         .width(1.5)
                         .style(egui_plot::LineStyle::dashed_dense()),

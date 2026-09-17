@@ -2,13 +2,14 @@
 //! on a selectable plane, drawn where the window is. The window's box and
 //! mesh (dark green) and its estimate trajectory x̂ + argmax ρ (dark green)
 //! move with the mode over a white background; the reference trajectory is
-//! black; the tracker's estimate can be overlaid in red. The heatmap inside
+//! black; the tracker's estimate can be overlaid in red and the unscented
+//! closure's centre in blue. The heatmap inside
 //! the box is the max-marginal of ρ at the snapshot nearest the playback
 //! time, redisplayed through the window's spectral-element basis (same
 //! resampler as the filter view), and can be hidden to see the mesh alone.
 
-use crate::filter_view::{ColorFocus, TRACKER_RED, heatmap_image, mesh_lines};
-use ode_observers::jobs::{BoxOutput, TrackerOutput};
+use crate::filter_view::{ColorFocus, Overlays, heatmap_image, mesh_lines};
+use ode_observers::jobs::BoxOutput;
 use std::collections::HashMap;
 
 /// The window and its estimate: dark green, the same in both themes (the
@@ -23,6 +24,8 @@ const REFERENCE_BLACK: egui::Color32 = egui::Color32::BLACK;
 pub struct BoxView {
     /// Overlay the tracker's estimate in red when a tracker run exists.
     pub show_tracker: bool,
+    /// Overlay the unscented closure's centre in blue when its run exists.
+    pub show_unscented: bool,
     /// Draw the density inside the window (off: mesh and box only).
     pub show_density: bool,
     /// Draw the window's estimate trajectory x̂ + argmax ρ (dark green).
@@ -39,6 +42,7 @@ impl Default for BoxView {
     fn default() -> Self {
         BoxView {
             show_tracker: true,
+            show_unscented: true,
             show_density: true,
             show_estimate: true,
             focus: ColorFocus::default(),
@@ -62,7 +66,7 @@ impl BoxView {
     }
 
     /// Render the view at playback `step`.
-    pub fn ui(&mut self, ui: &mut egui::Ui, out: &BoxOutput, tracker: Option<&TrackerOutput>, step: usize) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, out: &BoxOutput, overlays: Overlays, step: usize) {
         let w = &out.window;
         if w.pairs.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -103,12 +107,7 @@ impl BoxView {
                 .on_hover_text("Draw the window's density ρ inside the box (off: box and mesh only)");
             ui.checkbox(&mut self.show_estimate, "window x̂")
                 .on_hover_text("Draw the window's estimate x̂ + argmax ρ up to the playback time (dark green)");
-            ui.add_enabled(tracker.is_some(), egui::Checkbox::new(&mut self.show_tracker, "tracker x̂"))
-                .on_hover_text(if tracker.is_some() {
-                    "Overlay the tracker's estimate x̂(t) up to the playback time, in red"
-                } else {
-                    "Run the tracker to overlay its estimate"
-                });
+            overlays.checkboxes(ui, &mut self.show_tracker, &mut self.show_unscented);
             ui.separator();
             self.focus.ui(ui);
         });
@@ -160,12 +159,7 @@ impl BoxView {
         let reference: Vec<[f64; 2]> = w.reference[..=clip].iter().map(|s| [s[a], s[b]]).collect();
         let clip_e = step.min(w.estimates.len() - 1);
         let estimate: Vec<[f64; 2]> = w.estimates[..=clip_e].iter().map(|s| [s[a], s[b]]).collect();
-        let tracker_path = tracker.filter(|_| self.show_tracker).map(|t| {
-            let clip_t = step.min(t.estimates.len().saturating_sub(1));
-            let pts: Vec<[f64; 2]> = t.estimates[..=clip_t].iter().map(|e| [e[a], e[b]]).collect();
-            let last = &t.estimates[clip_t];
-            (pts, [last[a], last[b]])
-        });
+        let paths = overlays.paths(self.show_tracker, self.show_unscented, step, (a, b));
         let show_density = self.show_density;
         let show_estimate = self.show_estimate;
         let strong = WINDOW_GREEN;
@@ -241,15 +235,7 @@ impl BoxView {
                                     .color(strong),
                             );
                         }
-                        if let Some((path, last)) = tracker_path {
-                            plot_ui.line(egui_plot::Line::new("tracker x̂", path).color(TRACKER_RED).width(1.5));
-                            plot_ui.points(
-                                egui_plot::Points::new("", vec![last])
-                                    .radius(4.0)
-                                    .shape(egui_plot::MarkerShape::Diamond)
-                                    .color(TRACKER_RED),
-                            );
-                        }
+                        Overlays::draw(plot_ui, paths);
                     });
             });
         });
