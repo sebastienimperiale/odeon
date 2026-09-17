@@ -650,9 +650,9 @@ deployment script yet.
 | Sources | `~/odeon`, a clone of `github.com/sebastienimperiale/odeon` (public, `main`) |
 | Toolchain | rustup stable, `wasm32-unknown-unknown` target, `trunk` (installed with `cargo install --locked trunk`, or the prebuilt binary if that fails) |
 | Server | `~/odeon/target/release/observers-server`, systemd unit `/etc/systemd/system/odeon.service` (user `ubuntu`, `Restart=on-failure`), env `ODEON_SERVER_ADDR=127.0.0.1:8787`, `ODEON_TOKEN=ananke`, no `ODEON_WEB_DIR` (default = `~/odeon/apps/observers-client/dist`) |
-| Page | built on the VPS: `cd ~/odeon/apps/observers-client && trunk build --public-url /` → `dist/`, served by the server at `/` |
-| TLS | Caddy (`apt install caddy`), `/etc/caddy/Caddyfile` = `vps-d837c56a.vps.ovh.ca { reverse_proxy 127.0.0.1:8787 }`, Let's Encrypt certificate obtained and renewed by Caddy; firewall `ufw`: OpenSSH, 80, 443 open, 8787 closed |
-| URL | `https://vps-d837c56a.vps.ovh.ca/?token=ananke` (the token once per browser; the page remembers it and the server URL defaults to the page's origin) |
+| Page | built on the VPS: `cd ~/odeon/apps/observers-client && trunk build --public-url /odeon/` → `dist/`, served by the server at `/` and published by Caddy under `/odeon/` |
+| TLS | Caddy (`apt install caddy`), `/etc/caddy/Caddyfile` = `team-ananke.fr, www.team-ananke.fr { redir /odeon /odeon/` + `handle_path /odeon/* { reverse_proxy 127.0.0.1:8787 }` + `handle { respond "team-ananke.fr" 200 } }` (until 2026-09-17: `vps-d837c56a.vps.ovh.ca { reverse_proxy 127.0.0.1:8787 }`, a name no longer served), Let's Encrypt certificate obtained and renewed by Caddy; firewall `ufw`: OpenSSH, 80, 443 open, 8787 closed |
+| URL | `https://team-ananke.fr/odeon/?token=ananke` (the token once per browser; the page remembers it and the server URL defaults to the page's directory, `https://team-ananke.fr/odeon`) |
 
 The token is deliberately a plain word (user's choice); an intruder knowing
 it can only submit jobs within the limits. Change it in the unit file and
@@ -664,7 +664,7 @@ Everyday commands, on the VPS:
 # update to the pushed main branch (server + page), restart
 cd ~/odeon && git pull
 cargo build --release -p odeon-observers-server
-(cd apps/observers-client && trunk build --public-url /)
+(cd apps/observers-client && trunk build --public-url /odeon/)
 sudo systemctl restart odeon
 # state and logs
 systemctl status odeon --no-pager
@@ -684,7 +684,9 @@ cannot get a browser-trusted certificate, hence the OVH hostname (a bought
 domain would replace it by editing the Caddyfile only). After a page
 rebuild, hard-refresh the browser (Shift + reload) to drop the old wasm.
 
-**Domain `team-ananke.fr`** (bought at OVH 2026-09-17; target URL
+**Domain `team-ananke.fr`** (bought at OVH 2026-09-17 and deployed the
+same day — checked: `/odeon/` → the page, a twin run through
+`/odeon/twin-runs` with the token; URL
 `https://team-ananke.fr/odeon/?token=ananke`, the root of the domain kept
 free for other things). The web client's default server URL is the page's
 own *directory* (`page_directory(origin, pathname)` in the client's
@@ -695,6 +697,16 @@ prefix (`redir /odeon /odeon/` + `handle_path /odeon/* { reverse_proxy
 127.0.0.1:8787 }`) and the page is built with `trunk build --public-url
 /odeon/`. DNS: A records of `team-ananke.fr` and `www` → the VPS's IPv4
 (OVH parks new domains on 213.186.33.5), no AAAA.
+
+**No token, no server field for the moment** (2026-09-17, on request,
+"maybe back later"): the client's constants `SERVER_FIELD` and `USE_TOKEN`
+(`apps/observers-client/src/main.rs`) are `false` — the estimator section
+shows neither field, the URL still comes from `ODEON_SERVER` / `?server=` /
+the page's directory, and no token is read or sent; the server's token
+support is untouched, the VPS unit simply runs without `ODEON_TOKEN` (the
+job limits and the run expiry remain the only protection). URL:
+`https://team-ananke.fr/odeon/`. To restore: both constants to `true`,
+`Environment=ODEON_TOKEN=…` back in the unit.
 
 Known first-time pitfalls met: `apt` waiting on the unattended-upgrades
 lock right after install (wait, do not kill it); `cargo install trunk`

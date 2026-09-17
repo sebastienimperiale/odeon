@@ -10,6 +10,13 @@
 //! `http://127.0.0.1:8787`) and the server's token, if it needs one, from
 //! `ODEON_TOKEN`; both are editable in the estimator section.
 //!
+//! **Since 2026-09-17 both are switched off** by the constants
+//! `SERVER_FIELD` and `USE_TOKEN` below (on request, maybe back later):
+//! the server field is not shown — the URL still comes from `ODEON_SERVER`,
+//! `?server=` or the page's directory — and no token is read, shown or
+//! sent, so the server must run without `ODEON_TOKEN`. What follows
+//! describes the behaviour with both constants on.
+//!
 //! ```sh
 //! cargo run -p odeon-observers-server --release      # terminal 1
 //! cargo run -p odeon-observers-client --release      # terminal 2
@@ -46,6 +53,18 @@ use ode_observers_egui::app::{App, Compute, EstimatorRun, LocalRunner};
 use ode_observers_remote::protocol::TwinJob;
 use ode_observers_remote::RemoteRun;
 
+/// Whether the estimator section shows the "server" field. Off since
+/// 2026-09-17 (on request, maybe back later): the URL still comes from
+/// `ODEON_SERVER` / `?server=` / the page's directory, it is just not
+/// displayed nor editable.
+const SERVER_FIELD: bool = false;
+
+/// Whether the client uses an access token at all: reads it (`ODEON_TOKEN`,
+/// `?token=`, the remembered value), shows its field and sends it. Off
+/// since 2026-09-17 (on request, maybe back later) — the server must then
+/// run without `ODEON_TOKEN`.
+const USE_TOKEN: bool = false;
+
 /// Jobs posted to the observers server at `url`, as twin experiments,
 /// with its bearer `token` when it requires one (empty = none).
 struct RemoteCompute {
@@ -65,6 +84,7 @@ impl Default for RemoteCompute {
         };
         #[cfg(target_arch = "wasm32")]
         let (url, token) = (web::server_url(), web::token());
+        let token = if USE_TOKEN { token } else { String::new() };
         RemoteCompute { url, token }
     }
 }
@@ -171,6 +191,17 @@ impl Compute for RemoteCompute {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
+        if SERVER_FIELD {
+            self.server_field(ui);
+        }
+        if USE_TOKEN {
+            self.token_field(ui);
+        }
+    }
+}
+
+impl RemoteCompute {
+    fn server_field(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("server").on_hover_text(
                 "URL of the observers-server every estimator job is sent to (start one \
@@ -187,6 +218,9 @@ impl Compute for RemoteCompute {
             #[cfg(not(target_arch = "wasm32"))]
             let _ = edited;
         });
+    }
+
+    fn token_field(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("token").on_hover_text(
                 "Access token of the server, if it was started with ODEON_TOKEN (leave \
