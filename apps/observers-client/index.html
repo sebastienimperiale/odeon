@@ -9,6 +9,10 @@
     <link data-trunk rel="rust" data-wasm-opt="2" />
     <!-- GitHub Pages: serve the files as they are (no Jekyll). -->
     <link data-trunk rel="copy-file" href=".nojekyll" />
+    <!-- The models note, opened by "About this model…" as models.pdf next
+         to the page (build it with latexmk in crates/ode-models/docs; the
+         PDF is committed so that a checkout without LaTeX can publish it). -->
+    <link data-trunk rel="copy-file" href="../../crates/ode-models/docs/models.pdf" />
     <style>
         html, body { margin: 0; padding: 0; height: 100%; height: 100dvh; overflow: hidden; background: #202020; overscroll-behavior: none; }
         canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; height: 100dvh; touch-action: none; }

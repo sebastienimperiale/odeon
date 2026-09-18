@@ -729,6 +729,15 @@ requesting `ViewportCommand::Screenshot`; macOS refuses `screencapture`
 to the terminal). One second client for phones was considered and
 rejected: same layout code either way, twice the maintenance.
 
+**The models note on the web page** (2026-09-18, after "About this
+model…" did nothing there: `models.pdf` answered 404): `index.html` has a
+`copy-file` link for `crates/ode-models/docs/models.pdf`, so every `trunk
+build` publishes it beside the page, and the PDF is **committed** (the
+user un-ignored `crates/ode-models/docs/*.pdf` the same day) because the
+VPS has no LaTeX — rebuild it with `latexmk -pdf models.tex` and commit
+it whenever the note changes. Chrome's and Firefox's viewers honour the
+`#nameddest=` fragment; Safari's opens the first page.
+
 Known first-time pitfalls met: `apt` waiting on the unattended-upgrades
 lock right after install (wait, do not kill it); `cargo install trunk`
 without `--locked` failing to compile `lightningcss`; a manual test
