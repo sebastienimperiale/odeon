@@ -442,7 +442,7 @@ pure-algorithms crate.
 8. **Server hardening for a public deployment** — done 2026-09-16 (on
    request, before renting a VPS). `observers-server` reads a `Settings`
    from the environment (`Settings::from_env`, printed at startup):
-   `ODEON_TOKEN` (bearer token checked by a `route_layer` middleware on
+   `ODEON_TOKEN` (**removed 2026-09-18**, see below; bearer token checked by a `route_layer` middleware on
    the API routes only — 401 otherwise, the body drained first so a
    client still uploading sees the answer and not a reset; the CORS layer
    stays outermost so the page's preflight passes without it; the static
@@ -629,8 +629,8 @@ cargo run -p ode-observers --release --example one_spring # CLI examples (write 
 cargo bench -p ode-observers --bench transport            # transport paths (fixed box and window)
 cargo bench -p ode-observers --bench diffusion            # lobatto-spectral vs lobatto-fft
 cargo run -p odeon-observers-viewer --release             # the observers viewer (apps/observers-viewer)
-cargo run -p odeon-observers-server --release             # the job server on 127.0.0.1:8787 (ODEON_SERVER_ADDR; ODEON_TOKEN, ODEON_MAX_*, ODEON_RUN_TTL — see its crate doc)
-cargo run -p odeon-observers-client --release             # the same viewer sending its jobs to the server (ODEON_SERVER, default http://127.0.0.1:8787; ODEON_TOKEN)
+cargo run -p odeon-observers-server --release             # the job server on 127.0.0.1:8787 (ODEON_SERVER_ADDR; ODEON_MAX_*, ODEON_RUN_TTL — see its crate doc)
+cargo run -p odeon-observers-client --release             # the same viewer sending its jobs to the server (ODEON_SERVER, default http://127.0.0.1:8787)
 (cd apps/observers-client && trunk build)                # the web page → apps/observers-client/dist (release by Trunk.toml)
 cargo run -p odeon-observers-server --release             # …then serves it at http://127.0.0.1:8787/ (or ODEON_WEB_DIR=<dist>)
 python scripts/visualize_filter.py one_spring             # figures from a CLI run
@@ -649,14 +649,13 @@ deployment script yet.
 | Login | `ssh ubuntu@148.113.239.218` (the Mac's `~/.ssh/id_rsa` key, registered in the OVH panel) |
 | Sources | `~/odeon`, a clone of `github.com/sebastienimperiale/odeon` (public, `main`) |
 | Toolchain | rustup stable, `wasm32-unknown-unknown` target, `trunk` (installed with `cargo install --locked trunk`, or the prebuilt binary if that fails) |
-| Server | `~/odeon/target/release/observers-server`, systemd unit `/etc/systemd/system/odeon.service` (user `ubuntu`, `Restart=on-failure`), env `ODEON_SERVER_ADDR=127.0.0.1:8787`, `ODEON_TOKEN=ananke`, no `ODEON_WEB_DIR` (default = `~/odeon/apps/observers-client/dist`) |
+| Server | `~/odeon/target/release/observers-server`, systemd unit `/etc/systemd/system/odeon.service` (user `ubuntu`, `Restart=on-failure`), env `ODEON_SERVER_ADDR=127.0.0.1:8787` (an `ODEON_TOKEN=ananke` line may linger: ignored since 2026-09-18), no `ODEON_WEB_DIR` (default = `~/odeon/apps/observers-client/dist`) |
 | Page | built on the VPS: `cd ~/odeon/apps/observers-client && trunk build --public-url /odeon/` → `dist/`, served by the server at `/` and published by Caddy under `/odeon/` |
 | TLS | Caddy (`apt install caddy`), `/etc/caddy/Caddyfile` = `team-ananke.fr, www.team-ananke.fr { redir /odeon /odeon/` + `handle_path /odeon/* { reverse_proxy 127.0.0.1:8787 }` + `handle { respond "team-ananke.fr" 200 } }` (until 2026-09-17: `vps-d837c56a.vps.ovh.ca { reverse_proxy 127.0.0.1:8787 }`, a name no longer served), Let's Encrypt certificate obtained and renewed by Caddy; firewall `ufw`: OpenSSH, 80, 443 open, 8787 closed |
-| URL | `https://team-ananke.fr/odeon/?token=ananke` (the token once per browser; the page remembers it and the server URL defaults to the page's directory, `https://team-ananke.fr/odeon`) |
+| URL | `https://team-ananke.fr/odeon/` (no token; the server URL defaults to the page's directory, `https://team-ananke.fr/odeon`) |
 
-The token is deliberately a plain word (user's choice); an intruder knowing
-it can only submit jobs within the limits. Change it in the unit file and
-`systemctl restart odeon`; browsers then need `?token=` once more.
+No authentication (see "The token is gone" below): anyone with the URL
+can submit jobs within the limits.
 
 Everyday commands, on the VPS:
 
@@ -698,15 +697,37 @@ prefix (`redir /odeon /odeon/` + `handle_path /odeon/* { reverse_proxy
 /odeon/`. DNS: A records of `team-ananke.fr` and `www` → the VPS's IPv4
 (OVH parks new domains on 213.186.33.5), no AAAA.
 
-**No token, no server field for the moment** (2026-09-17, on request,
-"maybe back later"): the client's constants `SERVER_FIELD` and `USE_TOKEN`
-(`apps/observers-client/src/main.rs`) are `false` — the estimator section
-shows neither field, the URL still comes from `ODEON_SERVER` / `?server=` /
-the page's directory, and no token is read or sent; the server's token
-support is untouched, the VPS unit simply runs without `ODEON_TOKEN` (the
-job limits and the run expiry remain the only protection). URL:
-`https://team-ananke.fr/odeon/`. To restore: both constants to `true`,
-`Environment=ODEON_TOKEN=…` back in the unit.
+**No server field** (2026-09-17, on request, "maybe back later"): the
+client's constant `SERVER_FIELD` (`apps/observers-client/src/main.rs`) is
+`false` — the estimator section does not show the URL, which still comes
+from `ODEON_SERVER` / `?server=` / the page's directory. **The token is
+gone** (2026-09-18, on request — first switched off by a constant, then
+removed entirely): no `ODEON_TOKEN` on the server (`Settings::token`, the
+`require_token` middleware and its test are deleted; the startup line says
+"open to anyone reaching it"), no `_with_token` constructors in
+`ode-observers-remote`, no token field, `?token=` or `odeon.token` storage
+in the client; the job limits and the run expiry are the only protection.
+The preflight check survives as `a_page_on_another_origin_may_call_the_api`.
+URL: `https://team-ananke.fr/odeon/`. Step 8's token description above is
+history; restoring it means reverting that removal (commit of 2026-09-18).
+
+**Phone layout** (2026-09-18, on request — the page was unusable on a
+phone): `App::ui` picks its layout from the available width at every
+frame (`app::NARROW_WIDTH` = 640 points). Wide: the three panels as
+before (the bottom panel's default height is now 30 % of the window,
+clamped to [120, 230], so a phone held sideways keeps its scene). Narrow:
+a top row of tabs **Setup** (the left panel's content — `setup_ui`) /
+**View** (the central view — `central_ui` — with the observation panel
+below it), a spinner in the row while an estimator runs, and larger
+button padding for the finger; the page is remembered in `App::page`.
+The three panel bodies are the methods `setup_ui`, `central_ui` and
+`model_panels::observation_panel`, drawn by both layouts. `index.html`:
+`user-scalable=no` (a pinch reaches the app, not the browser), `100dvh`
+(Safari's address bar), `touch-action: none` on the canvas. Checked with
+in-app screenshots at 390×750 and 750×390 (a throw-away eframe example
+requesting `ViewportCommand::Screenshot`; macOS refuses `screencapture`
+to the terminal). One second client for phones was considered and
+rejected: same layout code either way, twice the maintenance.
 
 Known first-time pitfalls met: `apt` waiting on the unattended-upgrades
 lock right after install (wait, do not kill it); `cargo install trunk`

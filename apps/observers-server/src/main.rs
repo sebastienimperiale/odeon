@@ -11,7 +11,6 @@
 //! observers-server                       # listens on 127.0.0.1:8787, open, default limits
 //! ODEON_SERVER_ADDR=0.0.0.0:9000 observers-server
 //! ODEON_WEB_DIR=/path/to/dist observers-server   # serves that web client at /
-//! ODEON_TOKEN=secret observers-server            # every API request must carry it
 //! ```
 //!
 //! Deployment settings, all from the environment ([`Settings::from_env`]):
@@ -20,7 +19,6 @@
 //! |-----------------------|-----------|---------|
 //! | `ODEON_SERVER_ADDR`   | `127.0.0.1:8787` | listening address |
 //! | `ODEON_WEB_DIR`       | the workspace's `apps/observers-client/dist` | the page served at `/`; `none` serves no page |
-//! | `ODEON_TOKEN`         | unset = open | bearer token required on `/runs*` (`Authorization: Bearer …`), 401 otherwise |
 //! | `ODEON_MAX_RUNS`      | 2         | runs in progress at once; further jobs get 429 |
 //! | `ODEON_MAX_STEPS`     | 200000    | steps of one run |
 //! | `ODEON_MAX_DOFS`      | 2000000   | grid points of a filter or window run |
@@ -31,7 +29,10 @@
 //! A job beyond a limit is refused with 400 and a message naming the
 //! limit; the limits bound the memory one request can claim (the filter
 //! allocates ≈ (8 + 8·M) bytes per grid point plus its snapshots, the
-//! particles store the whole population at every step).
+//! particles store the whole population at every step). There is no
+//! authentication (an access token existed until 2026-09-18 and was
+//! removed on request): anyone reaching the server may submit jobs within
+//! the limits — the limits and the run expiry are the whole protection.
 //!
 //! Cross-origin requests are allowed from anywhere (the page may be
 //! published elsewhere, e.g. on GitHub Pages, and name this server with
@@ -40,8 +41,7 @@
 //! `apps/observers-client/dist` of this workspace (an absolute path fixed
 //! at compile time, so the working directory does not matter) whenever
 //! that directory exists — one origin for the page and its jobs, no
-//! configuration. The page never needs the token to load; only its jobs
-//! carry it.
+//! configuration.
 //!
 //! Runs live in memory until they are deleted (the client deletes its run
 //! when it drops the handle, i.e. once it has taken the output or
@@ -49,10 +49,9 @@
 //! tab). A job that panics (a malformed description) is reported in its
 //! status rather than killing the server.
 
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
-use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::http::header::{ACCEPT, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
-use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -67,11 +66,9 @@ use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
-/// Deployment settings: access and the limits protecting the machine.
+/// Deployment settings: the limits protecting the machine.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
-    /// Bearer token every API request must carry; `None` = open server.
-    pub token: Option<String>,
     /// Runs in progress accepted at once.
     pub max_runs: usize,
     /// Steps of one run.
@@ -87,11 +84,9 @@ pub struct Settings {
 }
 
 impl Default for Settings {
-    /// Open server with the default limits (what a bare `observers-server`
-    /// runs with).
+    /// The default limits (what a bare `observers-server` runs with).
     fn default() -> Self {
         Settings {
-            token: None,
             max_runs: 2,
             max_steps: 200_000,
             max_dofs: 2_000_000,
@@ -114,7 +109,6 @@ impl Settings {
         }
         let d = Settings::default();
         Settings {
-            token: var("ODEON_TOKEN"),
             max_runs: num("ODEON_MAX_RUNS", d.max_runs),
             max_steps: num("ODEON_MAX_STEPS", d.max_steps),
             max_dofs: num("ODEON_MAX_DOFS", d.max_dofs),
@@ -182,8 +176,8 @@ impl Runs {
 }
 
 /// The server's routes (see `ode_observers_remote::protocol`), open to
-/// cross-origin callers, guarded by the token and the limits of
-/// `settings`; with `web_dir`, the static web client at `/`. Starts the
+/// cross-origin callers, guarded by the limits of `settings`; with
+/// `web_dir`, the static web client at `/`. Starts the
 /// sweeper of idle runs on the current tokio runtime.
 pub fn router(web_dir: Option<&str>, settings: Settings) -> Router {
     let runs = Runs::new(settings);
@@ -200,7 +194,6 @@ pub fn router(web_dir: Option<&str>, settings: Settings) -> Router {
         .route("/twin-runs", post(create_twin))
         .route("/runs/{id}", get(status).delete(cancel))
         .route("/runs/{id}/output", get(output))
-        .route_layer(middleware::from_fn_with_state(runs.clone(), require_token))
         .with_state(runs);
     let router = match web_dir {
         Some(dir) => api.fallback_service(ServeDir::new(dir)),
@@ -209,32 +202,12 @@ pub fn router(web_dir: Option<&str>, settings: Settings) -> Router {
     // A job carries its reference (states and observations of every
     // step): a long run is tens of megabytes of JSON, far beyond axum's
     // default 2 MB body limit. The CORS layer is outermost so that
-    // preflight requests are answered before the token check; answers
-    // are gzipped for clients accepting it (an output is megabytes).
+    // preflight requests are answered first; answers are gzipped for
+    // clients accepting it (an output is megabytes).
     router
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
         .layer(DefaultBodyLimit::max(1 << 30))
-}
-
-/// With a token configured, refuse (401) any API request not carrying it
-/// as `Authorization: Bearer <token>`.
-async fn require_token(State(runs): State<Runs>, request: Request, next: Next) -> Response {
-    if let Some(token) = &runs.settings.token {
-        let sent = request
-            .headers()
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::trim);
-        if sent != Some(token.as_str()) {
-            // Read the body before answering: a client still uploading its
-            // job would otherwise see a reset connection instead of the 401.
-            let _ = axum::body::to_bytes(request.into_body(), 1 << 30).await;
-            return (StatusCode::UNAUTHORIZED, "missing or wrong token (Authorization: Bearer …)").into_response();
-        }
-    }
-    next.run(request).await
 }
 
 /// Nodes per direction of the grid a configuration describes for the
@@ -480,8 +453,7 @@ async fn main() {
         None => println!("no web client served (ODEON_WEB_DIR=<dist> to serve one)"),
     }
     println!(
-        "access: {}; limits: {} run(s) at once, {} steps, {} grid points, {} particles, {} output values; idle runs dropped after {} s",
-        if settings.token.is_some() { "token required (ODEON_TOKEN)" } else { "OPEN — set ODEON_TOKEN before exposing this server" },
+        "open to anyone reaching it (no authentication); limits: {} run(s) at once, {} steps, {} grid points, {} particles, {} output values; idle runs dropped after {} s",
         settings.max_runs,
         settings.max_steps,
         settings.max_dofs,
@@ -676,28 +648,17 @@ mod tests {
         assert!(gone, "the run was not deleted");
     }
 
-    /// With a token configured, jobs without it (or with a wrong one) are
-    /// refused with 401, and the client handle carrying it runs as usual.
+    /// A page published on another origin may call the server: its
+    /// preflight request is answered with a permissive CORS policy.
     #[tokio::test]
-    async fn the_token_guards_the_api() {
-        let base = serve_with(Settings { token: Some("s3cret".into()), ..Settings::default() }).await;
-        let twin = TwinJob { twin: spring_twin(5), estimator: Estimator::Tracker, config: spring_config() };
-        let err = take(RemoteRun::<TrackerOutput>::spawn_twin(&base, &twin)).await.err().expect("refused");
-        assert!(err.contains("401") && err.contains("token"), "{err}");
-        let err = take(RemoteRun::<TrackerOutput>::spawn_twin_with_token(&base, Some("wrong"), &twin))
-            .await
-            .err()
-            .expect("refused");
-        assert!(err.contains("401"), "{err}");
-        let out = take(RemoteRun::<TrackerOutput>::spawn_twin_with_token(&base, Some("s3cret"), &twin)).await.unwrap();
-        assert_eq!(out.estimates.len(), 6);
-        // The page's preflight must pass without the token.
+    async fn a_page_on_another_origin_may_call_the_api() {
+        let base = serve_with(Settings::default()).await;
         let mut preflight = ehttp::Request::get(format!("{base}/twin-runs"));
         preflight.method = "OPTIONS".into();
         preflight.headers = ehttp::Headers::new(&[
             ("Origin", "https://example.github.io"),
             ("Access-Control-Request-Method", "POST"),
-            ("Access-Control-Request-Headers", "authorization,content-type"),
+            ("Access-Control-Request-Headers", "content-type"),
         ]);
         let r = fetch(preflight).await;
         assert!(r.ok, "preflight answered {}", r.status);

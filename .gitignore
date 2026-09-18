@@ -11,7 +11,6 @@
 /docs/*.fls
 /docs/*.fdb_latexmk
 /docs/*.synctex.gz
-/crates/ode-models/docs/*.pdf
 /crates/ode-models/docs/*.aux
 /crates/ode-models/docs/*.log
 /crates/ode-models/docs/*.out

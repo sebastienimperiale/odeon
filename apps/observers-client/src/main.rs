@@ -7,15 +7,7 @@
 //! application and as a web page (wasm, `trunk`).
 //!
 //! Desktop: the server URL comes from `ODEON_SERVER` (default
-//! `http://127.0.0.1:8787`) and the server's token, if it needs one, from
-//! `ODEON_TOKEN`; both are editable in the estimator section.
-//!
-//! **Since 2026-09-17 both are switched off** by the constants
-//! `SERVER_FIELD` and `USE_TOKEN` below (on request, maybe back later):
-//! the server field is not shown — the URL still comes from `ODEON_SERVER`,
-//! `?server=` or the page's directory — and no token is read, shown or
-//! sent, so the server must run without `ODEON_TOKEN`. What follows
-//! describes the behaviour with both constants on.
+//! `http://127.0.0.1:8787`).
 //!
 //! ```sh
 //! cargo run -p odeon-observers-server --release      # terminal 1
@@ -30,10 +22,12 @@
 //! served by the server itself needs no configuration, and a page published elsewhere
 //! (GitHub Pages, say) is shared as one link naming the server:
 //! `https://you.github.io/Odeon/?server=https://my-mac.example.net`.
-//! Editing the field in the estimator section updates the remembered
-//! value. The token works the same way: `?token=…`, remembered under
-//! `odeon.token`, editable. (A page served over HTTPS can only call an
-//! HTTPS server.)
+//! (A page served over HTTPS can only call an HTTPS server.) The URL is
+//! not shown in the interface: the "server" field of the estimator
+//! section is switched off by `SERVER_FIELD` below (2026-09-17, on
+//! request, maybe back later); with it on, editing the field updates the
+//! remembered value. There is no access token (removed 2026-09-18, on
+//! request; the server has none either).
 //!
 //! ```sh
 //! cd apps/observers-client && trunk build --release        # → dist/
@@ -59,33 +53,24 @@ use ode_observers_remote::RemoteRun;
 /// displayed nor editable.
 const SERVER_FIELD: bool = false;
 
-/// Whether the client uses an access token at all: reads it (`ODEON_TOKEN`,
-/// `?token=`, the remembered value), shows its field and sends it. Off
-/// since 2026-09-17 (on request, maybe back later) — the server must then
-/// run without `ODEON_TOKEN`.
-const USE_TOKEN: bool = false;
-
-/// Jobs posted to the observers server at `url`, as twin experiments,
-/// with its bearer `token` when it requires one (empty = none).
+/// Jobs posted to the observers server at `url`, as twin experiments.
 struct RemoteCompute {
     url: String,
-    token: String,
 }
 
 impl Default for RemoteCompute {
-    /// Desktop: `ODEON_SERVER` or the local default port, `ODEON_TOKEN`.
-    /// Web: the `?server=` / `?token=` parameters, the remembered values,
-    /// or the page's origin and no token.
+    /// Desktop: `ODEON_SERVER` or the local default port. Web: the
+    /// `?server=` parameter, the remembered value, or the page's directory.
     fn default() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        let (url, token) = {
-            let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-            (var("ODEON_SERVER").unwrap_or_else(|| "http://127.0.0.1:8787".to_string()), var("ODEON_TOKEN").unwrap_or_default())
-        };
+        let url = std::env::var("ODEON_SERVER")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
         #[cfg(target_arch = "wasm32")]
-        let (url, token) = (web::server_url(), web::token());
-        let token = if USE_TOKEN { token } else { String::new() };
-        RemoteCompute { url, token }
+        let url = web::server_url();
+        RemoteCompute { url }
     }
 }
 
@@ -98,12 +83,10 @@ fn page_directory(origin: &str, pathname: &str) -> String {
     format!("{}{dir}", origin.trim_end_matches('/'))
 }
 
-/// Where the web page learns the server URL and token from, and remembers
-/// them.
+/// Where the web page learns the server URL from, and remembers it.
 #[cfg(target_arch = "wasm32")]
 mod web {
     pub const SERVER_KEY: &str = "odeon.server";
-    pub const TOKEN_KEY: &str = "odeon.token";
 
     fn storage() -> Option<web_sys::Storage> {
         web_sys::window()?.local_storage().ok().flatten()
@@ -155,11 +138,6 @@ mod web {
                 .unwrap_or_else(|| "http://127.0.0.1:8787".to_string())
         })
     }
-
-    /// `?token=…`, else the remembered token, else none.
-    pub fn token() -> String {
-        setting("token", TOKEN_KEY).unwrap_or_default()
-    }
 }
 
 /// A run on the server, seen through the app's run trait.
@@ -186,16 +164,12 @@ impl Compute for RemoteCompute {
         T: TryFrom<JobOutput, Error = String> + Send + 'static,
     {
         let JobSpec { estimator, config, .. } = job;
-        let token = Some(self.token.as_str()).filter(|t| !t.trim().is_empty());
-        Box::new(Remote(RemoteRun::spawn_twin_with_token(&self.url, token, &TwinJob { twin, estimator, config })))
+        Box::new(Remote(RemoteRun::spawn_twin(&self.url, &TwinJob { twin, estimator, config })))
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
         if SERVER_FIELD {
             self.server_field(ui);
-        }
-        if USE_TOKEN {
-            self.token_field(ui);
         }
     }
 }
@@ -214,24 +188,6 @@ impl RemoteCompute {
             #[cfg(target_arch = "wasm32")]
             if edited {
                 web::remember(web::SERVER_KEY, &self.url);
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            let _ = edited;
-        });
-    }
-
-    fn token_field(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("token").on_hover_text(
-                "Access token of the server, if it was started with ODEON_TOKEN (leave \
-                 empty for an open server; ODEON_TOKEN in the environment pre-fills it).",
-            );
-            let edited = ui
-                .add(egui::TextEdit::singleline(&mut self.token).password(true).desired_width(ui.available_width() - 8.0))
-                .changed();
-            #[cfg(target_arch = "wasm32")]
-            if edited {
-                web::remember(web::TOKEN_KEY, &self.token);
             }
             #[cfg(not(target_arch = "wasm32"))]
             let _ = edited;

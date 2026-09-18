@@ -44,6 +44,20 @@ enum CentralView {
     Unscented,
 }
 
+/// Below this available width (in points) the three panels no longer fit
+/// side by side — a phone held upright, a narrow browser window — and the
+/// app draws its narrow layout instead: a row of tabs choosing one page.
+pub const NARROW_WIDTH: f32 = 640.0;
+
+/// The page shown by the narrow layout: the left panel's content (model,
+/// parameters, estimator, Run), or the central view with the observation
+/// panel below it.
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+    Setup,
+    View,
+}
+
 /// The typed runner of `ode_observers::jobs` a backend may execute locally
 /// (`run_filter_spec`, `run_tracker_spec`, …): the slot's result type picks
 /// it, `JobSpec::estimator` is what the user selected.
@@ -239,6 +253,8 @@ pub struct App<C: Compute> {
     slots: Vec<Slot>,
     selected: usize,
     compute: C,
+    /// The page of the narrow layout (ignored by the wide one).
+    page: Page,
 }
 
 impl<C: Compute> App<C> {
@@ -248,10 +264,16 @@ impl<C: Compute> App<C> {
             slots: models::all().into_iter().map(Slot::new).collect(),
             selected: 0,
             compute,
+            page: Page::Setup,
         }
     }
 
-    /// One frame: the three panels.
+    /// One frame: the three panels side by side (left: model and
+    /// estimator; bottom: observation and playback; centre: the scene or
+    /// a result view), or — below [`NARROW_WIDTH`] — one page at a time
+    /// chosen by a row of tabs, the observation panel under the view. The
+    /// choice is made from the width at every frame, so a rotated phone
+    /// or a resized window switches layouts on the fly.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         // Collect finished background runs (all slots, not just the visible
         // one) and start their playback.
@@ -298,269 +320,26 @@ impl<C: Compute> App<C> {
             }
         }
 
-        egui::Panel::left("params")
-            .resizable(true)
-            .default_size(280.0)
-            .min_size(250.0)
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.heading("Model");
-                // While an estimator runs, the whole panel is frozen
-                // (grayed): its configuration must stay exactly what the
-                // run uses.
-                let estimating = self.slots[self.selected].estimating();
-                ui.add_enabled_ui(!estimating, |ui| {
-                    let names: Vec<&str> = self.slots.iter().map(|s| s.base.model.name()).collect();
-                    model_panels::model_selector(ui, &names, &mut self.selected);
-                    let compute = &mut self.compute;
-                    let slot = &mut self.slots[self.selected];
-                    ui.separator();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        if model_panels::params_ui(ui, &mut slot.base) {
-                            slot.clear_estimator_state();
-                        }
-                        ui.add_space(6.0);
-                        let estimating = slot.estimating();
-                        model_panels::run_ui(ui, &mut slot.base, !estimating);
-                        let run_done = slot.base.run_done();
-
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Mortensen estimator");
-                            if ui
-                                .add_enabled(run_done, egui::Button::new("default").small())
-                                .clicked()
-                            {
-                                slot.filter_cfg = slot.default_filter_cfg();
-                            }
-                        });
-                        compute.ui(ui);
-                        // Estimator-only options of the model (an unknown
-                        // parameter augmenting the state): the run is made
-                        // of a different model, so it and the configuration
-                        // (whose dimension may change) are discarded.
-                        if slot.base.model.estimator_options_ui(ui) {
-                            slot.base.refresh_preview();
-                            slot.clear_estimator_state();
-                            slot.filter_cfg = None;
-                        }
-                        panels::estimator_selector(ui, &mut slot.estimator);
-                        let is_tracker = matches!(slot.estimator, Estimator::Tracker | Estimator::Unscented);
-                        let is_window = slot.estimator == Estimator::Window;
-                        let obs_ok = slot.base.model.obs_selected().iter().any(|&s| s);
-                        let steps = slot.base.steps();
-                        let mut domains_ok = true;
-                        match &mut slot.filter_cfg {
-                            None => {
-                                ui.weak(
-                                    "Run a simulation first — domains and defaults \
-                                     are computed from the run.",
-                                );
-                            }
-                            Some(cfg) => {
-                                domains_ok = panels::config_ui(ui, cfg, slot.estimator, steps);
-                            }
-                        }
-
-                        ui.add_space(6.0);
-                        let prior_ok = slot
-                            .filter_cfg
-                            .as_ref()
-                            .is_none_or(|c| panels::prior_ok(c, slot.estimator));
-                        let can_run = run_done
-                            && !estimating
-                            && slot.filter_cfg.is_some()
-                            && obs_ok
-                            && prior_ok
-                            && (domains_ok || is_tracker || is_window);
-                        let clicked = ui
-                            .add_enabled(
-                                can_run,
-                                egui::Button::new(panels::run_label(slot.estimator))
-                                    .min_size(egui::vec2(ui.available_width() - 8.0, 28.0)),
-                            )
-                            .on_hover_text("Run the Mortensen estimator on this trajectory")
-                            .on_disabled_hover_text(if !obs_ok {
-                                "Select at least one observation first"
-                            } else if !domains_ok {
-                                "Each domain needs min < max"
-                            } else if !prior_ok {
-                                "This estimator needs σ > 0 in every direction (a Gaussian to follow)"
-                            } else {
-                                "Run a simulation first"
-                            })
-                            .clicked();
-                        if clicked
-                            && let (Some(cfg), Some(traj)) = (&slot.filter_cfg, slot.base.completed())
-                        {
-                            // The run on screen is the reference the estimator
-                            // runs along: same states, same observations — and
-                            // the twin experiment it came from, for a backend
-                            // that regenerates it elsewhere.
-                            let job = JobSpec {
-                                model: slot.base.model.model_spec(),
-                                reference: traj.reference(),
-                                estimator: slot.estimator,
-                                config: cfg.clone(),
-                            };
-                            let twin = slot.base.model.twin_spec(slot.base.dt, traj.len().saturating_sub(1));
-                            slot.run_error = None;
-                            match slot.estimator {
-                                Estimator::Filter => {
-                                    slot.filter_run =
-                                        Some(compute.spawn(job, twin, jobs::run_filter_spec));
-                                }
-                                Estimator::Window => {
-                                    slot.box_run =
-                                        Some(compute.spawn(job, twin, jobs::run_box_spec));
-                                }
-                                Estimator::Particles => {
-                                    slot.particle_run =
-                                        Some(compute.spawn(job, twin, jobs::run_particles_spec));
-                                }
-                                Estimator::Tracker => {
-                                    slot.tracker_run =
-                                        Some(compute.spawn(job, twin, jobs::run_tracker_spec));
-                                }
-                                Estimator::Unscented => {
-                                    slot.unscented_run =
-                                        Some(compute.spawn(job, twin, jobs::run_unscented_spec));
-                                }
-                            }
-                        }
-                        if let Some(out) = &slot.filter_out {
-                            ui.small(format!(
-                                "In memory: {} snapshots × {} plane(s)",
-                                out.saved_steps.len(),
-                                out.pairs.len(),
-                            ));
-                        }
-                    });
-                }); // add_enabled_ui
-
-                // Progress of a running estimator — outside the frozen
-                // region, so it renders at full strength.
-                let sel = &self.slots[self.selected];
-                let running: Option<(f32, f64, &str)> = if let Some(f) = &sel.filter_run {
-                    Some((f.progress(), f.elapsed(), panels::running_text(Estimator::Filter)))
-                } else if let Some(t) = &sel.tracker_run {
-                    Some((t.progress(), t.elapsed(), panels::running_text(Estimator::Tracker)))
-                } else if let Some(u) = &sel.unscented_run {
-                    Some((u.progress(), u.elapsed(), panels::running_text(Estimator::Unscented)))
-                } else if let Some(b) = &sel.box_run {
-                    Some((b.progress(), b.elapsed(), panels::running_text(Estimator::Window)))
-                } else {
-                    sel.particle_run
-                        .as_ref()
-                        .map(|p| (p.progress(), p.elapsed(), panels::running_text(Estimator::Particles)))
-                };
-                if let Some((progress, elapsed, text)) = running {
-                    ui.add_space(4.0);
-                    if panels::progress_ui(ui, progress, elapsed, text) {
-                        // Dropping the handles raises the cancel flag (or
-                        // deletes the run on the server): the worker stops
-                        // after its current iteration and its partial
-                        // result is discarded.
-                        self.slots[self.selected].cancel_estimators();
-                    }
-                }
-                if let Some(e) = &self.slots[self.selected].run_error {
-                    ui.add_space(4.0);
-                    ui.colored_label(ui.visuals().error_fg_color, format!("Estimator run failed: {e}"));
-                }
-                // Pin the content width to the panel width (same creep
-                // prevention as the bottom panel's take_available_height).
-                ui.take_available_width();
-            });
-
-        egui::Panel::bottom("obs_panel")
-            .resizable(true)
-            .default_size(230.0)
-            .min_size(170.0)
-            .show(ui, |ui| {
-                model_panels::observation_panel(ui, &mut self.slots[self.selected].base);
-            });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            let slot = &mut self.slots[self.selected];
-            // Advance the clock with wall time while playing.
-            let wall_dt = ui.input(|i| i.stable_dt) as f64;
-            slot.base.advance(wall_dt);
-
-            // View tabs, shown once an estimator output exists.
-            if slot.filter_out.is_some()
-                || slot.tracker_out.is_some()
-                || slot.unscented_out.is_some()
-                || slot.box_out.is_some()
-                || slot.particle_out.is_some()
-            {
-                let n_pairs = slot.filter_out.as_ref().map_or(0, |o| o.pairs.len());
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut slot.view, CentralView::Scene, "Scene");
-                    if slot.filter_out.is_some() {
-                        ui.selectable_value(&mut slot.view, CentralView::Filter, "Filter density");
-                    }
-                    if slot.box_out.is_some() {
-                        ui.selectable_value(&mut slot.view, CentralView::Window, "Tracking density");
-                    }
-                    if slot.particle_out.is_some() {
-                        ui.selectable_value(&mut slot.view, CentralView::Particles, "LParticles");
-                    }
-                    if slot.tracker_out.is_some() {
-                        ui.selectable_value(&mut slot.view, CentralView::Tracker, "Tracker");
-                    }
-                    if slot.unscented_out.is_some() {
-                        ui.selectable_value(&mut slot.view, CentralView::Unscented, "Unscented");
-                    }
-                    if slot.view == CentralView::Filter && n_pairs > 1 {
-                        ui.separator();
-                        ui.selectable_value(&mut slot.filter_view.n_panes, 1, "1 panel");
-                        ui.selectable_value(&mut slot.filter_view.n_panes, 2, "2 panels");
-                    }
+        if ui.available_width() < NARROW_WIDTH {
+            self.narrow_ui(ui);
+        } else {
+            egui::Panel::left("params")
+                .resizable(true)
+                .default_size(280.0)
+                .min_size(250.0)
+                .show(ui, |ui| self.setup_ui(ui));
+            // A short window (a phone held sideways) gets a shorter
+            // observation panel, so the scene keeps most of the height.
+            let obs_height = (0.3 * ui.available_height()).clamp(120.0, 230.0);
+            egui::Panel::bottom("obs_panel")
+                .resizable(true)
+                .default_size(obs_height)
+                .min_size(120.0)
+                .show(ui, |ui| {
+                    model_panels::observation_panel(ui, &mut self.slots[self.selected].base);
                 });
-                ui.separator();
-            }
-
-            let t = slot.base.playback.t;
-            if slot.view == CentralView::Filter
-                && let Some(out) = &slot.filter_out
-            {
-                let step = (t / out.dt).round().max(0.0) as usize;
-                let overlays = Overlays { tracker: slot.tracker_out.as_ref(), unscented: slot.unscented_out.as_ref() };
-                slot.filter_view.ui(ui, out, overlays, step);
-                return;
-            }
-            if slot.view == CentralView::Window
-                && let Some(out) = &slot.box_out
-            {
-                let step = (t / out.window.dt).round().max(0.0) as usize;
-                let overlays = Overlays { tracker: slot.tracker_out.as_ref(), unscented: slot.unscented_out.as_ref() };
-                slot.box_view.ui(ui, out, overlays, step);
-                return;
-            }
-            if slot.view == CentralView::Particles
-                && let Some(out) = &slot.particle_out
-            {
-                let step = (t / out.dt).round().max(0.0) as usize;
-                let overlays = Overlays { tracker: slot.tracker_out.as_ref(), unscented: slot.unscented_out.as_ref() };
-                slot.particles_view.ui(ui, out, overlays, step);
-                return;
-            }
-            if slot.view == CentralView::Tracker
-                && let Some(out) = &slot.tracker_out
-            {
-                tracker_view::ui(ui, out, t);
-                return;
-            }
-            if slot.view == CentralView::Unscented
-                && let Some(out) = &slot.unscented_out
-            {
-                tracker_view::ui_as(ui, out, t, "unscented x̄", 1);
-                return;
-            }
-
-            model_panels::scene_ui(ui, &slot.base, self.selected);
-        });
+            egui::CentralPanel::default().show(ui, |ui| self.central_ui(ui));
+        }
 
         // Keep animating while something moves or computes.
         let busy = self.slots[self.selected].base.playback.playing
@@ -568,6 +347,302 @@ impl<C: Compute> App<C> {
         if busy {
             ui.ctx().request_repaint();
         }
+    }
+
+    /// The narrow layout: a tab row (Setup / View, with a spinner while an
+    /// estimator runs), then the chosen page. Touch targets are widened
+    /// for the finger: larger button padding and row height.
+    fn narrow_ui(&mut self, ui: &mut egui::Ui) {
+        let estimating = self.slots[self.selected].estimating();
+        egui::Panel::top("page_tabs").show(ui, |ui| {
+            ui.spacing_mut().button_padding = egui::vec2(12.0, 8.0);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.page, Page::Setup, "Setup");
+                ui.selectable_value(&mut self.page, Page::View, "View");
+                if estimating {
+                    ui.spinner();
+                }
+            });
+            ui.add_space(4.0);
+        });
+        match self.page {
+            Page::Setup => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.spacing_mut().interact_size.y = 26.0;
+                    ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
+                    self.setup_ui(ui);
+                });
+            }
+            Page::View => {
+                egui::Panel::bottom("obs_panel_narrow")
+                    .resizable(true)
+                    .default_size(180.0)
+                    .min_size(120.0)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
+                        model_panels::observation_panel(ui, &mut self.slots[self.selected].base);
+                    });
+                egui::CentralPanel::default().show(ui, |ui| self.central_ui(ui));
+            }
+        }
+    }
+
+    /// The left panel's content: model selector, parameter form, run
+    /// settings, the estimator section with its Run button, then the
+    /// progress row and the error of the last run.
+    fn setup_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.heading("Model");
+        // While an estimator runs, the whole panel is frozen
+        // (grayed): its configuration must stay exactly what the
+        // run uses.
+        let estimating = self.slots[self.selected].estimating();
+        ui.add_enabled_ui(!estimating, |ui| {
+            let names: Vec<&str> = self.slots.iter().map(|s| s.base.model.name()).collect();
+            model_panels::model_selector(ui, &names, &mut self.selected);
+            let compute = &mut self.compute;
+            let slot = &mut self.slots[self.selected];
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if model_panels::params_ui(ui, &mut slot.base) {
+                    slot.clear_estimator_state();
+                }
+                ui.add_space(6.0);
+                let estimating = slot.estimating();
+                model_panels::run_ui(ui, &mut slot.base, !estimating);
+                let run_done = slot.base.run_done();
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Mortensen estimator");
+                    if ui
+                        .add_enabled(run_done, egui::Button::new("default").small())
+                        .clicked()
+                    {
+                        slot.filter_cfg = slot.default_filter_cfg();
+                    }
+                });
+                compute.ui(ui);
+                // Estimator-only options of the model (an unknown
+                // parameter augmenting the state): the run is made
+                // of a different model, so it and the configuration
+                // (whose dimension may change) are discarded.
+                if slot.base.model.estimator_options_ui(ui) {
+                    slot.base.refresh_preview();
+                    slot.clear_estimator_state();
+                    slot.filter_cfg = None;
+                }
+                panels::estimator_selector(ui, &mut slot.estimator);
+                let is_tracker = matches!(slot.estimator, Estimator::Tracker | Estimator::Unscented);
+                let is_window = slot.estimator == Estimator::Window;
+                let obs_ok = slot.base.model.obs_selected().iter().any(|&s| s);
+                let steps = slot.base.steps();
+                let mut domains_ok = true;
+                match &mut slot.filter_cfg {
+                    None => {
+                        ui.weak(
+                            "Run a simulation first — domains and defaults \
+                             are computed from the run.",
+                        );
+                    }
+                    Some(cfg) => {
+                        domains_ok = panels::config_ui(ui, cfg, slot.estimator, steps);
+                    }
+                }
+
+                ui.add_space(6.0);
+                let prior_ok = slot
+                    .filter_cfg
+                    .as_ref()
+                    .is_none_or(|c| panels::prior_ok(c, slot.estimator));
+                let can_run = run_done
+                    && !estimating
+                    && slot.filter_cfg.is_some()
+                    && obs_ok
+                    && prior_ok
+                    && (domains_ok || is_tracker || is_window);
+                let clicked = ui
+                    .add_enabled(
+                        can_run,
+                        egui::Button::new(panels::run_label(slot.estimator))
+                            .min_size(egui::vec2(ui.available_width() - 8.0, 28.0)),
+                    )
+                    .on_hover_text("Run the Mortensen estimator on this trajectory")
+                    .on_disabled_hover_text(if !obs_ok {
+                        "Select at least one observation first"
+                    } else if !domains_ok {
+                        "Each domain needs min < max"
+                    } else if !prior_ok {
+                        "This estimator needs σ > 0 in every direction (a Gaussian to follow)"
+                    } else {
+                        "Run a simulation first"
+                    })
+                    .clicked();
+                if clicked
+                    && let (Some(cfg), Some(traj)) = (&slot.filter_cfg, slot.base.completed())
+                {
+                    // The run on screen is the reference the estimator
+                    // runs along: same states, same observations — and
+                    // the twin experiment it came from, for a backend
+                    // that regenerates it elsewhere.
+                    let job = JobSpec {
+                        model: slot.base.model.model_spec(),
+                        reference: traj.reference(),
+                        estimator: slot.estimator,
+                        config: cfg.clone(),
+                    };
+                    let twin = slot.base.model.twin_spec(slot.base.dt, traj.len().saturating_sub(1));
+                    slot.run_error = None;
+                    match slot.estimator {
+                        Estimator::Filter => {
+                            slot.filter_run =
+                                Some(compute.spawn(job, twin, jobs::run_filter_spec));
+                        }
+                        Estimator::Window => {
+                            slot.box_run =
+                                Some(compute.spawn(job, twin, jobs::run_box_spec));
+                        }
+                        Estimator::Particles => {
+                            slot.particle_run =
+                                Some(compute.spawn(job, twin, jobs::run_particles_spec));
+                        }
+                        Estimator::Tracker => {
+                            slot.tracker_run =
+                                Some(compute.spawn(job, twin, jobs::run_tracker_spec));
+                        }
+                        Estimator::Unscented => {
+                            slot.unscented_run =
+                                Some(compute.spawn(job, twin, jobs::run_unscented_spec));
+                        }
+                    }
+                }
+                if let Some(out) = &slot.filter_out {
+                    ui.small(format!(
+                        "In memory: {} snapshots × {} plane(s)",
+                        out.saved_steps.len(),
+                        out.pairs.len(),
+                    ));
+                }
+            });
+        }); // add_enabled_ui
+
+        // Progress of a running estimator — outside the frozen
+        // region, so it renders at full strength.
+        let sel = &self.slots[self.selected];
+        let running: Option<(f32, f64, &str)> = if let Some(f) = &sel.filter_run {
+            Some((f.progress(), f.elapsed(), panels::running_text(Estimator::Filter)))
+        } else if let Some(t) = &sel.tracker_run {
+            Some((t.progress(), t.elapsed(), panels::running_text(Estimator::Tracker)))
+        } else if let Some(u) = &sel.unscented_run {
+            Some((u.progress(), u.elapsed(), panels::running_text(Estimator::Unscented)))
+        } else if let Some(b) = &sel.box_run {
+            Some((b.progress(), b.elapsed(), panels::running_text(Estimator::Window)))
+        } else {
+            sel.particle_run
+                .as_ref()
+                .map(|p| (p.progress(), p.elapsed(), panels::running_text(Estimator::Particles)))
+        };
+        if let Some((progress, elapsed, text)) = running {
+            ui.add_space(4.0);
+            if panels::progress_ui(ui, progress, elapsed, text) {
+                // Dropping the handles raises the cancel flag (or
+                // deletes the run on the server): the worker stops
+                // after its current iteration and its partial
+                // result is discarded.
+                self.slots[self.selected].cancel_estimators();
+            }
+        }
+        if let Some(e) = &self.slots[self.selected].run_error {
+            ui.add_space(4.0);
+            ui.colored_label(ui.visuals().error_fg_color, format!("Estimator run failed: {e}"));
+        }
+        // Pin the content width to the panel width (same creep
+        // prevention as the bottom panel's take_available_height).
+        ui.take_available_width();
+    }
+
+    /// The central panel's content: the view tabs once an estimator output
+    /// exists, then the selected result view or the animated scene.
+    fn central_ui(&mut self, ui: &mut egui::Ui) {
+        let slot = &mut self.slots[self.selected];
+        // Advance the clock with wall time while playing.
+        let wall_dt = ui.input(|i| i.stable_dt) as f64;
+        slot.base.advance(wall_dt);
+
+        // View tabs, shown once an estimator output exists.
+        if slot.filter_out.is_some()
+            || slot.tracker_out.is_some()
+            || slot.unscented_out.is_some()
+            || slot.box_out.is_some()
+            || slot.particle_out.is_some()
+        {
+            let n_pairs = slot.filter_out.as_ref().map_or(0, |o| o.pairs.len());
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut slot.view, CentralView::Scene, "Scene");
+                if slot.filter_out.is_some() {
+                    ui.selectable_value(&mut slot.view, CentralView::Filter, "Filter density");
+                }
+                if slot.box_out.is_some() {
+                    ui.selectable_value(&mut slot.view, CentralView::Window, "Tracking density");
+                }
+                if slot.particle_out.is_some() {
+                    ui.selectable_value(&mut slot.view, CentralView::Particles, "LParticles");
+                }
+                if slot.tracker_out.is_some() {
+                    ui.selectable_value(&mut slot.view, CentralView::Tracker, "Tracker");
+                }
+                if slot.unscented_out.is_some() {
+                    ui.selectable_value(&mut slot.view, CentralView::Unscented, "Unscented");
+                }
+                if slot.view == CentralView::Filter && n_pairs > 1 {
+                    ui.separator();
+                    ui.selectable_value(&mut slot.filter_view.n_panes, 1, "1 panel");
+                    ui.selectable_value(&mut slot.filter_view.n_panes, 2, "2 panels");
+                }
+            });
+            ui.separator();
+        }
+
+        let t = slot.base.playback.t;
+        if slot.view == CentralView::Filter
+            && let Some(out) = &slot.filter_out
+        {
+            let step = (t / out.dt).round().max(0.0) as usize;
+            let overlays = Overlays { tracker: slot.tracker_out.as_ref(), unscented: slot.unscented_out.as_ref() };
+            slot.filter_view.ui(ui, out, overlays, step);
+            return;
+        }
+        if slot.view == CentralView::Window
+            && let Some(out) = &slot.box_out
+        {
+            let step = (t / out.window.dt).round().max(0.0) as usize;
+            let overlays = Overlays { tracker: slot.tracker_out.as_ref(), unscented: slot.unscented_out.as_ref() };
+            slot.box_view.ui(ui, out, overlays, step);
+            return;
+        }
+        if slot.view == CentralView::Particles
+            && let Some(out) = &slot.particle_out
+        {
+            let step = (t / out.dt).round().max(0.0) as usize;
+            let overlays = Overlays { tracker: slot.tracker_out.as_ref(), unscented: slot.unscented_out.as_ref() };
+            slot.particles_view.ui(ui, out, overlays, step);
+            return;
+        }
+        if slot.view == CentralView::Tracker
+            && let Some(out) = &slot.tracker_out
+        {
+            tracker_view::ui(ui, out, t);
+            return;
+        }
+        if slot.view == CentralView::Unscented
+            && let Some(out) = &slot.unscented_out
+        {
+            tracker_view::ui_as(ui, out, t, "unscented x̄", 1);
+            return;
+        }
+
+        model_panels::scene_ui(ui, &slot.base, self.selected);
     }
 }
 

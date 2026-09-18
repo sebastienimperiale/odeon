@@ -12,8 +12,7 @@
 //! | `DELETE /runs/{id}`       | cancels at the next iteration and forgets the run (204; 404 unknown) |
 //!
 //! Answers are gzip-compressed for clients announcing `Accept-Encoding:
-//! gzip` (browsers and ureq do). When the server runs with a token (`ODEON_TOKEN`), every one of these
-//! needs `Authorization: Bearer <token>` (401 otherwise); a job beyond the
+//! gzip` (browsers and ureq do). A job beyond the
 //! server's limits is refused with 400 and a message naming the limit, and
 //! one more run than it accepts at once with 429.
 

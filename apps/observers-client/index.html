@@ -2,14 +2,16 @@
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- Phones: no page zoom (a pinch reaches the app, not the browser), the
+         canvas sized to the visible viewport (dvh: Safari's address bar). -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
     <title>Odeon — observers</title>
     <link data-trunk rel="rust" data-wasm-opt="2" />
     <!-- GitHub Pages: serve the files as they are (no Jekyll). -->
     <link data-trunk rel="copy-file" href=".nojekyll" />
     <style>
-        html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #202020; }
-        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        html, body { margin: 0; padding: 0; height: 100%; height: 100dvh; overflow: hidden; background: #202020; overscroll-behavior: none; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; height: 100dvh; touch-action: none; }
     </style>
 </head>
 <body>
